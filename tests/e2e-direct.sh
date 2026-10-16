@@ -135,7 +135,10 @@ grep -q "location ^~ /r/$RT/" /etc/nginx/conf.d/default.conf && pass "nginx: б�
 check "nginx -t с блоком отчётов" nginx -t
 [ "$(jq -r .log.loglevel /usr/local/etc/xray/config.json)" = warning ] && pass "лог доступа включён ради отчёта" || fail "лог доступа не включён"
 TOKEN_E=$(jq -r '.users[] | select(.name=="erin").token' /etc/autoxray/state.json)
-code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/r/$RT/erin/"); [ "$code" = 200 ] && pass "страница отчёта открывается по секретному адресу" || fail "страница отчёта: $code"
+for _ in 1 2 3 4 5 6 7 8 9 10; do   # nginx -s reload асинхронный: воркеры подхватывают конфиг не мгновенно
+  code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/r/$RT/erin/"); [ "$code" = 200 ] && break; sleep 0.5
+done
+[ "$code" = 200 ] && pass "страница отчёта открывается по секретному адресу" || fail "страница отчёта: $code"
 code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/r/ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ/erin/"); [ "$code" = 404 ] && pass "чужой токен отчётов даёт 404" || fail "чужой токен отчётов: $code"
 client_cfg "$TOKEN_E" 1 127.0.0.1 > /tmp/e1.json
 : > /var/log/xray/access.log
@@ -156,7 +159,10 @@ echo '{"date":"2000-01-01","total":1,"hosts":{"old.test":1},"hours":[]}' > /etc/
 autoxray report keep 7 >/dev/null; [ ! -e /etc/autoxray/reports/erin/2000-01-01.json ] && pass "старые дни удаляются по сроку хранения" || fail "retention не сработал"
 autoxray user set erin --report off >/dev/null 2>&1
 [ ! -d /var/lib/autoxray/reports/erin ] && pass "после выключения папка отчёта удалена" || fail "папка отчёта осталась"
-code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/r/$RT/erin/"); [ "$code" = 404 ] && pass "после выключения адрес отчёта не отдаётся" || fail "адрес отчёта: $code"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/r/$RT/erin/"); [ "$code" = 404 ] && break; sleep 0.5
+done
+[ "$code" = 404 ] && pass "после выключения адрес отчёта не отдаётся" || fail "адрес отчёта: $code"
 [ "$(jq -r .log.loglevel /usr/local/etc/xray/config.json)" = none ] && pass "лог доступа снова выключен" || fail "лог доступа остался"
 autoxray report purge erin >/dev/null; [ ! -d /etc/autoxray/reports/erin ] && pass "purge удаляет накопленные данные" || fail "purge"
 autoxray user del erin >/dev/null
