@@ -1,6 +1,7 @@
+# shellcheck shell=bash disable=SC2154
 # === Telegram Web Proxy (TeleMT Classic + tproxy-server) ===
-echo -e "${GRN}Версия: 116 ${NC}"
-sleep 1
+# Подключается через `source` из install.sh и ожидает переменные окружения:
+# DOMAIN, WEB_PATH, socksUser, socksPasw и цвета GRN/YEL/RED/NC. Экспортирует MTProto (tg://-ссылка).
 echo -e "\n${GRN}=== Установка бэкенда TeleMT и Web Proxy шлюза ===${NC}"
 
 # Останавливаем старые службы, если были
@@ -121,7 +122,7 @@ curl -fsSL --retry 2 "https://github.com/telegramdesktop/tproxy-server/archive/r
     || { echo -e "${RED}❌ Ошибка скачивания исходников tproxy-server${NC}"; exit 1; }
 
 # Статическая компиляция
-cd /tmp/tproxy-source
+cd /tmp/tproxy-source || exit 1
 CGO_ENABLED=0 /opt/go/bin/go build -trimpath -ldflags="-s -w" -o /usr/local/bin/tproxy-server ./cmd/tproxy-server \
     || { echo -e "${RED}❌ Ошибка сборки tproxy-server${NC}"; exit 1; }
 
@@ -129,7 +130,7 @@ chmod +x /usr/local/bin/tproxy-server
 
 # Чистим временные файлы компиляции
 rm -rf /tmp/tproxy-source /opt/go
-cd /root
+cd /root || exit 1
 
 # 3. Конфигурация tproxy-server
 echo -e "${GRN}[3/4] Настройка конфигурации tproxy-server...${NC}"

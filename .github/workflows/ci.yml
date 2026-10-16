@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -S warning autoxray install.sh templates/gen_page.sh components/telegram/*.sh tests/*.sh tests/stubs/* tests/docker/*.sh tools/*.sh
+      - name: bash -n
+        run: for f in autoxray install.sh templates/gen_page.sh components/telegram/*.sh; do bash -n "$f"; done
+      - name: согласованность версий
+        run: tests/check-version.sh
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: e2e в Docker (direct, bridge, install, migrate)
+        run: tests/run.sh all

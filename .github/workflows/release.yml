@@ -1,0 +1,46 @@
+name: Release
+
+# Релиз выпускается пушем тега vX.Y.Z (см. README, раздел «Релизы»).
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Тег совпадает с VERSION
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          [ "$tag" = "$(tr -d '[:space:]' < VERSION)" ] || { echo "тег $tag != VERSION"; exit 1; }
+          tests/check-version.sh
+
+      - name: Тесты
+        run: |
+          shellcheck -S warning autoxray install.sh templates/gen_page.sh components/telegram/*.sh tests/*.sh tests/stubs/* tests/docker/*.sh tools/*.sh
+          tests/run.sh all
+
+      - name: Сборка артефактов
+        run: |
+          mkdir dist
+          # установщик, закреплённый на этот тег: все файлы тянутся из релиза, а не из main
+          sed "s/^AX_REF_DEFAULT=\"main\"/AX_REF_DEFAULT=\"${GITHUB_REF_NAME}\"/" install.sh > dist/install.sh
+          grep -q "^AX_REF_DEFAULT=\"${GITHUB_REF_NAME}\"" dist/install.sh
+          cp autoxray dist/autoxray
+          (cd dist && sha256sum install.sh autoxray > SHA256SUMS)
+
+      - name: Заметки из CHANGELOG
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          awk -v v="$v" '$0 ~ "^## \\["v"\\]" {f=1; next} /^## \[/ {f=0} f' CHANGELOG.md > notes.md
+          [ -s notes.md ] || { echo "в CHANGELOG нет раздела $v"; exit 1; }
+
+      - name: Публикация
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "autoXRAY $GITHUB_REF_NAME" --notes-file notes.md --verify-tag

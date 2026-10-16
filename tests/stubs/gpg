@@ -1,0 +1,4 @@
+#!/bin/bash
+# заглушка: install.sh делает `gpg --dearmor -o файл` — создаём пустой файл
+out=""; while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out=$2; shift; done
+[ -n "$out" ] && : > "$out"; cat >/dev/null; exit 0

@@ -14,7 +14,7 @@ systemctl reset-failed
 # 3. Удаление бинарников
 echo "3. Удаление бинарных файлов..."
 rm -f /usr/local/bin/tproxy-server
-rm -f /bin/telemt
+rm -f /usr/local/bin/telemt /bin/telemt
 
 echo "4. Удаление конфигураций..."
 rm -rf /etc/tproxy-server
@@ -27,3 +27,7 @@ rm -rf /srv/tproxy-site
 echo "5. Удаление пользователя telemt..."
 userdel telemt 2>/dev/null || true
 groupdel telemt 2>/dev/null || true
+
+# nginx вернуть к раздаче статики, подписки пересобрать
+command -v autoxray >/dev/null && autoxray telegram off
+echo "Готово."

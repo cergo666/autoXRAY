@@ -1,0 +1,1220 @@
+#!/usr/bin/env bash
+# autoxray — управление пользователями, WARP и конфигурацией autoXRAY.
+#
+# Единственный источник правды — /etc/autoxray/state.json.
+# config.json Xray, страницы и файлы подписок — производные, их создаёт `autoxray render`.
+# Без аргументов открывается меню (TUI). Справка: autoxray help
+
+set -uo pipefail
+# bash >= 5.2: '&' в замене ${var//a/b} — спецсимвол; ссылки содержат '&'
+shopt -u patsub_replacement 2>/dev/null || true
+
+AX_VERSION="3.0.0"
+AX_REPO="cergo666/autoXRAY"
+AX_ETC="${AX_ETC:-/etc/autoxray}"
+STATE="$AX_ETC/state.json"
+TRAFFIC="$AX_ETC/traffic.json"
+LOCK="$AX_ETC/.lock"
+XRAY_CFG="${AX_XRAY_CFG:-/usr/local/etc/xray/config.json}"
+NGX_MAP="${AX_NGINX_MAP:-/etc/nginx/autoxray-userinfo.map}"
+TPL_DIR="${AX_TEMPLATES:-/usr/local/share/autoxray}"
+CURL="${AX_CURL:-curl}"
+DRY="${AX_DRY:-0}"            # 1 — не трогать службы (для тестов)
+API_ADDR="127.0.0.1:10085"
+WARP_API="https://api.cloudflareclient.com/v0i1909051800"
+WARP_ENDPOINT="engage.cloudflareclient.com:2408"
+
+GRN='\033[1;32m'; RED='\033[1;31m'; YEL='\033[1;33m'; CYAN='\033[1;36m'; NC='\033[0m'
+
+ok()   { echo -e "${GRN}$*${NC}"; }
+warn() { echo -e "${YEL}$*${NC}" >&2; }
+die()  { echo -e "${RED}❌ $*${NC}" >&2; exit 1; }
+
+need_root()  { [[ $DRY == 1 || $EUID -eq 0 ]] || die "Нужны root права."; }
+need_state() { [[ -f $STATE ]] || die "autoXRAY не установлен: нет $STATE"; }
+svc()        { [[ $DRY == 1 ]] || systemctl "$@" 9>&-; }
+
+rand()     { LC_ALL=C tr -dc "$1" </dev/urandom | head -c "$2"; }
+new_uuid() { cat /proc/sys/kernel/random/uuid; }
+now()      { date +%s; }
+next_month() { date -d "$(date +%Y-%m-01) +1 month" +%s; }
+
+urldecode() { printf '%b' "${1//%/\\x}"; }
+
+valid_name() { [[ ${1:-} =~ ^[A-Za-z0-9_-]{1,24}$ ]]; }
+is_num()     { [[ ${1:-} =~ ^[0-9]+([.][0-9]+)?$ ]]; }
+
+hbytes() {
+  awk -v b="${1:-0}" 'BEGIN{
+    split("Б КБ МБ ГБ ТБ", u, " "); i = 1
+    while (b >= 1024 && i < 5) { b /= 1024; i++ }
+    if (i == 1) printf "%d %s", b, u[i]; else printf "%.2f %s", b, u[i] }'
+}
+hdate() { [[ ${1:-0} -gt 0 ]] && date -d "@$1" +%F || echo "∞"; }
+
+lock()   { exec 9>>"$LOCK"; flock -w 30 9 || die "Другая операция autoxray ещё выполняется."; }
+locked() { lock; "$@"; local rc=$?; exec 9>&-; return $rc; }
+
+# ---------------------------------------------------------------- состояние
+
+st()      { jq -r "$1" "$STATE"; }
+mode()    { jq -r '.mode // "direct"' "$STATE"; }
+# В режиме моста 3-я группа UUID зарезервирована под vlessRoute (0000 = автобалансировщик)
+user_uuid() { local u; u=$(new_uuid); [[ ${1:-direct} == bridge ]] && u="${u:0:14}0000${u:18}"; echo "$u"; }
+st_edit() {
+  local tmp
+  tmp=$(mktemp "$AX_ETC/.state.XXXXXX") || die "Не могу создать временный файл в $AX_ETC"
+  if jq "$@" "$STATE" >"$tmp"; then chmod 600 "$tmp"; mv "$tmp" "$STATE"; else rm -f "$tmp"; die "Ошибка обновления state.json"; fi
+}
+
+JQ_DEFS='
+def used($u): (($t[0][$u.name].up // 0) + ($t[0][$u.name].down // 0));
+def status($u):
+  if ($u.enabled | not) then "disabled"
+  elif ($u.expire != 0 and $u.expire <= $now) then "expired"
+  elif ($u.limit != 0 and used($u) >= $u.limit) then "limit"
+  else "active" end;
+'
+jq_state() { jq --slurpfile t "$TRAFFIC" --argjson now "$(now)" "$@" "$STATE"; }
+
+user_get() { jq -c --arg n "$1" '.users[] | select(.name == $n)' "$STATE"; }
+user_must() { local j; j=$(user_get "$1"); [[ -n $j ]] || die "Пользователь '$1' не найден."; echo "$j"; }
+active_names() { jq_state -r "$JQ_DEFS"'.users[] | select(status(.) == "active") | .name' | sort | tr '\n' ' '; }
+
+# ------------------------------------------------------------ конфиг Xray
+
+XRAY_JQ=$(cat <<'JQ'
+def used($u): (($t[0][$u.name].up // 0) + ($t[0][$u.name].down // 0));
+def active($u): $u.enabled and ($u.expire == 0 or $u.expire > $now) and ($u.limit == 0 or used($u) < $u.limit);
+def sniff: {enabled: true, destOverride: ["http", "tls", "quic"]};
+def ru_domains: ["geosite:category-ru", "domain:ru", "domain:su", "domain:xn--p1ai", "geosite:yandex", "geosite:vk"];
+
+$s[0] as $S
+| [$S.users[] | select(active(.))] as $U
+| ($S.warp // {}) as $W
+| ($W.registered == true and $W.enabled == true) as $warp_on
+| ($W.ru == true) as $ru
+| {
+    log: {dnsLog: false, access: "/var/log/xray/access.log", error: "/var/log/xray/error.log", loglevel: "none"},
+    stats: {},
+    api: {tag: "api", services: ["StatsService"]},
+    policy: {levels: {"0": {statsUserUplink: true, statsUserDownlink: true}}},
+    dns: {
+      servers: ["https+local://8.8.4.4/dns-query", "https+local://8.8.8.8/dns-query", "https+local://1.1.1.1/dns-query", "localhost"],
+      queryStrategy: "UseIPv4"
+    },
+    inbounds: [
+      {
+        tag: "vsRAWtlsVISION", port: 443, listen: "0.0.0.0", protocol: "vless",
+        settings: {
+          clients: (if ($U | length) > 0
+                    then [$U[] | {flow: "xtls-rprx-vision", id: .uuid, email: .name}]
+                    else [{flow: "xtls-rprx-vision", id: $dummy_id}] end),
+          decryption: "none",
+          fallbacks: [{dest: "/dev/shm/nginx.sock", xver: 2}]
+        },
+        streamSettings: {
+          network: "raw", security: "tls",
+          tlsSettings: {
+            certificates: [{certificateFile: "/var/lib/xray/cert/fullchain.pem", keyFile: "/var/lib/xray/cert/privkey.pem"}],
+            minVersion: "1.2",
+            cipherSuites: "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+            alpn: ["h2", "http/1.1"]
+          }
+        },
+        sniffing: sniff
+      },
+      {
+        tag: "Hysteria2", listen: "0.0.0.0", port: 443, protocol: "hysteria",
+        settings: {
+          version: 2,
+          clients: (if ($U | length) > 0
+                    then [$U[] | {auth: .hy2, email: .name}]
+                    else [{auth: $dummy_auth}] end)
+        },
+        streamSettings: {
+          network: "hysteria", security: "tls",
+          tlsSettings: {
+            serverName: $S.domain, alpn: ["h3"],
+            certificates: [{usage: "encipherment", certificateFile: "/var/lib/xray/cert/fullchain.pem", keyFile: "/var/lib/xray/cert/privkey.pem"}]
+          },
+          hysteriaSettings: {version: 2},
+          finalmask: {quicParams: {congestion: "brutal", brutalUp: "100 mbps", brutalDown: "100 mbps"}}
+        },
+        sniffing: sniff
+      },
+      {
+        tag: "vsXHTTPtls", port: 3333, listen: "127.0.0.1", protocol: "vless",
+        settings: {
+          clients: (if ($U | length) > 0
+                    then [$U[] | {id: .uuid, email: .name}]
+                    else [{id: $dummy_id}] end),
+          decryption: "none"
+        },
+        streamSettings: {
+          network: "xhttp",
+          xhttpSettings: {mode: "stream-up", path: ("/" + $S.paths.xhttp)},
+          security: "none",
+          sockopt: {acceptProxyProtocol: false, trustedXForwardedFor: ["X-Real-IP"]}
+        },
+        sniffing: sniff
+      },
+      {
+        tag: "socks5", port: 10443, listen: "127.0.0.1", protocol: "mixed",
+        settings: {ip: "127.0.0.1", udp: true, auth: "password", accounts: [{user: $S.socks.user, pass: $S.socks.pass}]}
+      },
+      {
+        tag: "api", port: 10085, listen: "127.0.0.1", protocol: "dokodemo-door",
+        settings: {address: "127.0.0.1"}
+      }
+    ],
+    outbounds: (
+      [
+        {tag: "direct", protocol: "freedom", settings: {}, streamSettings: {sockopt: {domainStrategy: "ForceIPv4"}}},
+        {tag: "block", protocol: "blackhole"}
+      ]
+      + (if $W.registered == true then [{
+          tag: "warp", protocol: "wireguard",
+          settings: {
+            secretKey: $W.secretKey,
+            address: $W.address,
+            peers: [{publicKey: $W.peerPublicKey, allowedIPs: ["0.0.0.0/0", "::/0"], endpoint: $W.endpoint}],
+            mtu: 1280,
+            reserved: $W.reserved,
+            noKernelTun: true,
+            domainStrategy: "ForceIP"
+          }
+        }] else [] end)
+    ),
+    routing: {
+      domainStrategy: "IPIfNonMatch",
+      rules: (
+        [
+          {inboundTag: ["api"], outboundTag: "api"},
+          {ip: ["geoip:private"], outboundTag: "block"},
+          {port: "25, 135, 137-139, 445", outboundTag: "block"},
+          {protocol: ["bittorrent"], outboundTag: "block"},
+          {domain: ["geosite:category-ads", "geosite:win-spy", "geosite:private"], outboundTag: "block"}
+        ]
+        + (if $warp_on then
+             [{domain: (["full:one.one.one.one"] + ($W.domains // []) + (if $ru then ru_domains else [] end)), outboundTag: "warp"}]
+             + (if $ru then [{ip: ["geoip:ru"], outboundTag: "warp"}] else [] end)
+           else [] end)
+        + [{outboundTag: "block", domain: ["ifconfig.me", "checkip.amazonaws.com", "pify.org", "2ip.io", "geosite:category-ip-geo-detect"]}]
+      )
+    }
+  }
+JQ
+)
+
+# Исходящее подключение к EU-узлу (общее для сервера моста и клиентского профиля «Direct EU»)
+BRIDGE_COMMON=$(cat <<'JQ'
+def node_user($n): {id: $n.uuid, encryption: "none"} + (if $n.flow != "" then {flow: $n.flow} else {} end);
+def node_stream($n):
+  {network: $n.type}
+  + (if $n.type == "xhttp" then {xhttpSettings: {extra: (if $n.extra == "" then null else ($n.extra | fromjson) end), mode: $n.mode, path: $n.path}} else {} end)
+  + (if $n.security == "tls" then {security: "tls", tlsSettings: {serverName: $n.sni, fingerprint: $n.fp, alpn: $n.alpn}} else {security: "none"} end);
+def hex4($i): ([($i / 4096 | floor), (($i / 256 | floor) % 16), (($i / 16 | floor) % 16), ($i % 16)] | map("0123456789abcdef"[. : (. + 1)]) | join(""));
+def route_uuid($uuid; $i): $uuid[0:14] + hex4($i) + $uuid[18:];
+JQ
+)
+
+BRIDGE_JQ=$(cat <<'JQ'
+def used($u): (($t[0][$u.name].up // 0) + ($t[0][$u.name].down // 0));
+def active($u): $u.enabled and ($u.expire == 0 or $u.expire > $now) and ($u.limit == 0 or used($u) < $u.limit);
+def sniff: {enabled: true, destOverride: ["http", "tls", "quic"]};
+def node_out($n): {mux: {concurrency: -1, enabled: false}, tag: ("proxy-" + ($n.id | tostring)), protocol: "vless",
+  settings: {vnext: [{port: $n.port, users: [node_user($n)], address: $n.addr}]}, streamSettings: node_stream($n)};
+
+$s[0] as $S
+| [$S.users[] | select(active(.))] as $U
+| {
+    log: {dnsLog: false, access: "/var/log/xray/access.log", error: "/var/log/xray/error.log", loglevel: "warning"},
+    stats: {},
+    api: {tag: "api", services: ["StatsService"]},
+    policy: {levels: {"0": {statsUserUplink: true, statsUserDownlink: true}}},
+    burstObservatory: {
+      pingConfig: {timeout: "3s", interval: "40s", sampling: 1, destination: "https://www.gstatic.com/generate_204", connectivity: ""},
+      subjectSelector: ["proxy"]
+    },
+    dns: {
+      servers: [
+        {address: "https+local://77.88.8.8/dns-query",
+         domains: ["geosite:category-ru", "geosite:yandex", "geosite:vk", "domain:ru", "domain:su", "domain:xn--p1ai"],
+         skipFallback: true},
+        "https://8.8.4.4/dns-query", "https://8.8.8.8/dns-query", "https://1.1.1.1/dns-query"
+      ],
+      queryStrategy: "UseIPv4"
+    },
+    inbounds: [
+      {
+        tag: "RUbrEUtlsVISION", port: 443, listen: "0.0.0.0", protocol: "vless",
+        settings: {
+          clients: (if ($U | length) > 0
+                    then [$U[] | {id: .uuid, flow: "xtls-rprx-vision", email: .name}]
+                    else [{id: $dummy_id, flow: "xtls-rprx-vision"}] end),
+          decryption: "none",
+          fallbacks: [{dest: "/dev/shm/nginx.sock", xver: 2}]
+        },
+        streamSettings: {
+          network: "raw", security: "tls",
+          tlsSettings: {
+            certificates: [{certificateFile: "/var/lib/xray/cert/fullchain.pem", keyFile: "/var/lib/xray/cert/privkey.pem"}],
+            minVersion: "1.2",
+            cipherSuites: "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+            alpn: ["h2", "http/1.1"]
+          }
+        },
+        sniffing: sniff
+      },
+      {
+        tag: "RUbrEUxhttpTLS", port: 3333, listen: "127.0.0.1", protocol: "vless",
+        settings: {
+          clients: (if ($U | length) > 0 then [$U[] | {id: .uuid, email: .name}] else [{id: $dummy_id}] end),
+          decryption: "none"
+        },
+        streamSettings: {
+          network: "xhttp",
+          xhttpSettings: {mode: "stream-up", path: ("/" + $S.paths.xhttp)},
+          security: "none",
+          sockopt: {acceptProxyProtocol: false, trustedXForwardedFor: ["X-Real-IP"]}
+        },
+        sniffing: sniff
+      },
+      {
+        tag: "RUsocks5", port: 10443, listen: "127.0.0.1", protocol: "mixed",
+        settings: {ip: "127.0.0.1", udp: true, auth: "password", accounts: [{user: $S.socks.user, pass: $S.socks.pass}]}
+      },
+      {tag: "api", port: 10085, listen: "127.0.0.1", protocol: "dokodemo-door", settings: {address: "127.0.0.1"}}
+    ],
+    outbounds: (
+      [$S.nodes[] | node_out(.)]
+      + [{tag: "direct", protocol: "freedom", settings: {}, streamSettings: {sockopt: {domainStrategy: "ForceIPv4"}}},
+         {tag: "block", protocol: "blackhole"}]
+    ),
+    routing: {
+      domainMatcher: "hybrid", domainStrategy: "IPIfNonMatch",
+      balancers: [{
+        tag: "Super_Balancer", selector: ["proxy"],
+        strategy: {type: "leastLoad", settings: {maxRTT: "1s", expected: ($S.nodes | length), baselines: ["1s"], tolerance: 0.01}},
+        fallbackTag: "direct"
+      }],
+      rules: (
+        [
+          {inboundTag: ["api"], outboundTag: "api"},
+          {ip: ["geoip:private"], outboundTag: "block"},
+          {port: "25, 135, 137-139, 445", outboundTag: "block"},
+          {protocol: ["bittorrent"], outboundTag: "block"},
+          {domain: ["geosite:category-ads", "geosite:win-spy", "geosite:private"], outboundTag: "block"},
+          {domain: ["testipv6.net", "ifconfig.me", "checkip.amazonaws.com", "pify.org", "2ip.io", "domain:ru", "domain:su", "domain:xn--p1ai",
+                    "geosite:category-ip-geo-detect", "geosite:apple", "geosite:apple-pki", "geosite:f-droid", "geosite:yandex", "geosite:vk", "geosite:category-ru"],
+           outboundTag: "direct"},
+          {ip: ["geoip:ru"], outboundTag: "direct"}
+        ]
+        + [$S.nodes[] | {vlessRoute: (.id | tostring), outboundTag: ("proxy-" + (.id | tostring))}]
+        + [{inboundTag: ["RUsocks5"], balancerTag: "Super_Balancer"},
+           {network: "tcp,udp", balancerTag: "Super_Balancer"}]
+      )
+    }
+  }
+JQ
+)
+
+render_xray_json() {
+  local prog=$XRAY_JQ
+  [[ $(mode) == bridge ]] && prog="$BRIDGE_COMMON"$'\n'"$BRIDGE_JQ"
+  jq -n --slurpfile s "$STATE" --slurpfile t "$TRAFFIC" --argjson now "$(now)" \
+    --arg dummy_id "$(new_uuid)" --arg dummy_auth "$(rand 'a-f0-9' 16)" "$prog"
+}
+
+xray_group() {
+  local u g
+  u=$(systemctl show xray -p User --value 2>/dev/null); u=${u:-nobody}
+  g=$(id -gn "$u" 2>/dev/null) || g=""
+  echo "$g"
+}
+
+# Применяет config.json: проверка через `xray run -test`, откат при ошибке,
+# перезапуск только если файл действительно изменился.
+apply_xray() {
+  local new rc=0 grp
+  new=$(mktemp --suffix=.json) || die "mktemp"
+  render_xray_json >"$new" || { rm -f "$new"; die "Не удалось собрать config.json"; }
+  if [[ -f $XRAY_CFG ]] && cmp -s "$new" "$XRAY_CFG"; then rm -f "$new"; return 0; fi
+  if command -v xray >/dev/null 2>&1; then
+    if ! xray run -test -c "$new" >/tmp/autoxray-test.log 2>&1; then
+      warn "Xray отклонил новый конфиг, изменения НЕ применены. Лог: /tmp/autoxray-test.log"
+      tail -n 5 /tmp/autoxray-test.log >&2
+      rm -f "$new"; return 1
+    fi
+  fi
+  [[ -f $XRAY_CFG ]] && cp -p "$XRAY_CFG" "$XRAY_CFG.bak"
+  mkdir -p "$(dirname "$XRAY_CFG")"
+  cat "$new" >"$XRAY_CFG"; rm -f "$new"
+  grp=$([[ $DRY == 1 ]] && echo "" || xray_group)
+  if [[ -n $grp ]]; then chown "root:$grp" "$XRAY_CFG"; chmod 640 "$XRAY_CFG"; else chmod 644 "$XRAY_CFG"; fi
+  svc restart xray || rc=1
+  return $rc
+}
+
+# ----------------------------------------------------- клиентские конфиги
+
+EXTRA='%7B%22noGRPCHeader%22%3Afalse%2C%22xPaddingBytes%22%3A%22150-400%22%2C%22scMaxEachPostBytes%22%3A500000%2C%22scMinPostsIntervalMs%22%3A%225-15%22%2C%22scMaxBufferedPosts%22%3A20%2C%22scStreamUpServerSecs%22%3A%2290-180%22%2C%22xmux%22%3A%7B%22maxConcurrency%22%3A%222-4%22%2C%22cMaxReuseTimes%22%3A%22800-1500%22%2C%22hMaxReusableSecs%22%3A%22900-1200%22%7D%7D'
+
+# Печатает «название|ссылка» по строке на каждый протокол.
+user_links() {
+  jq -r --arg n "$1" --arg ex "$EXTRA" "$BRIDGE_COMMON"'
+    def xl($S; $id; $u; $tag): "vless://\(route_uuid($u.uuid; $id))@\($S.domain):443?security=tls&alpn=h2&type=xhttp&mode=stream-up&path=%2F\($S.paths.xhttp)&extra=\($ex)&sni=\($S.domain)&fp=\($S.fingerprint)#\($tag | @uri)";
+    . as $S | ($S.users[] | select(.name == $n)) as $u
+    | if $S.mode == "bridge" then
+        (if ($S.nodes | length) > 1 then "🇷🇺 RU>EU Автобалансир|\(xl($S; 0; $u; "RU>EU Автобалансир"))" else empty end),
+        ($S.nodes[] as $x
+         | "XHTTP TLS stream-up (RU>EU \($x.name))|\(xl($S; $x.id; $u; "RU>EU_xhttp_" + $x.name))",
+           "RAW VISION (RU>EU \($x.name))|vless://\(route_uuid($u.uuid; $x.id))@\($S.domain):443?security=tls&type=tcp&headerType=&path=&host=&flow=xtls-rprx-vision&sni=\($S.domain)&fp=\($S.fingerprint)&spx=%2F#\("RU>EU_raw_" + $x.name | @uri)",
+           "Direct EU (\($x.name))|\($x.url)")
+      else
+        "VLESS XHTTP TLS stream-up (для моста)|vless://\($u.uuid)@\($S.domain):443?security=tls&alpn=h2&type=xhttp&mode=stream-up&path=%2F\($S.paths.xhttp)&extra=\($ex)&sni=\($S.domain)&fp=\($S.fingerprint)#vlessXHTTPtls-\($u.name)",
+        "VLESS RAW TLS VISION|vless://\($u.uuid)@\($S.domain):443?security=tls&type=tcp&headerType=&path=&host=&flow=xtls-rprx-vision&sni=\($S.domain)&fp=\($S.fingerprint)&spx=%2F#vlessRAWtlsVision-\($u.name)",
+        "HYSTERIA2|hy2://\($u.hy2)@\($S.domain):443/?sni=\($S.domain)&alpn=h3#Hysteria2-\($u.name)"
+      end
+  ' "$STATE"
+}
+
+CLIENT_JQ=$(cat <<'JQ'
+def ru_domains: ["domain:ru", "domain:su", "domain:xn--p1ai", "geosite:yandex", "geosite:vk", "geosite:category-ru"];
+def sniff: {enabled: true, destOverride: ["http", "tls", "quic"]};
+
+def client($proxy; $remark; $ru_direct): {
+  log: {loglevel: "warning"},
+  dns: {
+    servers: [
+      {address: "https+local://77.88.8.8/dns-query",
+       domains: ["geosite:category-ru", "geosite:yandex", "geosite:vk", "domain:ru", "domain:su", "domain:xn--p1ai"],
+       skipFallback: true},
+      "https://8.8.4.4/dns-query", "https://8.8.8.8/dns-query", "https://1.1.1.1/dns-query"
+    ],
+    queryStrategy: "UseIPv4"
+  },
+  routing: {
+    domainMatcher: "hybrid", domainStrategy: "IPIfNonMatch",
+    rules: [
+      {domain: ["geosite:category-ads", "geosite:win-spy"], outboundTag: "block"},
+      {protocol: ["bittorrent"], outboundTag: "direct"},
+      {domain: ["habr.com", "apkmirror.com"], outboundTag: "proxy"},
+      {domain: (["geosite:private", "ifconfig.me", "checkip.amazonaws.com", "pify.org", "2ip.io",
+                 "geosite:category-ip-geo-detect", "geosite:apple", "geosite:apple-pki", "geosite:f-droid"]
+                + (if $ru_direct then ru_domains else [] end)),
+       outboundTag: "direct"},
+      {ip: (["geoip:private"] + (if $ru_direct then ["geoip:ru"] else [] end)), outboundTag: "direct"}
+    ]
+  },
+  inbounds: [
+    {tag: "socks-in", protocol: "socks", listen: "127.0.0.1", port: 10808, settings: {udp: true}, sniffing: sniff},
+    {tag: "socks-sb", protocol: "mixed", listen: "127.0.0.1", port: 2080, settings: {udp: true}, sniffing: sniff},
+    {tag: "http-in", protocol: "http", listen: "127.0.0.1", port: 10809, sniffing: sniff}
+  ],
+  outbounds: [$proxy, {tag: "direct", protocol: "freedom"}, {tag: "block", protocol: "blackhole"}],
+  remarks: $remark
+};
+
+JQ
+)
+
+CLIENT_DIRECT_TAIL=$(cat <<'JQ'
+. as $S
+| ($S.users[] | select(.name == $n)) as $u
+| (($S.warp.enabled == true and $S.warp.registered == true and $S.warp.ru == true) | not) as $ru_direct
+| {tag: "proxy", protocol: "vless",
+   settings: {vnext: [{address: $S.domain, port: 443, users: [{id: $u.uuid, encryption: "none"}]}]},
+   streamSettings: {
+     network: "xhttp",
+     xhttpSettings: {
+       mode: "stream-up", path: ("/" + $S.paths.xhttp),
+       extra: {noGRPCHeader: false, xPaddingBytes: "150-400", scMaxEachPostBytes: 500000,
+               scMinPostsIntervalMs: "5-15", scMaxBufferedPosts: 20, scStreamUpServerSecs: "90-180",
+               xmux: {maxConcurrency: "2-4", cMaxReuseTimes: "800-1500", hMaxReusableSecs: "900-1200"}}
+     },
+     security: "tls",
+     tlsSettings: {serverName: $S.domain, alpn: ["h2"], fingerprint: $S.fingerprint}
+   }} as $xhttp
+| {tag: "proxy", protocol: "vless",
+   settings: {vnext: [{address: $S.domain, port: 443, users: [{id: $u.uuid, flow: "xtls-rprx-vision", encryption: "none"}]}]},
+   streamSettings: {network: "raw", security: "tls",
+                    tlsSettings: {serverName: $S.domain, fingerprint: $S.fingerprint}}} as $vision
+| {tag: "proxy", protocol: "hysteria",
+   settings: {address: $S.domain, port: 443, version: 2},
+   streamSettings: {
+     network: "hysteria", security: "tls",
+     tlsSettings: {serverName: $S.domain, alpn: ["h3"], fingerprint: $S.fingerprint},
+     hysteriaSettings: {version: 2, auth: $u.hy2},
+     finalmask: {quicParams: {congestion: "brutal", brutalUp: "100 mbps", brutalDown: "100 mbps"}}
+   }} as $hy2
+| [client($xhttp; "🇪🇺 VLESS XHTTP TLS stream-up"; $ru_direct),
+   client($vision; "🇪🇺 VLESS RAW TLS VISION"; $ru_direct),
+   client($hy2; "🇪🇺 HYSTERIA2"; $ru_direct)]
+JQ
+)
+
+CLIENT_BRIDGE_TAIL=$(cat <<'JQ'
+def xextra: {noGRPCHeader: false, xPaddingBytes: "150-400", scMaxEachPostBytes: 500000, scMinPostsIntervalMs: "5-15",
+             scMaxBufferedPosts: 20, scStreamUpServerSecs: "90-180",
+             xmux: {maxConcurrency: "2-4", cMaxReuseTimes: "800-1500", hMaxReusableSecs: "900-1200"}};
+def via_xhttp($S; $u; $id): {mux: {concurrency: -1, enabled: false}, tag: "proxy", protocol: "vless",
+  settings: {vnext: [{address: $S.domain, port: 443, users: [{id: route_uuid($u.uuid; $id), encryption: "none"}]}]},
+  streamSettings: {network: "xhttp", security: "tls",
+                   tlsSettings: {serverName: $S.domain, alpn: ["h2"], fingerprint: $S.fingerprint},
+                   xhttpSettings: {mode: "stream-up", path: ("/" + $S.paths.xhttp), extra: xextra}}};
+def via_vision($S; $u; $id): {mux: {concurrency: -1, enabled: false}, tag: "proxy", protocol: "vless",
+  settings: {vnext: [{address: $S.domain, port: 443, users: [{id: route_uuid($u.uuid; $id), flow: "xtls-rprx-vision", encryption: "none"}]}]},
+  streamSettings: {network: "raw", security: "tls", tlsSettings: {serverName: $S.domain, fingerprint: $S.fingerprint}}};
+def direct_eu($n): {mux: {concurrency: -1, enabled: false}, tag: "proxy", protocol: "vless",
+  settings: {vnext: [{address: $n.addr, port: $n.port, users: [node_user($n)]}]}, streamSettings: node_stream($n)};
+
+. as $S
+| ($S.users[] | select(.name == $n)) as $u
+| ((if ($S.nodes | length) > 1 then [client(via_xhttp($S; $u; 0); "🇷🇺 RU>EU Автобалансир"; true)] else [] end)
+   + [$S.nodes[] as $x
+      | client(via_xhttp($S; $u; $x.id); "🇷🇺 RU>EU xhttp | \($x.name)"; true),
+        client(via_vision($S; $u; $x.id); "🇷🇺 RU>EU raw | \($x.name)"; true),
+        client(direct_eu($x); "🇪🇺 EU dir | \($x.name)"; true)])
+JQ
+)
+
+sub_json() {
+  local prog="$CLIENT_JQ"$'\n'"$CLIENT_DIRECT_TAIL"
+  [[ $(mode) == bridge ]] && prog="$BRIDGE_COMMON"$'\n'"$CLIENT_JQ"$'\n'"$CLIENT_BRIDGE_TAIL"
+  jq --arg n "$1" "$prog" "$STATE"
+}
+
+html_esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
+
+sub_html() {
+  local name=$1 tpl="$TPL_DIR/sub.html" u domain token used limit expire status tg rows="" idx=1 label link
+  [[ -f $tpl ]] || { warn "Нет шаблона $tpl — HTML-страница подписки пропущена."; return 1; }
+  u=$(user_must "$name")
+  domain=$(st .domain); token=$(jq -r .token <<<"$u")
+  limit=$(jq -r .limit <<<"$u"); expire=$(jq -r .expire <<<"$u")
+  used=$(jq -r --arg n "$name" '((.[$n].up // 0) + (.[$n].down // 0))' "$TRAFFIC")
+  status=$(jq_state -r --arg n "$name" "$JQ_DEFS"'.users[] | select(.name == $n) | status(.)')
+  tg=$(st '.telegram.link // ""')
+
+  while IFS='|' read -r label link; do
+    rows+="<div class=\"cfg\"><div class=\"cfg-head\"><span class=\"cfg-name\">$(html_esc <<<"$label")</span><span class=\"cfg-actions\"><button class=\"mini\" data-copy=\"c$idx\">Копировать</button><button class=\"mini\" data-qr=\"c$idx\">QR</button></span></div><code id=\"c$idx\">$(html_esc <<<"$link")</code></div>"$'\n'
+    idx=$((idx + 1))
+  done < <(user_links "$name")
+
+  local tg_block=""
+  if [[ -n $tg ]]; then
+    tg_block="<section class=\"card\"><h2>Telegram</h2><p class=\"muted\">Web Proxy на этом же сервере — открывается одной кнопкой.</p><div class=\"row\"><a class=\"btn tg\" href=\"$(html_esc <<<"$tg")\">Добавить прокси в Telegram</a><button class=\"btn ghost\" data-copy-text=\"$(html_esc <<<"$tg")\">Копировать ссылку</button></div></section>"
+  fi
+
+  local sub_url="https://$domain/$token.json" out
+  out=$(<"$tpl")
+  out=${out//'{{NAME}}'/$(html_esc <<<"$name")}
+  out=${out//'{{DOMAIN}}'/$(html_esc <<<"$domain")}
+  out=${out//'{{SUB_URL}}'/$(html_esc <<<"$sub_url")}
+  out=${out//'{{USED}}'/$used}
+  out=${out//'{{LIMIT}}'/$limit}
+  out=${out//'{{EXPIRE}}'/$expire}
+  out=${out//'{{STATUS}}'/$status}
+  out=${out//'{{TG_BLOCK}}'/$tg_block}
+  out=${out//'{{CONFIGS}}'/$rows}
+  printf '%s\n' "$out"
+}
+
+# Файлы подписок + map для заголовка subscription-userinfo в nginx.
+render_subs() {
+  local web name token map_new changed=0 keep=" "
+  web=$(st .web); mkdir -p "$web"
+  map_new=$(mktemp)
+  while IFS= read -r name; do
+    token=$(user_get "$name" | jq -r .token)
+    sub_json "$name" >"$web/$token.json" || warn "Не удалось собрать подписку для $name"
+    sub_html "$name" >"$web/$token.html" 2>/dev/null || rm -f "$web/$token.html"
+    chmod 644 "$web/$token.json" "$web/$token.html" 2>/dev/null
+    keep+="$token "
+    jq -r --arg n "$name" --arg tok "$token" --slurpfile t "$TRAFFIC" '
+      .users[] | select(.name == $n) as $u
+      | (($t[0][$n].up // 0)) as $up | (($t[0][$n].down // 0)) as $dn
+      | "\"/\($tok).json\" \"upload=\($up); download=\($dn)"
+        + (if $u.limit > 0 then "; total=\($u.limit)" else "" end)
+        + (if $u.expire > 0 then "; expire=\($u.expire)" else "" end) + "\";"' "$STATE" >>"$map_new"
+  done < <(jq -r '.users[].name' "$STATE")
+
+  # удаляем файлы подписок отозванных пользователей
+  local f base
+  for f in "$web"/*.json "$web"/*.html; do
+    [[ -e $f ]] || continue
+    base=$(basename "$f"); base=${base%.*}
+    [[ $base =~ ^[A-Za-z0-9]{20,32}$ ]] || continue
+    [[ $keep == *" $base "* ]] || rm -f "$f"
+  done
+
+  if [[ ! -f $NGX_MAP ]] || ! cmp -s "$map_new" "$NGX_MAP"; then
+    mkdir -p "$(dirname "$NGX_MAP")"; cat "$map_new" >"$NGX_MAP"; changed=1
+  fi
+  rm -f "$map_new"
+  [[ $changed == 1 ]] && svc reload nginx 2>/dev/null
+  return 0
+}
+
+NGX_CONF="${AX_NGINX_CONF:-/etc/nginx/conf.d/default.conf}"
+
+FALLBACK_PROXY='    # web proxy Telegram (tproxy-server) + раздача статики сайта-маскировки
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }'
+FALLBACK_STATIC='    location / {
+        try_files $uri $uri/ =404;
+    }'
+
+# nginx.conf собирается из шаблона и state.json; при ошибке `nginx -t` прежний файл возвращается.
+render_nginx() {
+  local tpl="$TPL_DIR/nginx.conf" out fb new
+  [[ -f $tpl ]] || { warn "Нет шаблона $tpl — nginx.conf не обновлён."; return 0; }
+  [[ -f $NGX_MAP ]] || { mkdir -p "$(dirname "$NGX_MAP")"; : >"$NGX_MAP"; }
+  fb=$FALLBACK_STATIC
+  [[ $(st '.telegram.enabled // false') == true ]] && fb=$FALLBACK_PROXY
+  out=$(<"$tpl")
+  out=${out//'{{FALLBACK}}'/$fb}
+  out=${out//'{{NGX_MAP}}'/$NGX_MAP}
+  out=${out//'{{DOMAIN}}'/$(st .domain)}
+  out=${out//'{{WEB}}'/$(st .web)}
+  out=${out//'{{XHTTP_PATH}}'/$(st .paths.xhttp)}
+  out=${out//'{{AUTH_PATH}}'/$(st .paths.auth)}
+  out=${out//'{{AUTH_CODE}}'/$(st '.auth.code // "ERR_AUTH_FAILED"')}
+  out=${out//'{{AUTH_MSG}}'/$(st '.auth.msg // "Authentication failed."')}
+  new=$(mktemp); printf '%s\n' "$out" >"$new"
+  if [[ -f $NGX_CONF ]] && cmp -s "$new" "$NGX_CONF"; then rm -f "$new"; return 0; fi
+  [[ -f $NGX_CONF ]] && cp -p "$NGX_CONF" "$NGX_CONF.bak"
+  mkdir -p "$(dirname "$NGX_CONF")"; cat "$new" >"$NGX_CONF"; rm -f "$new"
+  if command -v nginx >/dev/null 2>&1 && ! nginx -t >/tmp/autoxray-nginx.log 2>&1; then
+    warn "nginx отклонил конфиг, возвращаю прежний. Лог: /tmp/autoxray-nginx.log"; tail -n 5 /tmp/autoxray-nginx.log >&2
+    if [[ -f $NGX_CONF.bak ]]; then cp -p "$NGX_CONF.bak" "$NGX_CONF"; else rm -f "$NGX_CONF"; fi
+    return 1
+  fi
+  svc reload nginx 2>/dev/null || svc restart nginx
+}
+
+render_all() { apply_xray; local rc=$?; render_subs; render_nginx || rc=1; return $rc; }
+# Для команд, меняющих state: если конфиг не применился, не рапортуем об успехе.
+apply_or_die() { render_all || die "Изменения сохранены в state.json, но не применены (причина выше). Исправьте её и выполните: autoxray render"; }
+
+# ------------------------------------------------------------ пользователи
+
+user_summary() {
+  jq_state -r "$JQ_DEFS"'.users[] | [.name, status(.), (used(.)|tostring), (.limit|tostring), (.expire|tostring)] | @tsv'
+}
+
+cmd_user_list() {
+  need_state
+  printf "${CYAN}%-16s %-9s %-26s %s${NC}\n" "ПОЛЬЗОВАТЕЛЬ" "СТАТУС" "ТРАФИК" "ДО"
+  local name status used limit expire lim
+  while IFS=$'\t' read -r name status used limit expire; do
+    lim=$([[ $limit -gt 0 ]] && echo "$(hbytes "$used") / $(hbytes "$limit")" || echo "$(hbytes "$used") / ∞")
+    printf "%-16s %-9s %-26s %s\n" "$name" "$status" "$lim" "$(hdate "$expire")"
+  done < <(user_summary)
+}
+
+cmd_user_add() {
+  need_root; need_state
+  local name=${1:-} limit=0 expire=0 reset=never
+  valid_name "$name" || die "Имя: 1-24 символа, только A-Z a-z 0-9 _ -"
+  shift
+  [[ -z $(user_get "$name") ]] || die "Пользователь '$name' уже существует."
+  while (($#)); do
+    case $1 in
+      --limit) [[ $# -ge 2 ]] && is_num "$2" || die "--limit <ГБ>"; limit=$(awk -v g="$2" 'BEGIN{printf "%d", g*1073741824}'); shift 2 ;;
+      --days)  [[ $# -ge 2 ]] && is_num "$2" || die "--days <N>";   expire=$(awk -v n="$2" -v t="$(now)" 'BEGIN{printf "%d", t+n*86400}'); shift 2 ;;
+      --reset) [[ ${2:-} =~ ^(monthly|never)$ ]] || die "--reset monthly|never"; reset=$2; shift 2 ;;
+      *) die "Неизвестный параметр: $1" ;;
+    esac
+  done
+  st_edit --arg n "$name" --arg id "$(user_uuid "$(mode)")" --arg h "$(rand 'a-f0-9' 16)" --arg t "$(rand 'A-Za-z0-9' 24)" \
+          --argjson l "$limit" --argjson e "$expire" --argjson c "$(now)" --arg rs "$reset" --argjson nr "$([[ $reset == monthly ]] && next_month || echo 0)" \
+    '.users += [{name: $n, uuid: $id, hy2: $h, token: $t, created: $c, expire: $e, limit: $l, enabled: true, reset: $rs, next_reset: $nr}]'
+  apply_or_die
+  ok "✅ Пользователь '$name' создан."
+  show_user "$name"
+}
+
+cmd_user_del() {
+  need_root; need_state
+  local name=${1:-}; user_must "$name" >/dev/null
+  [[ $(jq '.users | length' "$STATE") -gt 1 ]] || warn "Это последний пользователь — доступ к серверу будет закрыт."
+  st_edit --arg n "$name" '.users |= map(select(.name != $n))'
+  jq --arg n "$name" 'del(.[$n])' "$TRAFFIC" >"$TRAFFIC.tmp" && mv "$TRAFFIC.tmp" "$TRAFFIC"
+  apply_or_die
+  ok "✅ Пользователь '$name' удалён (ключи и ссылки подписки больше не работают)."
+}
+
+cmd_user_set() {
+  need_root; need_state
+  local name=${1:-}; user_must "$name" >/dev/null; shift
+  (($#)) || die "Укажите параметры: --limit ГБ | --days N | --reset monthly|never | --enable | --disable | --reset-traffic"
+  while (($#)); do
+    case $1 in
+      --limit)  [[ $# -ge 2 ]] && is_num "$2" || die "--limit <ГБ> (0 — без лимита)"
+                st_edit --arg n "$name" --argjson l "$(awk -v g="$2" 'BEGIN{printf "%d", g*1073741824}')" '(.users[] | select(.name == $n) | .limit) = $l'; shift 2 ;;
+      --days)   [[ $# -ge 2 ]] && is_num "$2" || die "--days <N> (0 — бессрочно)"
+                st_edit --arg n "$name" --argjson e "$(awk -v n="$2" -v t="$(now)" 'BEGIN{printf "%d", (n>0) ? t+n*86400 : 0}')" '(.users[] | select(.name == $n) | .expire) = $e'; shift 2 ;;
+      --reset)  [[ ${2:-} =~ ^(monthly|never)$ ]] || die "--reset monthly|never"
+                st_edit --arg n "$name" --arg r "$2" --argjson nr "$([[ $2 == monthly ]] && next_month || echo 0)" '(.users[] | select(.name == $n)) |= (.reset = $r | .next_reset = $nr)'; shift 2 ;;
+      --enable)  st_edit --arg n "$name" '(.users[] | select(.name == $n) | .enabled) = true'; shift ;;
+      --disable) st_edit --arg n "$name" '(.users[] | select(.name == $n) | .enabled) = false'; shift ;;
+      --reset-traffic) jq --arg n "$name" 'del(.[$n])' "$TRAFFIC" >"$TRAFFIC.tmp" && mv "$TRAFFIC.tmp" "$TRAFFIC"; shift ;;
+      *) die "Неизвестный параметр: $1" ;;
+    esac
+  done
+  apply_or_die
+  ok "✅ Параметры '$name' обновлены."
+}
+
+cmd_user_rotate() {
+  need_root; need_state
+  local name=${1:-}; user_must "$name" >/dev/null
+  st_edit --arg n "$name" --arg id "$(user_uuid "$(mode)")" --arg h "$(rand 'a-f0-9' 16)" --arg t "$(rand 'A-Za-z0-9' 24)" \
+    '(.users[] | select(.name == $n)) |= (.uuid = $id | .hy2 = $h | .token = $t)'
+  apply_or_die
+  ok "✅ Для '$name' выпущены новые ключи и новая ссылка подписки."
+  show_user "$name"
+}
+
+qr_show() {
+  if command -v qrencode >/dev/null 2>&1; then qrencode -t ANSIUTF8 -m 1 "$1"
+  else warn "qrencode не установлен: apt install qrencode"; fi
+}
+
+show_user() {
+  need_state
+  local name=${1:-} u domain token label link
+  u=$(user_must "$name"); domain=$(st .domain); token=$(jq -r .token <<<"$u")
+  echo
+  echo -e "${YEL}Страница пользователя '$name' (ссылки, QR, приложения)${NC}"
+  echo "https://$domain/$token.html"
+  echo -e "${YEL}Ссылка на подписку (вставить в Happ / v2rayTun)${NC}"
+  echo "https://$domain/$token.json"
+  while IFS='|' read -r label link; do
+    echo -e "\n${YEL}$label${NC}\n$link"
+  done < <(user_links "$name")
+  local tg; tg=$(st '.telegram.link // ""')
+  [[ -n $tg ]] && echo -e "\n${YEL}Telegram Web Proxy${NC}\n$tg"
+  echo
+}
+
+cmd_user_qr() {
+  need_state
+  local name=${1:-} what=${2:-sub} u token domain
+  u=$(user_must "$name"); token=$(jq -r .token <<<"$u"); domain=$(st .domain)
+  case $what in
+    sub)    qr_show "https://$domain/$token.json" ;;
+    xhttp)  qr_show "$(user_links "$name" | sed -n 1p | cut -d'|' -f2)" ;;
+    vision) qr_show "$(user_links "$name" | sed -n 2p | cut -d'|' -f2)" ;;
+    hy2)    qr_show "$(user_links "$name" | sed -n 3p | cut -d'|' -f2)" ;;
+    *) die "QR: sub | xhttp | vision | hy2" ;;
+  esac
+}
+
+cmd_users() {
+  local sub=${1:-list}; shift || true
+  case $sub in
+    add)    locked cmd_user_add "$@" ;;
+    del|rm) locked cmd_user_del "$@" ;;
+    set)    locked cmd_user_set "$@" ;;
+    rotate) locked cmd_user_rotate "$@" ;;
+    list|ls) cmd_user_list ;;
+    link|show) show_user "${1:-}" ;;
+    qr)     cmd_user_qr "$@" ;;
+    *) die "user: add | del | set | rotate | list | link | qr" ;;
+  esac
+}
+
+# --------------------------------------------------------------- трафик
+
+cmd_stats() {
+  need_state
+  cmd_user_list
+  echo
+  echo -e "Всего: ↑ $(hbytes "$(jq '[.[].up] | add // 0' "$TRAFFIC")")   ↓ $(hbytes "$(jq '[.[].down] | add // 0' "$TRAFFIC")")"
+}
+
+# Раз в 5 минут из cron: забирает счётчики Xray (с обнулением), накапливает в traffic.json,
+# отключает пользователей с исчерпанным лимитом или истёкшим сроком, обновляет страницы.
+cmd_collect() {
+  need_state
+  local before after raw merged
+  before=$(active_names)
+  if command -v xray >/dev/null 2>&1; then
+    raw=$(xray api statsquery -s "$API_ADDR" -pattern "user>>>" -reset 2>/dev/null) || raw=""
+    if [[ -n $raw ]]; then
+      merged=$(jq --slurpfile t "$TRAFFIC" '
+        reduce (.stat[]? | select(.name | startswith("user>>>"))
+                | {p: (.name | split(">>>")), v: ((.value | tonumber?) // 0)}) as $e
+          ($t[0]; .[$e.p[1]][(if $e.p[3] == "uplink" then "up" else "down" end)] += $e.v)' <<<"$raw") \
+        && printf '%s\n' "$merged" >"$TRAFFIC.tmp" && mv "$TRAFFIC.tmp" "$TRAFFIC"
+    fi
+  fi
+  local due
+  while IFS= read -r due; do
+    [[ -n $due ]] || continue
+    jq --arg n "$due" 'del(.[$n])' "$TRAFFIC" >"$TRAFFIC.tmp" && mv "$TRAFFIC.tmp" "$TRAFFIC"
+    st_edit --arg n "$due" --argjson nr "$(next_month)" '(.users[] | select(.name == $n) | .next_reset) = $nr'
+  done < <(jq -r --argjson now "$(now)" '.users[] | select((.reset // "never") == "monthly" and (.next_reset // 0) <= $now) | .name' "$STATE")
+  after=$(active_names)
+  if [[ $before != "$after" ]]; then apply_xray; fi
+  render_subs
+}
+
+# --------------------------------------------------- узлы моста (EU)
+
+# vless://UUID@host:port?type=..&security=tls|none&...#имя  ->  JSON узла (без id)
+parse_vless() {
+  local url=$1 body name="" uuid hp addr rest port q pair k v pairs extra
+  declare -A P=()
+  [[ $url == vless://* ]] || return 1
+  body=${url#vless://}
+  if [[ $body == *"#"* ]]; then name=$(urldecode "${body##*#}"); body=${body%%#*}; fi
+  [[ $body == *"@"* ]] || return 1
+  uuid=${body%@*}; hp=${body#*@}
+  addr=${hp%%:*}; rest=${hp#*:}; port=${rest%%\?*}
+  q=""; [[ $rest == *"?"* ]] && q=${rest#*\?}
+  IFS='&' read -ra pairs <<<"$q"
+  for pair in "${pairs[@]}"; do k=${pair%%=*}; v=${pair#*=}; P[$k]=$(urldecode "$v"); done
+  [[ $uuid =~ ^[0-9a-fA-F-]{36}$ && -n $addr && $port =~ ^[0-9]+$ ]] || return 1
+  [[ ${P[security]:-tls} =~ ^(tls|none)$ ]] || return 1
+  extra=${P[extra]:-}
+  if [[ -n $extra ]]; then jq -e . <<<"$extra" >/dev/null 2>&1 || return 1; fi
+  jq -n --arg url "$url" --arg name "${name:-$addr}" --arg uuid "$uuid" --arg addr "$addr" --argjson port "$port" \
+    --arg type "${P[type]:-xhttp}" --arg sec "${P[security]:-tls}" --arg path "${P[path]:-/}" --arg mode "${P[mode]:-auto}" \
+    --arg extra "$extra" --arg sni "${P[sni]:-$addr}" --arg fp "${P[fp]:-firefox}" --arg alpn "${P[alpn]:-}" --arg flow "${P[flow]:-}" '
+    {url: $url, name: $name, uuid: $uuid, addr: $addr, port: $port, type: $type, security: $sec, path: $path, mode: $mode,
+     extra: $extra, sni: $sni, fp: $fp, alpn: (if $alpn == "" then ["h2", "http/1.1"] else ($alpn | split(",")) end), flow: $flow}'
+}
+
+cmd_node() {
+  need_state
+  [[ $(mode) == bridge ]] || die "Узлы есть только в режиме моста (установка: autoXRAY3.sh домен vless://...)."
+  local sub=${1:-list}; shift || true
+  case $sub in
+    add) need_root
+         local j; j=$(parse_vless "${1:-}") || die "Неверная vless-ссылка (нужен security=tls или none; REALITY не поддерживается)."
+         st_edit --argjson n "$j" '.nodes += [$n + {id: (([.nodes[].id] | max // 0) + 1)}]'
+         locked apply_or_die; ok "✅ Узел добавлен (подписки пользователей обновлены)." ;;
+    del) need_root
+         local k=${1:-}; [[ -n $k ]] || die "node del <имя|id>"
+         [[ $(jq --arg k "$k" '[.nodes[] | select(.name == $k or (.id | tostring) == $k)] | length' "$STATE") -gt 0 ]] || die "Узел '$k' не найден."
+         [[ $(jq --arg k "$k" '[.nodes[] | select(.name != $k and (.id | tostring) != $k)] | length' "$STATE") -gt 0 ]] || die "Нельзя удалить последний узел."
+         st_edit --arg k "$k" '.nodes |= map(select(.name != $k and (.id | tostring) != $k))'
+         locked apply_or_die; ok "✅ Узел удалён." ;;
+    list|ls) printf "${CYAN}%-4s %-22s %-32s %s${NC}\n" ID УЗЕЛ АДРЕС ТРАНСПОРТ
+             jq -r '.nodes[] | [(.id | tostring), .name, "\(.addr):\(.port)", "\(.type)/\(.security)"] | @tsv' "$STATE" \
+               | while IFS=$'\t' read -r id name addr tr; do printf "%-4s %-22s %-32s %s\n" "$id" "$name" "$addr" "$tr"; done ;;
+    *) die "node: add <vless://...> | del <имя|id> | list" ;;
+  esac
+}
+
+# ------------------------------------------------------------------ WARP
+
+curl_warp() { # METHOD PATH [extra curl args...]
+  local m=$1 p=$2; shift 2
+  "$CURL" -fsS --max-time 30 -H 'User-Agent: okhttp/3.12.1' -H 'Content-Type: application/json' -X "$m" "$WARP_API/$p" "$@"
+}
+
+# Регистрация анонимного устройства Cloudflare WARP (бесплатный тариф) —
+# тот же API, что использует ImMALWARE/bash-warp-generator (MIT).
+# Результат хранится в state.json и подключается как нативный wireguard-outbound Xray.
+warp_register() {
+  command -v openssl >/dev/null || die "Нужен openssl"
+  local key priv pub resp id token resp2 peer v4 v6 cid reserved tmp
+  tmp=$(mktemp); key=$tmp.pem
+  openssl genpkey -algorithm X25519 -out "$key" 2>/dev/null || { rm -f "$tmp" "$key"; die "openssl не умеет X25519"; }
+  priv=$(openssl pkey -in "$key" -outform DER 2>/dev/null | tail -c 32 | base64 -w0)
+  pub=$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null | tail -c 32 | base64 -w0)
+  rm -f "$tmp" "$key"
+  [[ -n $priv && -n $pub ]] || die "Не удалось сгенерировать ключи WireGuard"
+
+  resp=$(curl_warp POST reg -d "{\"install_id\":\"\",\"tos\":\"$(date -u +%FT%TZ)\",\"key\":\"$pub\",\"fcm_token\":\"\",\"type\":\"ios\",\"locale\":\"en_US\"}") \
+    || die "Cloudflare не ответил на регистрацию (сеть или блокировка API)."
+  id=$(jq -r '.result.id // empty' <<<"$resp"); token=$(jq -r '.result.token // empty' <<<"$resp")
+  [[ -n $id && -n $token ]] || die "Cloudflare отклонил регистрацию: $(jq -c '.errors // .' <<<"$resp" 2>/dev/null | head -c 300)"
+
+  resp2=$(curl_warp PATCH "reg/$id" -H "Authorization: Bearer $token" -d '{"warp_enabled":true}') \
+    || die "Не удалось активировать WARP-устройство."
+  peer=$(jq -r '.result.config.peers[0].public_key // empty' <<<"$resp2")
+  v4=$(jq -r '.result.config.interface.addresses.v4 // empty' <<<"$resp2")
+  v6=$(jq -r '.result.config.interface.addresses.v6 // empty' <<<"$resp2")
+  cid=$(jq -r '.result.config.client_id // empty' <<<"$resp2"); [[ -n $cid ]] || cid=$(jq -r '.result.config.client_id // empty' <<<"$resp")
+  [[ -n $peer && -n $v4 ]] || die "В ответе Cloudflare нет peer/адреса — формат API мог измениться."
+
+  reserved="[0,0,0]"
+  if [[ -n $cid ]]; then
+    reserved=$(printf '%s' "$cid" | base64 -d 2>/dev/null | od -An -tu1 -v | xargs | jq -Rc 'split(" ") | map(tonumber)') || reserved="[0,0,0]"
+    [[ $(jq 'length' <<<"$reserved" 2>/dev/null) == 3 ]] || reserved="[0,0,0]"
+  fi
+
+  st_edit --arg sk "$priv" --arg pp "$peer" --arg v4 "$v4" --arg v6 "$v6" --argjson rs "$reserved" \
+          --arg ep "$WARP_ENDPOINT" --arg id "$id" --arg tk "$token" '
+    .warp = ((.warp // {}) + {
+      registered: true, secretKey: $sk, peerPublicKey: $pp, endpoint: $ep, reserved: $rs,
+      address: ([$v4 + "/32"] + (if $v6 != "" then [$v6 + "/128"] else [] end)),
+      deviceId: $id, deviceToken: $tk})
+    | .warp.enabled = (.warp.enabled // false) | .warp.ru = (.warp.ru // false) | .warp.domains = (.warp.domains // [])'
+  ok "✅ WARP-устройство зарегистрировано ($v4)."
+}
+
+cmd_warp() {
+  need_state
+  [[ $(mode) == direct ]] || die "WARP не используется в режиме моста: российский трафик моста и так идёт напрямую."
+  local sub=${1:-status}; shift || true
+  case $sub in
+    register) need_root; locked warp_register ;;
+    on)  need_root
+         [[ $(st '.warp.registered // false') == true ]] || locked warp_register
+         st_edit '.warp.enabled = true'; locked apply_or_die && ok "✅ WARP включён." ;;
+    off) need_root; st_edit '.warp.enabled = false'; locked apply_or_die && ok "✅ WARP выключен." ;;
+    ru)  need_root
+         case ${1:-} in
+           on)  [[ $(st '.warp.registered // false') == true ]] || locked warp_register
+                st_edit '.warp.enabled = true | .warp.ru = true'; locked apply_or_die
+                ok "✅ Российские сайты идут через WARP."
+                warn "Обновите подписку в клиентах: теперь RU-трафик клиент отдаёт на сервер, а не напрямую." ;;
+           off) st_edit '.warp.ru = false'; locked apply_or_die; ok "✅ RU снова идёт напрямую (подписку в клиентах обновите)." ;;
+           *) die "warp ru on|off" ;;
+         esac ;;
+    add) need_root; local d=${1:-}; [[ -n $d ]] || die "warp add <домен|geosite:xxx>"
+         [[ $d == *:* ]] || d="domain:$d"
+         st_edit --arg d "$d" '.warp.domains = (((.warp.domains // []) + [$d]) | unique)'
+         locked apply_or_die; ok "✅ $d → WARP" ;;
+    del) need_root; local d=${1:-}; [[ -n $d ]] || die "warp del <домен>"
+         [[ $d == *:* ]] || d="domain:$d"
+         st_edit --arg d "$d" '.warp.domains = ((.warp.domains // []) - [$d])'
+         locked apply_or_die; ok "✅ $d удалён из списка WARP" ;;
+    list|status)
+         echo -e "${YEL}WARP:${NC} зарегистрирован=$(st '.warp.registered // false') включён=$(st '.warp.enabled // false') RU-через-WARP=$(st '.warp.ru // false')"
+         echo -e "${YEL}Домены:${NC}"; jq -r '(.warp.domains // [])[] | "  " + .' "$STATE" ;;
+    check)
+         local su sp
+         su=$(st .socks.user); sp=$(st .socks.pass)
+         echo "Запрос через socks5 сервера (one.one.one.one всегда направлен в WARP):"
+         "$CURL" -fsS --max-time 15 --socks5-hostname "$su:$sp@127.0.0.1:10443" https://one.one.one.one/cdn-cgi/trace | grep -E '^(ip|loc|warp)=' \
+           || die "Нет ответа. Проверьте: autoxray warp status; systemctl status xray" ;;
+    *) die "warp: register | on | off | ru on|off | add | del | list | check" ;;
+  esac
+}
+
+# ------------------------------------------------------ служебные команды
+
+cmd_status() {
+  need_state
+  local d; d=$(st .domain)
+  echo -e "${YEL}autoXRAY $AX_VERSION${NC}  домен: $d  fingerprint: $(st .fingerprint)"
+  local s
+  for s in xray nginx telemt tproxy-server; do
+    if systemctl is-active --quiet "$s" 2>/dev/null; then echo -e "  $s: ${GRN}RUNNING${NC}"
+    elif systemctl list-unit-files "$s.service" 2>/dev/null | grep -q "$s"; then echo -e "  $s: ${RED}STOPPED${NC}"; fi
+  done
+  echo "  пользователей: $(jq '.users | length' "$STATE"), активных: $(active_names | wc -w)"
+  echo "  WARP: registered=$(st '.warp.registered // false') enabled=$(st '.warp.enabled // false') ru=$(st '.warp.ru // false')"
+  if [[ -r /var/lib/xray/cert/fullchain.pem ]] && command -v openssl >/dev/null; then
+    echo "  сертификат до: $(openssl x509 -enddate -noout -in /var/lib/xray/cert/fullchain.pem | cut -d= -f2)"
+  fi
+}
+
+cmd_fingerprint() {
+  need_root; need_state
+  case ${1:-} in chrome|firefox|safari|ios|android|edge|360|qq) ;; *) die "fingerprint: chrome firefox safari ios android edge 360 qq" ;; esac
+  st_edit --arg f "$1" '.fingerprint = $f'; locked apply_or_die; ok "✅ fingerprint → $1 (обновите подписки в клиентах)"
+}
+
+cmd_telegram() {
+  need_root; need_state
+  case ${1:-} in
+    set) [[ -n ${2:-} ]] || die "telegram set <tg://webproxy?...>"; st_edit --arg l "$2" '.telegram = {enabled: true, link: $l}' ;;
+    off) st_edit '.telegram = {enabled: false, link: ""}' ;;
+    update) bash "$TPL_DIR/telegram/update.sh"; return ;;
+    remove) bash "$TPL_DIR/telegram/uninstall.sh"; return ;;
+    *) die "telegram: set <ссылка> | off | update | remove" ;;
+  esac
+  locked apply_or_die
+}
+
+cmd_backup() {
+  need_root; need_state
+  local out=${1:-/root/autoxray-backup-$(date +%F-%H%M).tar.gz} p paths=() web
+  web=$(st .web)
+  for p in etc/autoxray usr/local/etc/xray/config.json etc/telemt etc/tproxy-server var/lib/xray/cert \
+           etc/nginx/conf.d/default.conf etc/nginx/autoxray-userinfo.map root/.acme.sh "${web#/}"; do
+    [[ -e /$p ]] && paths+=("$p")
+  done
+  (umask 077; tar -C / -czf "$out" "${paths[@]}") || die "Не удалось создать бэкап"
+  chmod 600 "$out"
+  ok "✅ Бэкап: $out"
+  warn "Внутри ключи и пароли — храните в безопасном месте."
+}
+
+cmd_restore() {
+  need_root
+  local f=${1:-}; [[ -f $f ]] || die "restore <файл.tar.gz>"
+  tar -tzf "$f" >/dev/null 2>&1 || die "Файл не является tar.gz"
+  warn "Будут перезаписаны конфиги из архива ($f)."
+  read -rp "Продолжить? (y/N): " a; [[ $a =~ ^[Yy]$ ]] || exit 1
+  tar -C / -xzf "$f" || die "Ошибка распаковки"
+  svc daemon-reload; svc restart nginx xray; svc restart telemt tproxy-server 2>/dev/null
+  ok "✅ Восстановлено."
+}
+
+cmd_update_core() {
+  need_root; need_state
+  local v=${1:-$(st '.xray_version // "latest"')}
+  if [[ $v == latest ]]; then
+    bash -c "$(curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+  else
+    bash -c "$(curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version "$v"
+  fi
+  svc restart xray
+}
+
+# Переносит установку autoXRAY 2 (один пользователь, config.json) в state.json:
+# сохраняются UUID, пароль Hysteria2, пути, ключи socks5 и адрес старой ссылки подписки.
+cmd_migrate() {
+  need_root
+  [[ -f $STATE ]] && die "state.json уже существует — переносить нечего."
+  [[ -f $XRAY_CFG ]] || die "Не найден $XRAY_CFG"
+  local cfg=$XRAY_CFG ngx=${AX_NGINX_CONF:-/etc/nginx/conf.d/default.conf}
+  local domain uuid hy2 xp su sp token fp="firefox" web user=${1:-main} sub
+  domain=$(jq -r '.inbounds[] | select(.tag == "Hysteria2") | .streamSettings.tlsSettings.serverName // empty' "$cfg")
+  uuid=$(jq -r '.inbounds[] | select(.tag == "vsRAWtlsVISION") | .settings.clients[0].id // empty' "$cfg")
+  hy2=$(jq -r '.inbounds[] | select(.tag == "Hysteria2") | .settings.clients[0].auth // empty' "$cfg")
+  xp=$(jq -r '.inbounds[] | select(.tag == "vsXHTTPtls") | .streamSettings.xhttpSettings.path // empty' "$cfg"); xp=${xp#/}
+  su=$(jq -r '.inbounds[] | select(.tag == "socks5") | .settings.accounts[0].user // empty' "$cfg")
+  sp=$(jq -r '.inbounds[] | select(.tag == "socks5") | .settings.accounts[0].pass // empty' "$cfg")
+  [[ -n $domain && -n $uuid && -n $hy2 && -n $xp && -n $su && -n $sp ]] || die "config.json не похож на конфиг autoXRAY 2 (нет нужных inbound'ов)."
+  token=$(sed -n 's#.*location = /\([A-Za-z0-9]\{20,32\}\)\.json.*#\1#p' "$ngx" 2>/dev/null | head -n1)
+  [[ -n $token ]] || token=$(rand 'A-Za-z0-9' 24)
+  web="${AX_WEB:-/var/www/$domain}"
+  sub="$web/$token.json"
+  [[ -f $sub ]] && fp=$(jq -r '.[0].outbounds[0].streamSettings.tlsSettings.fingerprint // "firefox"' "$sub")
+  mkdir -p "$AX_ETC"; chmod 700 "$AX_ETC"
+  echo '{}' >"$TRAFFIC"; chmod 600 "$TRAFFIC"
+  cp -p "$cfg" "$AX_ETC/config.v2.json.bak"
+  jq -n --arg d "$domain" --arg f "$fp" --arg xp "$xp" --arg w "$web" --arg su "$su" --arg sp "$sp" \
+        --arg n "$user" --arg id "$uuid" --arg h "$hy2" --arg t "$token" --argjson c "$(now)" '
+    {version: 3, mode: "direct", nodes: [], domain: $d, fingerprint: $f, web: $w, xray_version: "",
+     paths: {xhttp: $xp, auth: "/api/v1/authenticate"}, socks: {user: $su, pass: $sp},
+     telegram: {enabled: false, link: ""}, warp: {registered: false, enabled: false, ru: false, domains: []},
+     users: [{name: $n, uuid: $id, hy2: $h, token: $t, created: $c, expire: 0, limit: 0, enabled: true, reset: "never", next_reset: 0}]}' >"$STATE"
+  chmod 600 "$STATE"
+  ok "✅ Перенесено из autoXRAY 2: пользователь '$user', ссылка подписки сохранена (токен $token)."
+  warn "Прежний config.json сохранён: $AX_ETC/config.v2.json.bak"
+}
+
+# Обновление самого autoxray, шаблонов и компонентов до релиза (по умолчанию — последнего).
+cmd_self_update() {
+  need_root
+  local tag=${1:-} raw tmp f
+  if [[ -z $tag ]]; then
+    tag=$("$CURL" -fsS --max-time 15 "https://api.github.com/repos/$AX_REPO/releases/latest" | jq -r '.tag_name // empty')
+    [[ -n $tag ]] || die "Не удалось узнать последний релиз (GitHub API недоступен)."
+  fi
+  [[ $tag == v* ]] || tag="v$tag"
+  [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Версия вида vX.Y.Z"
+  [[ ${tag#v} == "$AX_VERSION" ]] && { ok "Уже установлена версия $AX_VERSION."; return 0; }
+  raw="https://raw.githubusercontent.com/$AX_REPO/$tag"
+  tmp=$(mktemp -d)
+  for f in autoxray templates/sub.html templates/nginx.conf components/telegram/install.sh components/telegram/update.sh components/telegram/uninstall.sh; do
+    mkdir -p "$tmp/$(dirname "$f")"
+    "$CURL" -fsSL --max-time 30 "$raw/$f" -o "$tmp/$f" || { rm -rf "$tmp"; die "Не удалось скачать $f ($tag)"; }
+  done
+  bash -n "$tmp/autoxray" || { rm -rf "$tmp"; die "Скачанный autoxray не прошёл проверку синтаксиса."; }
+  install -m 755 "$tmp/autoxray" /usr/local/bin/autoxray
+  mkdir -p "$TPL_DIR/telegram"
+  install -m 644 "$tmp/templates/sub.html" "$tmp/templates/nginx.conf" "$TPL_DIR/"
+  install -m 755 "$tmp"/components/telegram/*.sh "$TPL_DIR/telegram/"
+  rm -rf "$tmp"
+  ok "✅ autoxray $AX_VERSION → ${tag#v}. Заметки: https://github.com/$AX_REPO/releases/tag/$tag"
+  /usr/local/bin/autoxray render
+}
+
+# Полное удаление: Telegram Web Proxy, Xray, nginx, acme.sh, данные и сам autoxray.
+cmd_uninstall() {
+  need_root; need_state
+  local web; web=$(st .web)
+  warn "Будут удалены: Xray, nginx, acme.sh, сайт-маскировка ($web), Telegram Web Proxy, ключи и данные пользователей."
+  warn "Сначала сделайте бэкап, если он может понадобиться: autoxray backup"
+  read -rp "Для подтверждения введите yes: " a; [[ $a == yes ]] || die "Отменено."
+  [[ -f $TPL_DIR/telegram/uninstall.sh ]] && bash "$TPL_DIR/telegram/uninstall.sh" || true
+  bash -c "$("$CURL" -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge
+  svc disable --now nginx 2>/dev/null; apt-get remove -y nginx >/dev/null 2>&1
+  [[ -x $HOME/.acme.sh/acme.sh ]] && "$HOME/.acme.sh/acme.sh" --uninstall >/dev/null 2>&1
+  rm -rf "$web" /var/lib/xray /usr/local/share/autoxray "$AX_ETC" "$NGX_MAP" /etc/cron.d/autoxray \
+         /etc/sysctl.d/999-autoXRAY.conf /etc/security/limits.d/99-autoXRAY.conf /usr/local/bin/autoxray
+  ok "✅ autoXRAY удалён."
+}
+
+cmd_render() { need_root; need_state; locked render_all; }
+
+cmd_init() {
+  need_root
+  local domain="" fp=firefox xp="" ap=/api/v1/authenticate web="" user=main xv="" mode=direct nodes='[]' nj
+  while (($#)); do
+    case $1 in
+      --mode) [[ ${2:-} =~ ^(direct|bridge)$ ]] || die "--mode direct|bridge"; mode=$2; shift 2 ;;
+      --node) nj=$(parse_vless "${2:-}") || die "Неверная vless-ссылка узла: ${2:-}"
+              nodes=$(jq -c --argjson n "$nj" '. + [$n + {id: (length + 1)}]' <<<"$nodes"); shift 2 ;;
+      --domain) domain=$2; shift 2 ;; --fp) fp=$2; shift 2 ;; --xhttp-path) xp=$2; shift 2 ;;
+      --auth-path) ap=$2; shift 2 ;; --web) web=$2; shift 2 ;; --user) user=$2; shift 2 ;;
+      --xray-version) xv=$2; shift 2 ;;
+      *) die "init: неизвестный параметр $1" ;;
+    esac
+  done
+  [[ -n $domain ]] || die "init --domain <домен>"
+  [[ $mode == direct || $(jq length <<<"$nodes") -gt 0 ]] || die "Для режима моста нужен хотя бы один --node vless://..."
+  valid_name "$user" || die "Недопустимое имя пользователя"
+  [[ -f $STATE ]] && die "Уже инициализировано: $STATE (для повторной установки удалите его или сделайте backup)"
+  mkdir -p "$AX_ETC"; chmod 700 "$AX_ETC"
+  [[ -n $xp ]] || xp=$(rand 'a-z0-9' 6)
+  [[ -n $web ]] || web="${AX_WEB:-/var/www/$domain}"
+  echo '{}' >"$TRAFFIC"; chmod 600 "$TRAFFIC"
+  local variants=(
+    "ERR_INVALID_CREDENTIALS|The username or password you entered is incorrect."
+    "ERR_INVALID_CREDENTIALS|The identity or security key you provided is invalid."
+    "ERR_BAD_PASSWORD|Incorrect password. Please verify your credentials and retry."
+    "ERR_KEY_MISMATCH|The security key provided does not match the account identity."
+    "ERR_CREDENTIAL_REJECTED|Credential verification rejected by the authentication authority."
+    "ERR_PASSWORD_MISMATCH|The password provided does not match the registered key."
+    "ERR_INCORRECT_KEY|Incorrect security credentials provided for this principal."
+    "ERR_USER_NOT_FOUND|Principal identity not found in directory services."
+    "ERR_IDENTITY_NOT_FOUND|No account found matching the provided identity."
+    "ERR_PRINCIPAL_MISSING|User principal does not exist in this organizational realm."
+    "ERR_ACCOUNT_NOT_FOUND|Account identifier not recognized by the identity provider."
+    "ERR_UNKNOWN_USER|Unrecognized user identity. Please verify your login."
+    "ERR_LOOKUP_FAILED|User lookup failed: Specified identity does not exist."
+    "ERR_AUTH_FAILED|Authentication failed: The provided credentials do not match."
+    "ERR_DIRECTORY_MISMATCH|Credentials could not be verified against the corporate directory."
+    "ERR_RECORDS_MISMATCH|The security credentials entered do not match our records."
+  )
+  local pick=${variants[$((RANDOM % ${#variants[@]}))]}
+  jq -n --arg ac "${pick%%|*}" --arg am "${pick#*|}" --arg d "$domain" --arg f "$fp" --arg xp "$xp" --arg ap "$ap" --arg w "$web" --arg xv "$xv" \
+        --arg su "$(rand 'A-Za-z0-9' 6)" --arg sp "$(rand 'A-Za-z0-9' 16)" \
+        --arg n "$user" --arg id "$(user_uuid "$mode")" --arg h "$(rand 'a-f0-9' 16)" --arg t "$(rand 'A-Za-z0-9' 24)" --argjson c "$(now)" \
+        --arg mode "$mode" --argjson nodes "$nodes" '
+    {version: 3, mode: $mode, nodes: $nodes, auth: {code: $ac, msg: $am}, domain: $d, fingerprint: $f, web: $w, xray_version: $xv,
+     paths: {xhttp: $xp, auth: $ap}, socks: {user: $su, pass: $sp},
+     telegram: {enabled: false, link: ""},
+     warp: {registered: false, enabled: false, ru: false, domains: []},
+     users: [{name: $n, uuid: $id, hy2: $h, token: $t, created: $c, expire: 0, limit: 0, enabled: true, reset: "never", next_reset: 0}]}' >"$STATE"
+  chmod 600 "$STATE"
+  ok "✅ state.json создан: $STATE"
+}
+
+# ----------------------------------------------------------------- меню
+
+pause() { read -rp "Enter — продолжить..." _; }
+
+menu() {
+  need_state
+  local c name
+  while true; do
+    clear
+    cmd_status
+    echo -e "\n${CYAN}1)${NC} Пользователи        ${CYAN}6)${NC} WARP"
+    echo -e "${CYAN}2)${NC} Добавить            ${CYAN}7)${NC} Бэкап"
+    echo -e "${CYAN}3)${NC} Удалить             ${CYAN}8)${NC} Применить конфиг заново"
+    echo -e "${CYAN}4)${NC} Ссылки и QR         ${CYAN}9)${NC} Обновить ядро Xray"
+    echo -e "${CYAN}5)${NC} Статистика          ${CYAN}0)${NC} Выход"
+    read -rp "> " c
+    case $c in
+      1) cmd_user_list; pause ;;
+      2) read -rp "Имя: " name; read -rp "Лимит трафика, ГБ (Enter — без лимита): " lim; read -rp "Срок, дней (Enter — бессрочно): " days
+         args=(); [[ -n $lim ]] && args+=(--limit "$lim"); [[ -n $days ]] && args+=(--days "$days")
+         (locked cmd_user_add "$name" "${args[@]}"); pause ;;
+      3) cmd_user_list; read -rp "Кого удалить: " name; (locked cmd_user_del "$name"); pause ;;
+      4) cmd_user_list; read -rp "Пользователь: " name
+         (show_user "$name"; read -rp "Показать QR подписки? (y/N): " q; [[ $q =~ ^[Yy]$ ]] && cmd_user_qr "$name" sub); pause ;;
+      5) cmd_stats; pause ;;
+      6) cmd_warp status
+         echo -e "\n1) включить  2) выключить  3) RU через WARP вкл  4) RU напрямую  5) добавить домен  6) проверить  0) назад"
+         read -rp "> " w
+         case $w in
+           1) (cmd_warp on) ;; 2) (cmd_warp off) ;; 3) (cmd_warp ru on) ;; 4) (cmd_warp ru off) ;;
+           5) read -rp "Домен: " d; (cmd_warp add "$d") ;; 6) (cmd_warp check) ;;
+         esac; pause ;;
+      7) (cmd_backup); pause ;;
+      8) (cmd_render); pause ;;
+      9) (cmd_update_core); pause ;;
+      0|q) exit 0 ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<EOF
+autoxray $AX_VERSION — управление autoXRAY
+
+  autoxray                         меню
+  autoxray status                  состояние служб
+  autoxray user list
+  autoxray user add <имя> [--limit ГБ] [--days N] [--reset monthly]
+  autoxray user del <имя>
+  autoxray user set <имя> [--limit ГБ] [--days N] [--reset monthly|never] [--enable|--disable] [--reset-traffic]
+  autoxray user rotate <имя>       новые ключи и ссылка
+  autoxray user link <имя>         ссылки и адрес страницы подписки
+  autoxray user qr <имя> [sub|xhttp|vision|hy2]
+  autoxray stats                   трафик по пользователям
+  autoxray node add <vless://...>|del <имя|id>|list   (режим моста)
+  autoxray migrate [имя]           перенос установки autoXRAY 2
+  autoxray warp register|on|off|status|check
+  autoxray warp ru on|off          российские сайты через WARP
+  autoxray warp add|del <домен>    свой список доменов через WARP
+  autoxray fingerprint <браузер>
+  autoxray telegram set <ссылка>|off|update|remove
+  autoxray backup [файл] | restore <файл>
+  autoxray update-core [версия]
+  autoxray render                  пересобрать конфиги Xray, nginx и подписки
+  autoxray self-update [vX.Y.Z]    обновить autoxray до релиза (по умолчанию — последнего)
+  autoxray version
+  autoxray uninstall               удалить всё (с подтверждением)
+  autoxray collect                 (cron) учёт трафика и лимитов
+EOF
+}
+
+main() {
+  local cmd=${1:-menu}; shift || true
+  case $cmd in
+    menu)         menu ;;
+    status)       cmd_status ;;
+    user|users)   cmd_users "$@" ;;
+    stats)        cmd_stats ;;
+    collect)      need_root; locked cmd_collect ;;
+    warp)         cmd_warp "$@" ;;
+    fingerprint)  cmd_fingerprint "$@" ;;
+    telegram)     cmd_telegram "$@" ;;
+    backup)       cmd_backup "$@" ;;
+    restore)      cmd_restore "$@" ;;
+    update-core)  cmd_update_core "$@" ;;
+    render)       cmd_render ;;
+    init)         cmd_init "$@" ;;
+    migrate)      cmd_migrate "$@" ;;
+    node|nodes)   cmd_node "$@" ;;
+    self-update)  cmd_self_update "$@" ;;
+    uninstall)    cmd_uninstall ;;
+    -v|--version|version) echo "autoxray $AX_VERSION" ;;
+    help|-h|--help) usage ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
