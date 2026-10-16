@@ -17,7 +17,7 @@ BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
 
-AX_RELEASE="3.2.0"
+AX_RELEASE="3.3.0"
 AX_REF_DEFAULT="main"   # при выпуске релиза заменяется на тег (см. .github/workflows/release.yml)
 AX_REF="${AUTOXRAY_REF:-$AX_REF_DEFAULT}"
 RAW="https://raw.githubusercontent.com/cergo666/autoXRAY/$AX_REF"
@@ -132,7 +132,18 @@ ask AX_USER "Имя первого пользователя (латиница, �
 
 WARP_MODE=off
 if [ "$INIT_MODE" = direct ]; then
-    ask AX_WARP "Подключить Cloudflare WARP? n — нет, y — да (свой список доменов), ru — ещё и российские сайты через WARP [n]:" n
+    if [ -z "$AX_WARP" ]; then
+        echo -e "\n${BOLD}${YEL}Cloudflare WARP${NC}"
+        echo "  Часть трафика сервер сможет выпускать не напрямую, а через сеть Cloudflare."
+        echo "  Это касается только того, что дошло до сервера. Что клиент отправит на сервер, решает его маршрутизация."
+        echo -e "  ${CYAN}n${NC}   не нужен"
+        echo -e "  ${CYAN}y${NC}   включить, нужные сайты вы добавите сами: ${DIM}autoxray warp add сайт.com${NC}"
+        echo -e "  ${CYAN}ru${NC}  включить и пускать через WARP российские сайты, которые дошли до сервера"
+        echo -e "      ${DIM}Клиенты с маршрутизацией (подписка) российские сайты на сервер не шлют, они открываются напрямую.${NC}"
+        echo -e "      ${DIM}Чтобы такой клиент слал их на сервер: autoxray user set имя --ru server${NC}"
+        echo -e "      ${DIM}Клиенты без маршрутизации (ссылка vless:// в роутере) отправляют на сервер всё, что вы им настроили.${NC}"
+    fi
+    ask AX_WARP "Ваш выбор [n]:" n
     case $AX_WARP in y|Y) WARP_MODE=on ;; ru|RU) WARP_MODE=ru ;; esac
 fi
 
@@ -327,14 +338,7 @@ esac
 
 autoxray render || die "Не удалось применить конфигурацию Xray (autoxray render)"
 
-mkdir -p /etc/cron.d
-cat > /etc/cron.d/autoxray <<'EOF'
-# учёт трафика, лимиты и сроки пользователей autoXRAY
-*/5 * * * * root /usr/local/bin/autoxray collect >/dev/null 2>&1
-# обновление гео-данных (маршрутизация), по понедельникам
-17 4 * * 1 root /usr/local/bin/autoxray geo-update --quiet >/dev/null 2>&1
-EOF
-chmod 644 /etc/cron.d/autoxray
+autoxray setup-cron
 
 # ==========================================
 # Итог

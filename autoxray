@@ -9,7 +9,7 @@ set -uo pipefail
 # bash >= 5.2: '&' в замене ${var//a/b} — спецсимвол; ссылки содержат '&'
 shopt -u patsub_replacement 2>/dev/null || true
 
-AX_VERSION="3.2.0"
+AX_VERSION="3.3.0"
 AX_REPO="cergo666/autoXRAY"
 XRAY_TESTED="v26.9.9"          # версия ядра, с которой этот релиз проверен тестами
 API="${AX_API:-https://api.github.com}"
@@ -17,6 +17,9 @@ AX_ETC="${AX_ETC:-/etc/autoxray}"
 STATE="$AX_ETC/state.json"
 TRAFFIC="$AX_ETC/traffic.json"
 LOCK="$AX_ETC/.lock"
+IPS="$AX_ETC/ips.json"                       # известные IP пользователей с лимитом: {имя: {ip: {first, last}}}
+BANS="$AX_ETC/bans.json"                     # блокировки лишних IP: [{user, ip, until}]
+ACCESS_LOG="${AX_ACCESS_LOG:-/var/log/xray/access.log}"
 XRAY_CFG="${AX_XRAY_CFG:-/usr/local/etc/xray/config.json}"
 NGX_MAP="${AX_NGINX_MAP:-/etc/nginx/autoxray-userinfo.map}"
 TPL_DIR="${AX_TEMPLATES:-/usr/local/share/autoxray}"
@@ -84,7 +87,14 @@ update_banner() {
 days_left() { echo $(( ($1 - $(date +%s)) / 86400 )); }
 
 need_root()  { [[ $DRY == 1 || $EUID -eq 0 ]] || die "Нужны root права."; }
-need_state() { [[ -f $STATE ]] || die "autoXRAY не установлен: нет $STATE"; }
+# Явные значения «ru» и «ip_limit» у каждого пользователя (раньше режим RU выводился из общего флага WARP)
+normalize_state() {
+  [[ -w $STATE ]] || return 0
+  jq -e '[.users[] | select(.ru == null or .ip_limit == null)] | length == 0' "$STATE" >/dev/null 2>&1 && return 0
+  st_edit '(.warp.enabled == true and .warp.registered == true and .warp.ru == true) as $r
+           | .users |= map(.ru //= (if $r then "server" else "direct" end) | .ip_limit //= 0)'
+}
+need_state() { [[ -f $STATE ]] || die "autoXRAY не установлен: нет $STATE"; normalize_state; }
 svc()        { [[ $DRY == 1 ]] || systemctl "$@" 9>&-; }
 
 rand()     { LC_ALL=C tr -dc "$1" </dev/urandom | head -c "$2"; }
@@ -148,7 +158,7 @@ $s[0] as $S
 | ($W.registered == true and $W.enabled == true) as $warp_on
 | ($W.ru == true) as $ru
 | {
-    log: {dnsLog: false, access: "/var/log/xray/access.log", error: "/var/log/xray/error.log", loglevel: "none"},
+    log: {dnsLog: false, access: "/var/log/xray/access.log", error: "/var/log/xray/error.log", loglevel: (if has_ip_limit($S) then "warning" else "none" end)},
     stats: {},
     api: {tag: "api", services: ["StatsService"]},
     policy: {levels: {"0": {statsUserUplink: true, statsUserDownlink: true}}},
@@ -242,8 +252,9 @@ $s[0] as $S
     routing: {
       domainStrategy: "IPIfNonMatch",
       rules: (
-        [
-          {inboundTag: ["api"], outboundTag: "api"},
+        [{inboundTag: ["api"], outboundTag: "api"}]
+        + ban_rules
+        + [
           {ip: ["geoip:private"], outboundTag: "block"},
           {port: "25, 135, 137-139, 445", outboundTag: "block"},
           {protocol: ["bittorrent"], outboundTag: "block"},
@@ -257,6 +268,13 @@ $s[0] as $S
       )
     }
   }
+JQ
+)
+
+# Общее для серверных конфигов: лог доступа нужен только при лимитах IP; блокировка лишних IP по правилу user + source
+SERVER_COMMON=$(cat <<'JQ'
+def has_ip_limit($S): ([$S.users[] | select(.enabled and ((.ip_limit // 0) > 0))] | length) > 0;
+def ban_rules: ([$b[0][] | select(.until > $now)] | group_by(.user) | map({user: [.[0].user], source: (map(.ip) | unique), outboundTag: "block"}));
 JQ
 )
 
@@ -353,8 +371,9 @@ $s[0] as $S
         fallbackTag: "direct"
       }],
       rules: (
-        [
-          {inboundTag: ["api"], outboundTag: "api"},
+        [{inboundTag: ["api"], outboundTag: "api"}]
+        + ban_rules
+        + [
           {ip: ["geoip:private"], outboundTag: "block"},
           {port: "25, 135, 137-139, 445", outboundTag: "block"},
           {protocol: ["bittorrent"], outboundTag: "block"},
@@ -374,9 +393,10 @@ JQ
 )
 
 render_xray_json() {
-  local prog=$XRAY_JQ
-  [[ $(mode) == bridge ]] && prog="$BRIDGE_COMMON"$'\n'"$BRIDGE_JQ"
-  jq -n --slurpfile s "$STATE" --slurpfile t "$TRAFFIC" --argjson now "$(now)" \
+  local prog="$SERVER_COMMON"$'\n'"$XRAY_JQ"
+  [[ $(mode) == bridge ]] && prog="$SERVER_COMMON"$'\n'"$BRIDGE_COMMON"$'\n'"$BRIDGE_JQ"
+  [[ -f $BANS ]] || echo '[]' >"$BANS"
+  jq -n --slurpfile s "$STATE" --slurpfile t "$TRAFFIC" --slurpfile b "$BANS" --argjson now "$(now)" \
     --arg dummy_id "$(new_uuid)" --arg dummy_auth "$(rand 'a-f0-9' 16)" "$prog"
 }
 
@@ -426,7 +446,7 @@ user_links() {
            "RAW VISION (RU>EU \($x.name))|vless://\(route_uuid($u.uuid; $x.id))@\($S.domain):443?security=tls&type=tcp&headerType=&path=&host=&flow=xtls-rprx-vision&sni=\($S.domain)&fp=\($S.fingerprint)&spx=%2F#\("RU>EU_raw_" + $x.name | @uri)",
            "Direct EU (\($x.name))|\($x.url)")
       else
-        "VLESS XHTTP TLS stream-up (для моста)|vless://\($u.uuid)@\($S.domain):443?security=tls&alpn=h2&type=xhttp&mode=stream-up&path=%2F\($S.paths.xhttp)&extra=\($ex)&sni=\($S.domain)&fp=\($S.fingerprint)#vlessXHTTPtls-\($u.name)",
+        "VLESS XHTTP TLS stream-up|vless://\($u.uuid)@\($S.domain):443?security=tls&alpn=h2&type=xhttp&mode=stream-up&path=%2F\($S.paths.xhttp)&extra=\($ex)&sni=\($S.domain)&fp=\($S.fingerprint)#vlessXHTTPtls-\($u.name)",
         "VLESS RAW TLS VISION|vless://\($u.uuid)@\($S.domain):443?security=tls&type=tcp&headerType=&path=&host=&flow=xtls-rprx-vision&sni=\($S.domain)&fp=\($S.fingerprint)&spx=%2F#vlessRAWtlsVision-\($u.name)",
         "HYSTERIA2|hy2://\($u.hy2)@\($S.domain):443/?sni=\($S.domain)&alpn=h3#Hysteria2-\($u.name)"
       end
@@ -476,7 +496,7 @@ JQ
 CLIENT_DIRECT_TAIL=$(cat <<'JQ'
 . as $S
 | ($S.users[] | select(.name == $n)) as $u
-| (($S.warp.enabled == true and $S.warp.registered == true and $S.warp.ru == true) | not) as $ru_direct
+| (($u.ru // (if ($S.warp.enabled == true and $S.warp.registered == true and $S.warp.ru == true) then "server" else "direct" end)) == "direct") as $ru_direct
 | {tag: "proxy", protocol: "vless",
    settings: {vnext: [{address: $S.domain, port: 443, users: [{id: $u.uuid, encryption: "none"}]}]},
    streamSettings: {
@@ -669,16 +689,17 @@ apply_or_die() { render_all || die "Изменения сохранены в sta
 # ------------------------------------------------------------ пользователи
 
 user_summary() {
-  jq_state -r "$JQ_DEFS"'.users[] | [.name, status(.), (used(.)|tostring), (.limit|tostring), (.expire|tostring)] | @tsv'
+  jq_state -r "$JQ_DEFS"'.users[] | [.name, status(.), (used(.)|tostring), (.limit|tostring), (.expire|tostring), ((.ip_limit // 0)|tostring), (.ru // "direct")] | @tsv'
 }
 
 cmd_user_list() {
   need_state
   if [[ ${1:-} == --plain ]]; then user_summary; return; fi
   section "👥 Пользователи"
-  printf '%b   %s %s %s %s %s%b\n' "$DIM" "$(pad ИМЯ 14)" "$(pad СТАТУС 12)" "$(pad РАСХОД 15)" "$(pad ТРАФИК 17)" ДЕЙСТВУЕТ "$NC"
-  local name status used limit expire icon col col2 label txt left exp
-  while IFS=$'\t' read -r name status used limit expire; do
+  printf '%b   %s %s %s %s %s %s %s%b\n' "$DIM" "$(pad ИМЯ 14)" "$(pad СТАТУС 12)" "$(pad РАСХОД 15)" "$(pad ТРАФИК 17)" "$(pad RU 7)" "$(pad IP 6)" ДЕЙСТВУЕТ "$NC"
+  local name status used limit expire ipl ru icon col col2 label txt left exp rul ipt wru
+  wru=$([[ $(st '.warp.enabled // false') == true && $(st '.warp.ru // false') == true ]] && echo 1 || echo 0)
+  while IFS=$'\t' read -r name status used limit expire ipl ru; do
     case $status in
       active)   icon="🟢"; col=$GRN;  label="активен" ;;
       disabled) icon="⚫"; col=$DIM;  label="отключён" ;;
@@ -691,13 +712,15 @@ cmd_user_list() {
       left=$(days_left "$expire"); col2=$GRN; [[ $left -le 7 ]] && col2=$YEL; [[ $left -le 3 ]] && col2=$RED
       exp="$(hdate "$expire") ${col2}($left дн.)${NC}"
     else exp="${DIM}бессрочно${NC}"; fi
-    printf '%s %b%s%b %b%s%b %b %s %b\n' "$icon" "$BOLD" "$(pad "$name" 14)" "$NC" "$col" "$(pad "$label" 12)" "$NC" "$(bar "$used" "$limit" 10)" "$(pad "$txt" 17)" "$exp"
+    if [[ $ru == server ]]; then rul=$([[ $wru == 1 ]] && echo WARP || echo сервер); else rul=прямо; fi
+    if [[ ${ipl:-0} -gt 0 ]]; then ipt="$(ips_count "$name")/$ipl"; else ipt="∞"; fi
+    printf '%s %b%s%b %b%s%b %b %s %s %s %b\n' "$icon" "$BOLD" "$(pad "$name" 14)" "$NC" "$col" "$(pad "$label" 12)" "$NC" "$(bar "$used" "$limit" 10)" "$(pad "$txt" 17)" "$(pad "$rul" 7)" "$(pad "$ipt" 6)" "$exp"
   done < <(user_summary)
 }
 
 cmd_user_add() {
   need_root; need_state
-  local name=${1:-} limit=0 expire=0 reset=never
+  local name=${1:-} limit=0 expire=0 reset=never ru=direct ips=0
   valid_name "$name" || die "Имя: 1-24 символа, только A-Z a-z 0-9 _ -"
   shift
   [[ -z $(user_get "$name") ]] || die "Пользователь '$name' уже существует."
@@ -706,12 +729,14 @@ cmd_user_add() {
       --limit) [[ $# -ge 2 ]] && is_num "$2" || die "--limit <ГБ>"; limit=$(awk -v g="$2" 'BEGIN{printf "%d", g*1073741824}'); shift 2 ;;
       --days)  [[ $# -ge 2 ]] && is_num "$2" || die "--days <N>";   expire=$(awk -v n="$2" -v t="$(now)" 'BEGIN{printf "%d", t+n*86400}'); shift 2 ;;
       --reset) [[ ${2:-} =~ ^(monthly|never)$ ]] || die "--reset monthly|never"; reset=$2; shift 2 ;;
+      --ru)    [[ ${2:-} =~ ^(direct|server)$ ]] || die "--ru direct|server"; ru=$2; shift 2 ;;
+      --ips)   [[ ${2:-} =~ ^[0-9]+$ ]] || die "--ips <число IP> (0 без лимита)"; ips=$2; shift 2 ;;
       *) die "Неизвестный параметр: $1" ;;
     esac
   done
-  st_edit --arg n "$name" --arg id "$(user_uuid "$(mode)")" --arg h "$(rand 'a-f0-9' 16)" --arg t "$(rand 'A-Za-z0-9' 24)" \
+  st_edit --arg n "$name" --arg ru "$ru" --argjson ips "$ips" --arg id "$(user_uuid "$(mode)")" --arg h "$(rand 'a-f0-9' 16)" --arg t "$(rand 'A-Za-z0-9' 24)" \
           --argjson l "$limit" --argjson e "$expire" --argjson c "$(now)" --arg rs "$reset" --argjson nr "$([[ $reset == monthly ]] && next_month || echo 0)" \
-    '.users += [{name: $n, uuid: $id, hy2: $h, token: $t, created: $c, expire: $e, limit: $l, enabled: true, reset: $rs, next_reset: $nr}]'
+    '.users += [{name: $n, uuid: $id, hy2: $h, token: $t, created: $c, expire: $e, limit: $l, enabled: true, reset: $rs, next_reset: $nr, ru: $ru, ip_limit: $ips}]'
   apply_or_die
   ok "✅ Пользователь '$name' создан."
   show_user "$name"
@@ -730,7 +755,7 @@ cmd_user_del() {
 cmd_user_set() {
   need_root; need_state
   local name=${1:-}; user_must "$name" >/dev/null; shift
-  (($#)) || die "Укажите параметры: --limit ГБ | --days N | --reset monthly|never | --enable | --disable | --reset-traffic"
+  (($#)) || die "Укажите параметры: --limit ГБ | --days N | --ips N | --ru direct|server | --reset monthly|never | --enable | --disable | --reset-traffic"
   while (($#)); do
     case $1 in
       --limit)  [[ $# -ge 2 ]] && is_num "$2" || die "--limit <ГБ> (0 — без лимита)"
@@ -739,6 +764,11 @@ cmd_user_set() {
                 st_edit --arg n "$name" --argjson e "$(awk -v n="$2" -v t="$(now)" 'BEGIN{printf "%d", (n>0) ? t+n*86400 : 0}')" '(.users[] | select(.name == $n) | .expire) = $e'; shift 2 ;;
       --reset)  [[ ${2:-} =~ ^(monthly|never)$ ]] || die "--reset monthly|never"
                 st_edit --arg n "$name" --arg r "$2" --argjson nr "$([[ $2 == monthly ]] && next_month || echo 0)" '(.users[] | select(.name == $n)) |= (.reset = $r | .next_reset = $nr)'; shift 2 ;;
+      --ips)    [[ ${2:-} =~ ^[0-9]+$ ]] || die "--ips <число IP> (0 без лимита)"
+                st_edit --arg n "$name" --argjson v "$2" '(.users[] | select(.name == $n) | .ip_limit) = $v'
+                [[ $2 -gt 0 ]] || { jq --arg n "$name" 'del(.[$n])' "$IPS" >"$IPS.tmp" 2>/dev/null && mv "$IPS.tmp" "$IPS"; }; shift 2 ;;
+      --ru)     [[ ${2:-} =~ ^(direct|server)$ ]] || die "--ru direct|server"
+                st_edit --arg n "$name" --arg v "$2" '(.users[] | select(.name == $n) | .ru) = $v'; shift 2 ;;
       --enable)  st_edit --arg n "$name" '(.users[] | select(.name == $n) | .enabled) = true'; shift ;;
       --disable) st_edit --arg n "$name" '(.users[] | select(.name == $n) | .enabled) = false'; shift ;;
       --reset-traffic) jq --arg n "$name" 'del(.[$n])' "$TRAFFIC" >"$TRAFFIC.tmp" && mv "$TRAFFIC.tmp" "$TRAFFIC"; shift ;;
@@ -817,6 +847,94 @@ cmd_stats() {
   rule
   printf ' %bИтого%b   %b↑ %s%b   %b↓ %s%b\n' "$BOLD" "$NC" "$CYAN" "$(hbytes "$(jq '[.[].up] | add // 0' "$TRAFFIC")")" "$NC" \
     "$GRN" "$(hbytes "$(jq '[.[].down] | add // 0' "$TRAFFIC")")" "$NC"
+}
+
+# ------------------------------------------------------------ лимит IP
+
+ips_count() { jq -r --arg n "$1" --argjson now "$(now)" '((.[$n] // {}) | [to_entries[] | select(.value.last >= ($now - 600))] | length)' "$IPS" 2>/dev/null || echo 0; }
+
+# Из access.log вытаскивает пары «email ip» (без заблокированных соединений и без источников без email)
+ipwatch_parse() {
+  awk '/ accepted / && / email: / && !/ -> block/ {
+    src = ""; for (i = 1; i <= NF; i++) if ($i == "from") { src = $(i + 1); break }
+    email = $NF; if (src == "" || email == "") next
+    sub(/^(tcp|udp):/, "", src); sub(/:[0-9]+$/, "", src); gsub(/[\[\]]/, "", src)
+    print email, src }' | sort -u
+}
+
+# Раз в минуту из cron. Для пользователей с лимитом IP: первые N адресов считаются «своими» (пока их видно,
+# слот занят; через 10 минут без активности слот освобождается), следующие блокируются на 30 минут.
+# Лог доступа читается и сразу обнуляется: он живёт не дольше минуты.
+cmd_ipwatch() {
+  need_state
+  jq -e '[.users[] | select(.enabled and ((.ip_limit // 0) > 0))] | length > 0' "$STATE" >/dev/null || return 0
+  [[ -f $ACCESS_LOG ]] || return 0
+  local tmp seen new old_act new_act t
+  t=$(now)
+  tmp=$(mktemp); cp "$ACCESS_LOG" "$tmp"; : >"$ACCESS_LOG"
+  seen=$(ipwatch_parse <"$tmp" | jq -Rn '[inputs | split(" ") | select(length == 2)]'); rm -f "$tmp"
+  [[ -f $IPS ]] || echo '{}' >"$IPS"; [[ -f $BANS ]] || echo '[]' >"$BANS"
+  new=$(jq -n --argjson seen "$seen" --slurpfile st "$STATE" --slurpfile ips "$IPS" --slurpfile bans "$BANS" --argjson now "$t" '
+    ($st[0].users | map(select(.enabled and ((.ip_limit // 0) > 0)) | {key: .name, value: .ip_limit}) | from_entries) as $lim
+    | ($ips[0] // {} | with_entries(select($lim[.key] != null) | .value |= with_entries(select(.value.last >= ($now - 600))))) as $known
+    | reduce ($seen[] | select($lim[.[0]] != null)) as [$u, $ip]
+        ({ips: $known, bans: ($bans[0] // [] | map(select(.until > $now)))};
+         if .ips[$u][$ip] != null then .ips[$u][$ip].last = $now
+         elif ([.bans[] | select(.user == $u and .ip == $ip)] | length) > 0 then .
+         elif ((.ips[$u] // {}) | length) < $lim[$u] then .ips[$u][$ip] = {first: $now, last: $now}
+         else .bans += [{user: $u, ip: $ip, until: ($now + 1800)}] end)')
+  old_act=$(jq -c --argjson now "$t" '[.[] | select(.until > $now) | {user, ip}] | sort' "$BANS")
+  new_act=$(jq -c '[.bans[] | {user, ip}] | sort' <<<"$new")
+  jq '.ips' <<<"$new" >"$IPS.tmp" && mv "$IPS.tmp" "$IPS"
+  if [[ $old_act != "$new_act" ]]; then
+    jq '.bans' <<<"$new" >"$BANS.tmp" && mv "$BANS.tmp" "$BANS"
+    jq -r --argjson old "$old_act" '.bans[] | select(. as $b | ($old | index({user: $b.user, ip: $b.ip})) == null) | "🚫 \(.user): лишний IP \(.ip) заблокирован"' <<<"$new"
+    apply_xray
+  fi
+}
+
+cmd_ips() {
+  need_state
+  local filter=${1:-} u lim ip last until_ n=0
+  section "📱 Устройства (IP)"
+  while IFS=$'\t' read -r u lim; do
+    [[ -n $filter && $filter != "$u" ]] && continue
+    n=$((n + 1))
+    echo -e "\n ${BOLD}$u${NC}  ${DIM}лимит: $lim, сейчас: $(ips_count "$u")${NC}"
+    while IFS=$'\t' read -r ip last; do
+      echo -e "    ${GRN}●${NC} $ip ${DIM}(последняя активность $(( ($(now) - last) / 60 )) мин назад)${NC}"
+    done < <(jq -r --arg n "$u" --argjson now "$(now)" '(.[$n] // {}) | to_entries[] | select(.value.last >= ($now - 600)) | [.key, .value.last] | @tsv' "$IPS" 2>/dev/null)
+    while IFS=$'\t' read -r ip until_; do
+      echo -e "    ${RED}🚫${NC} $ip ${DIM}заблокирован ещё $(( (until_ - $(now)) / 60 )) мин${NC}"
+    done < <(jq -r --arg n "$u" --argjson now "$(now)" '.[] | select(.user == $n and .until > $now) | [.ip, .until] | @tsv' "$BANS" 2>/dev/null)
+  done < <(jq -r '.users[] | select((.ip_limit // 0) > 0) | [.name, (.ip_limit | tostring)] | @tsv' "$STATE")
+  [[ $n -gt 0 ]] || echo -e " ${DIM}Лимиты IP не заданы. Включить: autoxray user set <имя> --ips 3${NC}"
+}
+
+cmd_unban() {
+  need_root; need_state
+  local who=${1:-}; [[ -n $who ]] || die "unban <имя|--all>"
+  if [[ $who == --all ]]; then echo '[]' >"$BANS"; echo '{}' >"$IPS"
+  else
+    user_must "$who" >/dev/null
+    jq --arg n "$who" 'map(select(.user != $n))' "$BANS" >"$BANS.tmp" && mv "$BANS.tmp" "$BANS"
+    jq --arg n "$who" 'del(.[$n])' "$IPS" >"$IPS.tmp" && mv "$IPS.tmp" "$IPS"
+  fi
+  apply_or_die; ok "✅ Блокировки сняты."
+}
+
+# Расписание: учёт трафика, лимиты IP, гео-данные
+cmd_setup_cron() {
+  need_root; mkdir -p /etc/cron.d
+  cat >/etc/cron.d/autoxray <<'EOF'
+# учёт трафика, лимиты и сроки пользователей autoXRAY
+*/5 * * * * root /usr/local/bin/autoxray collect >/dev/null 2>&1
+# лимит IP: разбор лога доступа (работает, только если у кого-то задан лимит)
+* * * * * root /usr/local/bin/autoxray ipwatch >/dev/null 2>&1
+# обновление гео-данных (маршрутизация), по понедельникам
+17 4 * * 1 root /usr/local/bin/autoxray geo-update --quiet >/dev/null 2>&1
+EOF
+  chmod 644 /etc/cron.d/autoxray
 }
 
 # Раз в 5 минут из cron: забирает счётчики Xray (с обнулением), накапливает в traffic.json,
@@ -1061,9 +1179,12 @@ cmd_warp() {
            on)  [[ $(st '.warp.registered // false') == true ]] || locked warp_register
                 warp_enable_checked "${2:-}" || exit 1
                 st_edit '.warp.enabled = true | .warp.ru = true'; locked apply_or_die
-                ok "✅ Российские сайты идут через WARP."
-                warn "Обновите подписку в клиентах: теперь RU-трафик клиент отдаёт на сервер, а не напрямую." ;;
-           off) st_edit '.warp.ru = false'; locked apply_or_die; ok "✅ RU снова идёт напрямую (подписку в клиентах обновите)." ;;
+                ok "✅ Сервер будет отправлять российские сайты через WARP."
+                echo -e " ${BOLD}Кого это касается${NC}"
+                echo -e "   ${CYAN}•${NC} клиентов, у которых российские сайты доходят до сервера: ссылки vless:// без маршрутизации и пользователи с режимом «сервер»"
+                echo -e "   ${CYAN}•${NC} остальные по подписке по-прежнему открывают российские сайты напрямую с устройства, мимо сервера"
+                echo -e " ${DIM}Отправить российские сайты конкретного пользователя на сервер: autoxray user set <имя> --ru server${NC}" ;;
+           off) st_edit '.warp.ru = false'; locked apply_or_die; ok "✅ Российские сайты, дошедшие до сервера, снова выходят напрямую." ;;
            *) die "warp ru on|off" ;;
          esac ;;
     add) need_root; local d=${1:-}; [[ -n $d ]] || die "warp add <домен|geosite:xxx>"
@@ -1078,12 +1199,25 @@ cmd_warp() {
          section "🌍 Cloudflare WARP"
          kv "🆔" "Профиль" "$(tick "$(st '.warp.registered // false')") зарегистрирован"
          kv "🔌" "Состояние" "$(tick "$(st '.warp.enabled // false')") включён"
-         kv "🇷🇺" "Российские сайты" "$(tick "$(st '.warp.ru // false')") через WARP ${DIM}(иначе напрямую)${NC}"
+         kv "🇷🇺" "RU на сервере" "$(tick "$(st '.warp.ru // false')") российские сайты, дошедшие до сервера, идут через WARP"
+         kv "📍" "Endpoint" "$(st '.warp.endpoint // "не задан"')"
          local n; n=$(jq '(.warp.domains // []) | length' "$STATE")
          if [[ $n -gt 0 ]]; then
-           echo -e " 🎯 ${DIM}Свои домены${NC}"
+           echo -e " 🎯 ${DIM}Свои домены (всегда через WARP, если трафик дошёл до сервера)${NC}"
            local dom; while IFS= read -r dom; do echo -e "    ${CYAN}•${NC} $dom"; done < <(jq -r '(.warp.domains // [])[]' "$STATE")
-         else echo -e " 🎯 ${DIM}Свои домены: не заданы (autoxray warp add <домен>)${NC}"; fi ;;
+         else echo -e " 🎯 ${DIM}Свои домены: не заданы (autoxray warp add <домен>)${NC}"; fi
+         echo -e "\n ${BOLD}Как это работает${NC}"
+         echo -e " ${DIM}WARP работает на сервере и касается только трафика, который до сервера дошёл.${NC}"
+         echo -e " ${DIM}Что именно клиент отправит на сервер, решает его маршрутизация:${NC}"
+         echo -e "   ${CYAN}•${NC} подписка с маршрутизацией, режим «прямо»: российские сайты идут с устройства напрямую, сервер их не видит"
+         echo -e "   ${CYAN}•${NC} подписка, режим «сервер», или ссылка vless:// без правил (роутер, приложение без маршрутизации): российские сайты приходят на сервер"
+         echo -e "   ${DIM}Дальше сервер сам: свои домены и (если включено выше) российские сайты уходят через WARP, остальное напрямую.${NC}"
+         echo -e "\n ${BOLD}Режим российских сайтов у пользователей${NC}"
+         local un ur
+         while IFS=$'\t' read -r un ur; do
+           if [[ $ur == server ]]; then echo -e "   🛰  $(pad "$un" 14) через сервер"; else echo -e "   🏠 $(pad "$un" 14) напрямую с устройства"; fi
+         done < <(jq -r '.users[] | [.name, (.ru // "direct")] | @tsv' "$STATE")
+         echo -e " ${DIM}Изменить: autoxray user set <имя> --ru server|direct${NC}" ;;
     check)
          local su sp
          su=$(st .socks.user); sp=$(st .socks.pass)
@@ -1169,13 +1303,14 @@ cmd_restore() {
 
 xray_version() { xray version 2>/dev/null | awk 'NR == 1 {print "v" $2}'; }
 
-# Стабильные версии Xray новее текущей (по одной в строке, свежие сверху)
+# Версии Xray новее текущей: «тег<TAB>true|false» (true — пререлиз), свежие сверху
 core_newer() {
   local cur; cur=$(xray_version)
   "$CURL" -fsS --max-time 10 "$API/repos/XTLS/Xray-core/releases" 2>/dev/null \
-    | jq -r '.[] | select(.prerelease == false and .draft == false) | .tag_name' 2>/dev/null \
-    | while read -r t; do ver_gt "$t" "$cur" && echo "$t"; done | sort -rV | head -n 12
+    | jq -r '.[] | select(.draft == false) | "\(.tag_name)\t\(.prerelease)"' 2>/dev/null \
+    | while IFS=$'\t' read -r t pre; do ver_gt "$t" "$cur" && printf '%s\t%s\n' "$t" "$pre"; done | sort -rV -t$'\t' -k1,1 | head -n 15
 }
+core_is_pre() { "$CURL" -fsS --max-time 10 "$API/repos/XTLS/Xray-core/releases" 2>/dev/null | jq -e --arg t "$1" 'any(.[]; .tag_name == $t and .prerelease == true)' >/dev/null 2>&1; }
 
 core_warning() {
   echo -e "\n ${BOLD}${YEL}⚠️  Ядро Xray лучше не обновлять без необходимости${NC}"
@@ -1193,7 +1328,11 @@ cmd_core() {
       kv "📌" "Установлено" "${BOLD}${cur:-не найдено}${NC}"
       kv "✅" "Проверено" "$XRAY_TESTED ${DIM}(с этим релизом autoXRAY)${NC}"
       newer=$(core_newer)
-      if [[ -n $newer ]]; then echo -e " 🆕 ${DIM}Новее установленной:${NC}"; while read -r t; do echo -e "    ${CYAN}•${NC} $t"; done <<<"$newer"
+      if [[ -n $newer ]]; then
+        echo -e " 🆕 ${DIM}Новее установленной:${NC}"
+        while IFS=$'\t' read -r t pre; do
+          if [[ $pre == true ]]; then echo -e "    ${YEL}•${NC} $t  ${YEL}пререлиз${NC}"; else echo -e "    ${CYAN}•${NC} $t"; fi
+        done <<<"$newer"
       else echo -e " ${DIM}Новее установленной версий нет (или GitHub недоступен).${NC}"; fi
       core_warning ;;
     update)
@@ -1204,6 +1343,7 @@ cmd_core() {
       [[ $v == v* ]] || v="v$v"
       prev=$(xray_version)
       core_warning
+      core_is_pre "$v" && echo -e "\n ${BOLD}${RED}🧪 $v это пререлиз.${NC} ${DIM}Он может содержать ошибки и менять поведение. Для постоянной работы выбирайте стабильные версии.${NC}"
       echo -e "\n Сейчас: ${BOLD}${prev:-?}${NC}  →  будет установлена: ${BOLD}$v${NC}"
       if [[ $yes != 1 ]]; then read -rp "$(echo -e " ${BOLD}Продолжить? Введите yes:${NC} ")" a; [[ $a == yes ]] || die "Отменено."; fi
       bash -c "$("$CURL" -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version "$v" \
@@ -1277,6 +1417,7 @@ cmd_self_update() {
   install -m 755 "$tmp"/components/telegram/*.sh "$TPL_DIR/telegram/"
   rm -rf "$tmp"
   ok "✅ autoxray $AX_VERSION → ${tag#v}. Заметки: https://github.com/$AX_REPO/releases/tag/$tag"
+  /usr/local/bin/autoxray setup-cron
   /usr/local/bin/autoxray render
 }
 
@@ -1509,8 +1650,8 @@ choose() {
 # pick_user — выбор пользователя; имя в PICKED
 PICKED=""
 pick_user() {
-  local labels=() names=() name status used limit expire ic
-  while IFS=$'\t' read -r name status used limit expire; do
+  local labels=() names=() name status used limit expire _ipl _ru ic
+  while IFS=$'\t' read -r name status used limit expire _ipl _ru; do
     case $status in active) ic="🟢" ;; disabled) ic="⚫" ;; expired) ic="⌛" ;; limit) ic="🚫" ;; *) ic="❔" ;; esac
     names+=("$name")
     if [[ $limit -gt 0 ]]; then labels+=("$ic $(pad "$name" 16) $(hbytes "$used") / $(hbytes "$limit")"); else labels+=("$ic $(pad "$name" 16) $(hbytes "$used")"); fi
@@ -1524,7 +1665,8 @@ user_menu_actions() { # имя
   local name=$1 act lim days
   while true; do
     clear; cmd_user_list; echo
-    choose "Пользователь «$name»" "🔗 Ссылки и ключи" "📷 QR подписки" "📝 Лимит и срок" "🔌 Отключить / включить" "🔁 Новые ключи и ссылка" "❌ Удалить" "🔙 Назад" || return 0
+    choose "Пользователь «$name»" "🔗 Ссылки и ключи" "📷 QR подписки" "📝 Лимит трафика и срок" "📱 Лимит устройств (IP)" \
+      "🇷🇺 Российские сайты: куда идут" "🔌 Отключить / включить" "🔁 Новые ключи и ссылка" "❌ Удалить" "🔙 Назад" || return 0
     act=$CHOICE
     case $act in
       0) show_user "$name"; pause ;;
@@ -1533,11 +1675,20 @@ user_menu_actions() { # имя
          lim=$(ask "Лимит трафика, ГБ"); days=$(ask "Срок, дней от сегодня")
          [[ -n $lim ]] && (locked cmd_user_set "$name" --limit "$lim")
          [[ -n $days ]] && (locked cmd_user_set "$name" --days "$days"); pause ;;
-      3) if [[ $(jq -r --arg n "$name" '.users[] | select(.name == $n) | .enabled' "$STATE") == true ]]
+      3) echo -e " ${DIM}Сколько разных IP-адресов может одновременно пользоваться доступом. 0 снимает лимит.${NC}"
+         echo -e " ${DIM}Лишние адреса блокируются на 30 минут. Для работы включается лог доступа, он очищается раз в минуту.${NC}"
+         lim=$(ask "Лимит IP (сейчас: $(jq -r --arg n "$name" '.users[] | select(.name == $n) | (.ip_limit // 0)' "$STATE"))")
+         [[ -n $lim ]] && (locked cmd_user_set "$name" --ips "$lim"); pause ;;
+      4) echo -e " ${DIM}Куда клиент по подписке отправляет российские сайты.${NC}"
+         if choose "Российские сайты" "🏠 Напрямую с устройства (мимо сервера)" "🛰  Через сервер (и через WARP, если он включён для RU)" "🔙 Отмена"; then
+           case $CHOICE in 0) (locked cmd_user_set "$name" --ru direct) ;; 1) (locked cmd_user_set "$name" --ru server) ;; esac
+           echo -e " ${DIM}Подписку в приложении клиента нужно обновить.${NC}"
+         fi; pause ;;
+      5) if [[ $(jq -r --arg n "$name" '.users[] | select(.name == $n) | .enabled' "$STATE") == true ]]
          then (locked cmd_user_set "$name" --disable); else (locked cmd_user_set "$name" --enable); fi; pause ;;
-      4) confirm "Выпустить новые ключи? Старая ссылка перестанет работать" && (locked cmd_user_rotate "$name"); pause ;;
-      5) if confirm "Удалить «$name» без возможности восстановления"; then (locked cmd_user_del "$name"); pause; return 0; fi ;;
-      6) return 0 ;;
+      6) confirm "Выпустить новые ключи? Старая ссылка перестанет работать" && (locked cmd_user_rotate "$name"); pause ;;
+      7) if confirm "Удалить «$name» без возможности восстановления"; then (locked cmd_user_del "$name"); pause; return 0; fi ;;
+      8) return 0 ;;
     esac
   done
 }
@@ -1594,9 +1745,10 @@ menu_update() {
       1) newer=$(core_newer)
          clear; cmd_core list; echo
          if [[ -n $newer ]]; then
-           local vers=(); mapfile -t vers <<<"$newer"
-           if choose "Установить версию (после подтверждения)" "${vers[@]}" "🔙 Не обновлять"; then
-             [[ $CHOICE -lt ${#vers[@]} ]] && (cmd_core update "${vers[$CHOICE]}")
+           local tags=() labels=() t pre
+           while IFS=$'\t' read -r t pre; do tags+=("$t"); if [[ $pre == true ]]; then labels+=("$t   🧪 пререлиз"); else labels+=("$t"); fi; done <<<"$newer"
+           if choose "Установить версию (после подтверждения)" "${labels[@]}" "🔙 Не обновлять"; then
+             [[ $CHOICE -lt ${#tags[@]} ]] && (cmd_core update "${tags[$CHOICE]}")
            fi
          fi; pause ;;
       2) (cmd_geo_update); pause ;;
@@ -1637,8 +1789,9 @@ usage() {
   echo -e "  ${C}autoxray stats${N}                 📊 трафик по пользователям"
   echo -e "${H}Пользователи${N}"
   echo -e "  ${C}autoxray user list${N} ${D}[--plain]${N}"
-  echo -e "  ${C}autoxray user add${N} <имя> ${D}[--limit ГБ] [--days N] [--reset monthly]${N}"
-  echo -e "  ${C}autoxray user set${N} <имя> ${D}[--limit ГБ] [--days N] [--reset monthly|never] [--enable|--disable] [--reset-traffic]${N}"
+  echo -e "  ${C}autoxray user add${N} <имя> ${D}[--limit ГБ] [--days N] [--ips N] [--ru direct|server] [--reset monthly]${N}"
+  echo -e "  ${C}autoxray user set${N} <имя> ${D}[--limit ГБ] [--days N] [--ips N] [--ru direct|server] [--reset monthly|never] [--enable|--disable] [--reset-traffic]${N}"
+  echo -e "  ${C}autoxray ips${N} ${D}[имя]${N}  ${C}unban${N} <имя|--all>   ${D}лимит устройств (IP) и блокировки${N}"
   echo -e "  ${C}autoxray user del${N} <имя>        ${C}user rotate${N} <имя>  ${D}новые ключи и ссылка${N}"
   echo -e "  ${C}autoxray user link${N} <имя> ${D}[--plain]${N}  ${C}user qr${N} <имя> ${D}[sub|xhttp|vision|hy2]${N}"
   echo -e "${H}Сеть${N}"
@@ -1677,6 +1830,10 @@ main() {
     node|nodes)   cmd_node "$@" ;;
     self-update)  cmd_self_update "$@" ;;
     uninstall)    cmd_uninstall ;;
+    ipwatch)      need_root; locked cmd_ipwatch ;;
+    ips)          cmd_ips "$@" ;;
+    unban)        cmd_unban "$@" ;;
+    setup-cron)   cmd_setup_cron ;;
     doctor)       cmd_doctor ;;
     geo-update)   need_root; cmd_geo_update "$@" ;;
     firewall)     cmd_firewall "$@" ;;

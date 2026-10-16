@@ -40,7 +40,7 @@ check "autoxray в PATH" autoxray version
 check "xray -test" xray run -test -c /usr/local/etc/xray/config.json
 check "nginx -t" nginx -t
 check "xray и nginx запущены" bash -c 'pgrep -x xray && pgrep -x nginx'
-check "cron для учёта трафика" test -f /etc/cron.d/autoxray
+check "cron: учёт трафика, лимит IP, гео-данные" bash -c 'grep -q collect /etc/cron.d/autoxray && grep -q ipwatch /etc/cron.d/autoxray && grep -q geo-update /etc/cron.d/autoxray'
 [ "$(stat -c %a /var/lib/xray/cert/privkey.pem)" = 640 ] && pass "ключ TLS: права 640" || fail "права ключа: $(stat -c %a /var/lib/xray/cert/privkey.pem)"
 TOKEN=$(jq -r '.users[0].token' /etc/autoxray/state.json)
 check "подписка отдаётся" bash -c "curl -fsS --max-time 8 https://$DOMAIN/$TOKEN.json | jq -e 'length == 3'"

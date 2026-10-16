@@ -83,6 +83,47 @@ code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/$TOK
 autoxray user del bob >/dev/null && pass "bob удалён" || fail "del bob"
 code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/$TOKEN_B.json"); [ "$code" = 404 ] && pass "ссылка bob мертва" || fail "ссылка bob жива: $code"
 
+step "Режим российских сайтов у каждого пользователя"
+autoxray user add carl --ru server >/dev/null && pass "carl создан с --ru server" || fail "user add carl"
+TOKEN_C=$(jq -r '.users[] | select(.name=="carl").token' /etc/autoxray/state.json)
+TOKEN_A=$(jq -r '.users[] | select(.name=="alice").token' /etc/autoxray/state.json)
+has_ru_direct() { jq -e '.[0].routing.rules | map(.ip // [] | index("geoip:ru")) | any(. != null)' "$WEB/$1.json" >/dev/null; }
+has_ru_direct "$TOKEN_A" && pass "alice (ru direct): российские сайты в подписке идут напрямую" || fail "alice: нет direct для RU"
+has_ru_direct "$TOKEN_C" && fail "carl (ru server): в подписке остался direct для RU" || pass "carl (ru server): российские сайты уходят на сервер"
+autoxray user set carl --ru direct >/dev/null; has_ru_direct "$TOKEN_C" && pass "carl переключён в direct" || fail "carl не переключился"
+autoxray user list --plain | awk -F'\t' '$1=="carl" && $7=="direct"' | grep -q . && pass "plain-вывод содержит режим RU" || fail "plain без режима RU"
+autoxray user link alice --plain | head -n1 | grep -q 'для моста' && fail "в названии XHTTP осталась приписка «для моста»" || pass "название XHTTP без приписки «для моста»"
+autoxray user del carl >/dev/null
+
+step "Лимит IP: второй адрес блокируется, первый продолжает работать"
+check "ipwatch_parse: tcp:, IPv6, пропуск блокировок и строк без email" bash -c '
+  source <(sed -n "/^ipwatch_parse()/,/^}/p" /opt/autoxray/autoxray)
+  out=$(printf "%s\n" \
+    "x from 1.2.3.4:5 accepted tcp:a:1 [i >> d] email: u1" \
+    "x from tcp:5.6.7.8:9 accepted tcp:a:1 [i >> d] email: u1" \
+    "x from [2001:db8::1]:77 accepted tcp:a:1 [i >> d] email: u2" \
+    "x from 9.9.9.9:1 accepted tcp:a:1 [i -> block] email: u1" \
+    "x from 7.7.7.7:1 accepted tcp:a:1 [socks >> d]" | ipwatch_parse | tr "\n" ";")
+  [ "$out" = "u1 1.2.3.4;u1 5.6.7.8;u2 2001:db8::1;" ]'
+autoxray user add dan --ips 1 >/dev/null || fail "user add dan"
+TOKEN_D=$(jq -r '.users[] | select(.name=="dan").token' /etc/autoxray/state.json)
+[ "$(jq -r .log.loglevel /usr/local/etc/xray/config.json)" = warning ] && pass "лог доступа включился вместе с лимитом IP" || fail "лог доступа не включён"
+client_cfg "$TOKEN_D" 1 127.0.0.1 > /tmp/d1.json
+jq '.outbounds[0].sendThrough = "127.0.0.2"' /tmp/d1.json > /tmp/d2.json
+: > /var/log/xray/access.log
+client_start /tmp/d1.json && via_proxy ok.txt >/dev/null && pass "dan: первый IP (127.0.0.1) работает" || fail "dan: первый IP"
+client_start /tmp/d2.json && via_proxy ok.txt >/dev/null && pass "dan: второй IP (127.0.0.2) до проверки проходит" || fail "dan: второй IP до проверки"
+autoxray ipwatch | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'лишний IP 127.0.0.2' && pass "ipwatch заблокировал лишний IP" || fail "ipwatch не заблокировал"
+jq -e '.routing.rules[] | select(.user == ["dan"] and .source == ["127.0.0.2"] and .outboundTag == "block")' /usr/local/etc/xray/config.json >/dev/null && pass "правило user+source в конфиге Xray" || fail "нет правила блокировки"
+check "xray -test с правилом блокировки" xray run -test -c /usr/local/etc/xray/config.json
+client_start /tmp/d2.json; curl -fsS --max-time 8 --socks5-hostname 127.0.0.1:10808 http://93.184.216.34:8080/ok.txt >/dev/null 2>&1 && fail "заблокированный IP всё ещё проходит" || pass "заблокированный IP не проходит"
+client_start /tmp/d1.json && via_proxy ok.txt >/dev/null && pass "dan: первый IP продолжает работать" || fail "dan: первый IP сломался"
+autoxray ips dan | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'заблокирован' && pass "autoxray ips показывает блокировку" || fail "ips без блокировки"
+autoxray unban dan >/dev/null && client_start /tmp/d2.json && via_proxy ok.txt >/dev/null && pass "после unban второй IP снова проходит" || fail "unban"
+client_stop
+autoxray user set dan --ips 0 >/dev/null; [ "$(jq -r .log.loglevel /usr/local/etc/xray/config.json)" = none ] && pass "без лимитов лог доступа снова выключен" || fail "лог доступа остался включён"
+autoxray user del dan >/dev/null
+
 step "WARP: регистрация (заглушка Cloudflare API) + настоящий xray -test с wireguard-outbound"
 cat > /tmp/fakecurl <<'FC'
 #!/bin/bash
@@ -98,7 +139,9 @@ autoxray warp ru on --force && pass "warp ru on --force" || fail "warp ru on --f
 check "xray -test с wireguard-outbound и RU-правилами" xray run -test -c /usr/local/etc/xray/config.json
 jq -e '.outbounds[] | select(.tag=="warp" and .protocol=="wireguard")' /usr/local/etc/xray/config.json >/dev/null && pass "outbound warp в конфиге" || fail "нет outbound warp"
 TOKEN_A=$(jq -r '.users[] | select(.name=="alice").token' /etc/autoxray/state.json)
-jq -e '.[0].routing.rules | map(.ip // [] | index("geoip:ru")) | any(. != null) | not' "$WEB/$TOKEN_A.json" >/dev/null && pass "клиентский профиль: RU больше не direct" || fail "RU остался direct в клиенте"
+has_ru_direct "$TOKEN_A" && pass "warp ru on не меняет подписку пользователя в режиме direct" || fail "warp ru on изменил подписку"
+autoxray user set alice --ru server >/dev/null
+has_ru_direct "$TOKEN_A" && fail "alice с --ru server: RU остался direct" || pass "alice с --ru server: российские сайты идут на сервер"
 client_cfg "$TOKEN_A" 1 127.0.0.1 > /tmp/client-w.json
 client_start /tmp/client-w.json && via_proxy ok.txt >/dev/null && pass "трафик идёт при включённом WARP (не-RU напрямую)" || fail "трафик сломан при WARP"
 client_stop
@@ -112,7 +155,7 @@ echo '[{"tag_name":"v99.1.0","prerelease":false,"draft":false},{"tag_name":"v100
 rm -f /etc/autoxray/.latest
 AX_API=file:///tmp/api autoxray status 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'Доступна версия 99.0.0' && pass "баннер: доступна новая версия autoxray" || fail "баннера обновления нет"
 AX_API=file:///tmp/api autoxray core list 2>&1 | sed 's/\x1b\[[0-9;]*m//g' > /tmp/core.out
-grep -q 'v99.1.0' /tmp/core.out && ! grep -q 'v100.0.0' /tmp/core.out && pass "core list: новее текущей, без предрелизов" || { fail "core list"; cat /tmp/core.out; }
+grep -q 'v99.1.0' /tmp/core.out && grep -q 'v100.0.0.*пререлиз' /tmp/core.out && ! grep -q 'v99.1.0.*пререлиз' /tmp/core.out && pass "core list: новее текущей, пререлиз помечен" || { fail "core list"; cat /tmp/core.out; }
 grep -q 'лучше не обновлять без необходимости' /tmp/core.out && pass "предупреждение об обновлении ядра" || fail "нет предупреждения"
 printf 'no\n' | autoxray core update v26.9.9 >/tmp/core-up.out 2>&1; grep -q 'Отменено' /tmp/core-up.out && pass "core update без подтверждения отменяется" || { fail "core update не спросил"; cat /tmp/core-up.out; }
 step "Выбор пользователя без терминала (нумерованный список)"
