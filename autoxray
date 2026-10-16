@@ -9,7 +9,7 @@ set -uo pipefail
 # bash >= 5.2: '&' в замене ${var//a/b} — спецсимвол; ссылки содержат '&'
 shopt -u patsub_replacement 2>/dev/null || true
 
-AX_VERSION="3.3.0"
+AX_VERSION="3.4.0"
 AX_REPO="cergo666/autoXRAY"
 XRAY_TESTED="v26.9.9"          # версия ядра, с которой этот релиз проверен тестами
 API="${AX_API:-https://api.github.com}"
@@ -853,6 +853,16 @@ cmd_stats() {
 
 ips_count() { jq -r --arg n "$1" --argjson now "$(now)" '((.[$n] // {}) | [to_entries[] | select(.value.last >= ($now - 600))] | length)' "$IPS" 2>/dev/null || echo 0; }
 
+# Логи Xray не должны расти и храниться: при отсутствии лимитов IP они очищаются, иначе ограничиваются по размеру.
+trim_logs() {
+  local f max=${AX_LOG_MAX:-20971520} limited=0
+  jq -e 'any(.users[]; .enabled and ((.ip_limit // 0) > 0))' "$STATE" >/dev/null 2>&1 && limited=1
+  for f in "$ACCESS_LOG" "$(dirname "$ACCESS_LOG")/error.log"; do
+    [[ -f $f ]] || continue
+    if [[ $limited == 0 ]] || [[ $(stat -c %s "$f") -gt $max ]]; then : >"$f"; fi
+  done
+}
+
 # Из access.log вытаскивает пары «email ip» (без заблокированных соединений и без источников без email)
 ipwatch_parse() {
   awk '/ accepted / && / email: / && !/ -> block/ {
@@ -867,6 +877,7 @@ ipwatch_parse() {
 # Лог доступа читается и сразу обнуляется: он живёт не дольше минуты.
 cmd_ipwatch() {
   need_state
+  trim_logs
   jq -e '[.users[] | select(.enabled and ((.ip_limit // 0) > 0))] | length > 0' "$STATE" >/dev/null || return 0
   [[ -f $ACCESS_LOG ]] || return 0
   local tmp seen new old_act new_act t
@@ -960,6 +971,7 @@ cmd_collect() {
     st_edit --arg n "$due" --argjson nr "$(next_month)" '(.users[] | select(.name == $n) | .next_reset) = $nr'
   done < <(jq -r --argjson now "$(now)" '.users[] | select((.reset // "never") == "monthly" and (.next_reset // 0) <= $now) | .name' "$STATE")
   latest_ax force >/dev/null
+  trim_logs
   after=$(active_names)
   if [[ $before != "$after" ]]; then apply_xray; fi
   render_subs
@@ -1072,20 +1084,25 @@ warp_candidates() {
       162.159.193.1:2408 188.114.97.1:2408 188.114.99.1:2408 engage.cloudflareclient.com:2408; } | awk '!seen[$0]++'
 }
 
-# warp_probe <endpoint> — отдельный Xray только с WARP спрашивает one.one.one.one/cdn-cgi/trace.
-# Результат: код 0 при warp=on; журнал сохраняется в $WARP_PROBE_LOG (секреты вырезаны).
-warp_probe() {
-  local ep=$1 cfg pid out port=10899 i
-  command -v xray >/dev/null 2>&1 || { WARP_PROBE_OUT="xray не найден"; return 2; }
-  cfg=$(mktemp --suffix=.json); WARP_PROBE_LOG=$(mktemp)
-  jq -n --slurpfile s "$STATE" --arg ep "$ep" --argjson port "$port" '
+# Конфиг тестового Xray: socks на порту, весь трафик уходит в WARP через указанный endpoint
+warp_probe_cfg() { # endpoint порт
+  jq -n --slurpfile s "$STATE" --arg ep "$1" --argjson port "$2" '
     $s[0].warp as $W | {
       log: {loglevel: "debug"},
       inbounds: [{tag: "in", listen: "127.0.0.1", port: $port, protocol: "socks", settings: {udp: false}}],
       outbounds: [{tag: "warp", protocol: "wireguard", settings: {
         secretKey: $W.secretKey, address: $W.address,
         peers: [{publicKey: $W.peerPublicKey, allowedIPs: ["0.0.0.0/0", "::/0"], endpoint: $ep}],
-        mtu: 1280, reserved: $W.reserved, noKernelTun: true, domainStrategy: "ForceIP"}}]}' >"$cfg"
+        mtu: 1280, reserved: $W.reserved, noKernelTun: true, domainStrategy: "ForceIP"}}]}'
+}
+
+# warp_probe <endpoint> — отдельный Xray только с WARP спрашивает one.one.one.one/cdn-cgi/trace.
+# Результат: код 0 при warp=on; журнал сохраняется в $WARP_PROBE_LOG (секреты вырезаны).
+warp_probe() {
+  local ep=$1 cfg pid port=10899 i
+  command -v xray >/dev/null 2>&1 || { WARP_PROBE_OUT="xray не найден"; return 2; }
+  cfg=$(mktemp --suffix=.json); WARP_PROBE_LOG=$(mktemp)
+  warp_probe_cfg "$ep" "$port" >"$cfg"
   xray run -c "$cfg" >"$WARP_PROBE_LOG" 2>&1 9>&- &
   pid=$!
   for i in $(seq 1 15); do ss -ltn 2>/dev/null | grep -q "127.0.0.1:$port " && break; sleep 0.2; done
@@ -1095,20 +1112,97 @@ warp_probe() {
   grep -qE '^warp=(on|plus)' <<<"$WARP_PROBE_OUT"
 }
 
-# Перебирает endpoint'ы, оставляет первый рабочий в state.json. Код 1 — WARP недоступен с этого сервера.
+# warp_probe_to <endpoint> <порт> <файл> — до трёх запросов trace через туннель (для параллельного сканирования).
+# При успехе пишет в файл «мс<TAB>endpoint<TAB>узел<TAB>страна<TAB>удачных из 3», иначе файл остаётся пустым.
+warp_probe_to() {
+  local ep=$1 port=$2 out=$3 cfg pid i n ok=0 best="" t body colo="" loc=""
+  cfg=$(mktemp --suffix=.json); body=$(mktemp)
+  warp_probe_cfg "$ep" "$port" | sed 's/"loglevel": "debug"/"loglevel": "none"/' >"$cfg"
+  xray run -c "$cfg" >/dev/null 2>&1 9>&- &
+  pid=$!
+  for i in $(seq 1 15); do ss -ltn 2>/dev/null | grep -q "127.0.0.1:$port " && break; sleep 0.2; done
+  for n in 1 2 3; do
+    t=$("$CURL" -fsS --max-time 6 -o "$body" -w '%{time_total}' --socks5-hostname "127.0.0.1:$port" https://one.one.one.one/cdn-cgi/trace 2>/dev/null) \
+      && grep -qE '^warp=(on|plus)' "$body" || { [[ $n -eq 1 ]] && break; continue; }
+    ok=$((ok + 1)); t=$(awk -v t="$t" 'BEGIN {printf "%d", t * 1000}')
+    if [[ -z $best || $t -lt $best ]]; then best=$t; colo=$(sed -n 's/^colo=//p' "$body"); loc=$(sed -n 's/^loc=//p' "$body"); fi
+  done
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -f "$cfg" "$body"
+  [[ $ok -gt 0 ]] && printf '%s\t%s\t%s\t%s\t%s\n' "$best" "$ep" "${colo:-?}" "${loc:-?}" "$ok" >"$out"
+  return 0
+}
+
+# Диапазоны адресов WARP, по одному случайному адресу из каждого (список и идея сканирования: vernette/warpscout, MIT)
+WARP_POOLS=(8.6.112 8.34.70 8.34.146 8.35.211 8.39.125 8.39.204 8.39.214 8.47.69 162.159.192 162.159.195 188.114.96 188.114.97 188.114.98 188.114.99)
+
+warp_scan_candidates() { # quick | full | ports
+  local phase=${1:-quick} p i per=1 port
+  if [[ -n ${AX_WARP_CANDIDATES:-} ]]; then [[ $phase == ports ]] || tr ' ' '\n' <<<"$AX_WARP_CANDIDATES"; return 0; fi
+  case $phase in
+    quick|full)
+      [[ $phase == full ]] && per=3
+      { st '.warp.endpoint // empty'
+        for p in "${WARP_POOLS[@]}"; do for ((i = 0; i < per; i++)); do echo "$p.$((RANDOM % 254 + 1)):2408"; done; done; } | awk 'NF && !seen[$0]++' ;;
+    ports) for port in 500 1701 4500; do for p in 162.159.192 188.114.97 188.114.99; do echo "$p.1:$port"; done; done ;;
+  esac
+}
+
+# warp_rank <только узлы> <кроме узлов> — читает TSV из stdin, лучшие (самые быстрые) сверху
+warp_rank() {
+  awk -F'\t' -v inc="${1:-}" -v exc="${2:-}" 'BEGIN { n = split(inc, I, ","); m = split(exc, E, ",") }
+    { keep = (inc == "") ? 1 : 0
+      for (i = 1; i <= n; i++) if ($3 == I[i]) keep = 1
+      for (i = 1; i <= m; i++) if (exc != "" && $3 == E[i]) keep = 0
+      if (keep) print }' | sort -t$'\t' -k1,1n
+}
+
+# warp_scan [--full] [--colo A,B] [--exclude-colo C,D] — параллельно проверяет endpoint'ы, результат в WARP_SCAN_RESULT
+WARP_SCAN_RESULT=""
+warp_scan() {
+  local full=0 inc="" exc="" dir ep phase k=0 jobs=8 cands=() phases
+  while (($#)); do case $1 in --full) full=1 ;; --colo) inc=${2:-}; shift ;; --exclude-colo) exc=${2:-}; shift ;; esac; shift; done
+  command -v xray >/dev/null 2>&1 || { warn "xray не найден"; return 2; }
+  dir=$(mktemp -d); : >"$dir/all"; WARP_SCAN_RESULT=""
+  phases="quick ports"; [[ $full == 1 ]] && phases="full ports"
+  for phase in $phases; do
+    [[ $phase == ports && -s $dir/all ]] && continue    # запасные порты нужны, только если основной ничего не нашёл
+    mapfile -t cands < <(warp_scan_candidates "$phase")
+    [[ ${#cands[@]} -gt 0 ]] || continue
+    echo -e " 🔎 ${DIM}Проверяю ${#cands[@]} endpoint'ов ($phase)...${NC}"
+    for ep in "${cands[@]}"; do
+      warp_probe_to "$ep" $((10900 + k)) "$dir/r.$phase.$k" &
+      k=$((k + 1)); (( k % jobs == 0 )) && wait
+    done
+    wait
+    cat "$dir"/r."$phase".* >>"$dir/all" 2>/dev/null
+  done
+  WARP_SCAN_RESULT=$(warp_rank "$inc" "$exc" <"$dir/all"); rm -rf "$dir"
+  [[ -n $WARP_SCAN_RESULT ]]
+}
+
+warp_scan_table() {
+  local i=0 ms ep colo loc ok col
+  printf '%b   %s %s %s %s %s%b\n' "$DIM" "$(pad "#" 3)" "$(pad ЗАДЕРЖКА 10)" "$(pad ENDPOINT 24)" "$(pad УЗЕЛ 6)" "СТРАНА, ПОТЕРИ" "$NC"
+  while IFS=$'\t' read -r ms ep colo loc ok; do
+    i=$((i + 1)); [[ $i -gt 10 ]] && break
+    col=$GRN; [[ $ms -gt 250 ]] && col=$YEL; [[ $ms -gt 600 ]] && col=$RED
+    printf ' %s %b%s%b %s %b%s%b %s%%\n' "$(pad "$i" 3)" "$col" "$(pad "$ms мс" 10)" "$NC" "$(pad "$ep" 24)" "$BOLD" "$(pad "$colo" 6)" "$NC" "$loc, $(( (3 - ok) * 100 / 3 ))"
+  done <<<"$WARP_SCAN_RESULT"
+}
+
+# Запоминает лучший (первый) endpoint из WARP_SCAN_RESULT
+warp_apply_best() {
+  local best ms colo
+  best=$(head -n1 <<<"$WARP_SCAN_RESULT" | cut -f2); ms=$(head -n1 <<<"$WARP_SCAN_RESULT" | cut -f1); colo=$(head -n1 <<<"$WARP_SCAN_RESULT" | cut -f3)
+  st_edit --arg ep "$best" --arg c "$colo" --argjson ms "$ms" '.warp.endpoint = $ep | .warp.colo = $c | .warp.rtt = $ms'
+  echo -e " ⚡ ${BOLD}Выбран:${NC} ${GRN}$best${NC} ${DIM}(узел $colo, $ms мс)${NC}"
+}
+
+# Быстрое сканирование и выбор самого быстрого рабочего endpoint. Код 1: ни один не ответил.
 warp_pick_endpoint() {
-  local ep
-  echo -e " 🔎 ${DIM}Проверяю, отвечает ли WARP с этого сервера...${NC}"
-  while read -r ep; do
-    [[ -n $ep ]] || continue
-    printf '    %s ... ' "$ep"
-    if warp_probe "$ep"; then
-      echo -e "${GRN}✔ работает${NC}"
-      st_edit --arg ep "$ep" '.warp.endpoint = $ep'; return 0
-    fi
-    echo -e "${RED}✘${NC}"
-  done < <(warp_candidates)
-  return 1
+  warp_scan || return 1
+  warp_scan_table
+  warp_apply_best
 }
 
 warp_enable_checked() { # [--force]; печатает причину и возвращает 1, если WARP не отвечает
@@ -1171,6 +1265,16 @@ cmd_warp() {
          warp_enable_checked "${1:-}" || exit 1
          st_edit '.warp.enabled = true'; locked apply_or_die && ok "✅ WARP включён." ;;
     debug) warp_debug "$@" ;;
+    candidates) warp_scan_candidates "${1:-quick}" ;;
+    scan) need_root
+         local apply=0 sargs=()
+         while (($#)); do case $1 in --apply) apply=1 ;; *) sargs+=("$1") ;; esac; shift; done
+         [[ $(st '.warp.registered // false') == true ]] || locked warp_register
+         if warp_scan "${sargs[@]}"; then
+           warp_scan_table
+           if [[ $apply == 1 ]]; then warp_apply_best; locked apply_or_die; ok "✅ Endpoint сохранён."
+           else echo -e "\n ${DIM}Применить лучший: ${NC}${CYAN}autoxray warp scan --apply${NC}${DIM}. Ограничить узлы: --colo FRA,AMS или --exclude-colo DME${NC}"; fi
+         else die "Ни один endpoint не ответил: WARP недоступен с этого сервера (autoxray warp debug)."; fi ;;
     endpoint) need_root; [[ -n ${1:-} ]] || die "warp endpoint <ip:порт>"
          st_edit --arg ep "$1" '.warp.endpoint = $ep'; locked apply_or_die; ok "✅ endpoint → $1" ;;
     off) need_root; st_edit '.warp.enabled = false'; locked apply_or_die && ok "✅ WARP выключен." ;;
@@ -1200,7 +1304,7 @@ cmd_warp() {
          kv "🆔" "Профиль" "$(tick "$(st '.warp.registered // false')") зарегистрирован"
          kv "🔌" "Состояние" "$(tick "$(st '.warp.enabled // false')") включён"
          kv "🇷🇺" "RU на сервере" "$(tick "$(st '.warp.ru // false')") российские сайты, дошедшие до сервера, идут через WARP"
-         kv "📍" "Endpoint" "$(st '.warp.endpoint // "не задан"')"
+         kv "📍" "Endpoint" "$(st '.warp.endpoint // "не задан"') ${DIM}$([[ -n $(st '.warp.colo // empty') ]] && echo "(узел $(st .warp.colo), $(st .warp.rtt) мс)")${NC}"
          local n; n=$(jq '(.warp.domains // []) | length' "$STATE")
          if [[ $n -gt 0 ]]; then
            echo -e " 🎯 ${DIM}Свои домены (всегда через WARP, если трафик дошёл до сервера)${NC}"
@@ -1226,7 +1330,7 @@ cmd_warp() {
            || die "Нет ответа. Проверьте: autoxray warp status; systemctl status xray"
          echo "$trace" | sed 's/^/   /'
          grep -qE '^warp=(on|plus)' <<<"$trace" && ok "✅ WARP работает" || warn "warp не включён в ответе — трафик идёт мимо WARP" ;;
-    *) die "warp: register | on | off | ru on|off | add | del | list | check | debug | endpoint" ;;
+    *) die "warp: register | on | off | ru on|off | add | del | list | check | scan | debug | endpoint" ;;
   esac
 }
 
@@ -1489,6 +1593,11 @@ cmd_doctor() {
   echo -e "\n ${BOLD}Система${NC}"
   local use; use=$(df -P / | awk 'NR == 2 {gsub("%", "", $5); print $5}')
   [[ ${use:-0} -ge 90 ]] && warn_ "диск заполнен на ${use}%" "очистите журналы и старые бэкапы" || pass_ "диск: занято ${use:-?}%"
+  local lsz; lsz=$(stat -c %s "$ACCESS_LOG" 2>/dev/null || echo 0)
+  if [[ $lsz -gt 5242880 ]]; then warn_ "лог доступа $(hbytes "$lsz")" "должен очищаться раз в минуту: проверьте cron (/etc/cron.d/autoxray), autoxray ipwatch"
+  elif [[ $lsz -gt 0 ]] && ! jq -e 'any(.users[]; .enabled and ((.ip_limit // 0) > 0))' "$STATE" >/dev/null 2>&1; then
+    warn_ "в логе доступа есть записи, хотя лимиты IP не заданы" "autoxray ipwatch очистит его"
+  else pass_ "лог доступа в порядке ($(hbytes "$lsz"))"; fi
   local geo=${XRAY_LOCATION_ASSET:-/usr/local/share/xray}/geosite.dat
   if [[ -f $geo ]]; then
     days=$(( ($(date +%s) - $(stat -c %Y "$geo")) / 86400 ))
@@ -1715,7 +1824,7 @@ menu_warp() {
   while true; do
     clear; cmd_warp status; echo
     choose "WARP" "🟢 Включить WARP" "🔴 Выключить WARP" "🇷🇺 Российские сайты ЧЕРЕЗ WARP" "🏠 Российские сайты напрямую" \
-      "➕ Добавить домен в WARP" "➖ Убрать домен из WARP" "🔎 Проверить работу" "🧪 Отладка (отчёт для разбора проблем)" "🔙 Назад" || return 0
+      "➕ Добавить домен в WARP" "➖ Убрать домен из WARP" "🔎 Проверить работу" "⚡ Найти самый быстрый endpoint" "🧪 Отладка (отчёт для разбора проблем)" "🔙 Назад" || return 0
     case $CHOICE in
       0) (cmd_warp on); pause ;;
       1) (cmd_warp off); pause ;;
@@ -1725,8 +1834,9 @@ menu_warp() {
       5) mapfile -t doms < <(jq -r '(.warp.domains // [])[]' "$STATE")
          if [[ ${#doms[@]} -eq 0 ]]; then warn "Список доменов пуст."; else choose "Какой домен убрать" "${doms[@]}" && (cmd_warp del "${doms[$CHOICE]}"); fi; pause ;;
       6) (cmd_warp check); pause ;;
-      7) (cmd_warp debug); pause ;;
-      8) return 0 ;;
+      7) (cmd_warp scan --apply); pause ;;
+      8) (cmd_warp debug); pause ;;
+      9) return 0 ;;
     esac
   done
 }
@@ -1796,6 +1906,7 @@ usage() {
   echo -e "  ${C}autoxray user link${N} <имя> ${D}[--plain]${N}  ${C}user qr${N} <имя> ${D}[sub|xhttp|vision|hy2]${N}"
   echo -e "${H}Сеть${N}"
   echo -e "  ${C}autoxray warp${N} register|on|off|status|check|add|del  ${C}warp debug${N} ${D}[--quick]${N} ${D}разбор проблем${N}"
+  echo -e "  ${C}autoxray warp scan${N} ${D}[--apply] [--full] [--colo FRA,AMS] [--exclude-colo DME]${N}  ${D}самый быстрый endpoint${N}"
   echo -e "  ${C}autoxray warp ru${N} on|off        ${D}российские сайты через WARP${N}"
   echo -e "  ${C}autoxray node${N} add <vless://…>|del <имя|id>|list   ${D}(режим моста)${N}"
   echo -e "  ${C}autoxray fingerprint${N} <браузер> ${C}telegram${N} set <ссылка>|off|update|remove"

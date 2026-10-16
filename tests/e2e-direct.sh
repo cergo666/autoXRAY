@@ -148,6 +148,25 @@ client_stop
 autoxray warp ru off >/dev/null && check "warp ru off + xray -test" xray run -test -c /usr/local/etc/xray/config.json
 autoxray warp off >/dev/null && check "warp off + xray -test" xray run -test -c /usr/local/etc/xray/config.json
 
+step "Логи: без лимитов очищаются, при превышении размера обнуляются"
+echo junk > /var/log/xray/access.log; echo junk > /var/log/xray/error.log
+autoxray ipwatch; { [ ! -s /var/log/xray/access.log ] && [ ! -s /var/log/xray/error.log ]; } && pass "без лимитов IP логи очищаются" || fail "логи не очищены"
+autoxray user add eve --ips 1 >/dev/null
+head -c 5000 /dev/urandom | base64 > /var/log/xray/error.log
+AX_LOG_MAX=1000 autoxray ipwatch; [ ! -s /var/log/xray/error.log ] && pass "превышение размера обнуляет лог" || fail "большой лог не обнулён"
+autoxray user del eve >/dev/null
+
+step "WARP: сканер endpoint'ов (ранжирование, кандидаты, отказ без ответа)"
+check "warp_rank: сортировка и фильтры по узлам" bash -c '
+  source <(sed -n "/^warp_rank()/,/^}/p" /opt/autoxray/autoxray)
+  tsv=$(printf "120\ta:1\tFRA\tDE\t3\n40\tb:1\tDME\tRU\t3\n80\tc:1\tAMS\tNL\t2\n")
+  [ "$(printf "%s\n" "$tsv" | warp_rank "" "" | cut -f2 | tr "\n" " ")" = "b:1 c:1 a:1 " ] &&
+  [ "$(printf "%s\n" "$tsv" | warp_rank "" "DME" | cut -f2 | tr "\n" " ")" = "c:1 a:1 " ] &&
+  [ "$(printf "%s\n" "$tsv" | warp_rank "FRA,AMS" "" | cut -f2 | tr "\n" " ")" = "c:1 a:1 " ]'
+[ "$(autoxray warp candidates quick | grep -cE "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:2408$")" -ge 14 ] && pass "кандидаты: по адресу из каждого диапазона Cloudflare" || fail "кандидаты quick"
+[ "$(autoxray warp candidates ports | wc -l)" = 9 ] && pass "кандидаты: запасные порты 500, 1701, 4500" || fail "кандидаты ports"
+AX_WARP_CANDIDATES="162.159.192.1:2408 188.114.97.1:2408" autoxray warp scan >/tmp/scan.out 2>&1 && fail "scan «нашёл» рабочий endpoint с поддельным профилем" || pass "scan честно сообщает, что ни один endpoint не ответил"
+
 step "Версии: баннер обновления и список версий ядра (поддельный GitHub API)"
 mkdir -p /tmp/api/repos/cergo666/autoXRAY/releases /tmp/api/repos/XTLS/Xray-core
 echo '{"tag_name":"v99.0.0"}' > /tmp/api/repos/cergo666/autoXRAY/releases/latest
