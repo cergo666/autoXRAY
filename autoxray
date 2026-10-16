@@ -9,7 +9,7 @@ set -uo pipefail
 # bash >= 5.2: '&' в замене ${var//a/b} — спецсимвол; ссылки содержат '&'
 shopt -u patsub_replacement 2>/dev/null || true
 
-AX_VERSION="3.0.0"
+AX_VERSION="3.1.0"
 AX_REPO="cergo666/autoXRAY"
 AX_ETC="${AX_ETC:-/etc/autoxray}"
 STATE="$AX_ETC/state.json"
@@ -24,11 +24,36 @@ API_ADDR="127.0.0.1:10085"
 WARP_API="https://api.cloudflareclient.com/v0i1909051800"
 WARP_ENDPOINT="engage.cloudflareclient.com:2408"
 
-GRN='\033[1;32m'; RED='\033[1;31m'; YEL='\033[1;33m'; CYAN='\033[1;36m'; NC='\033[0m'
+BOLD='\033[1m'; DIM='\033[2m'
+GRN='\033[1;32m'; RED='\033[1;31m'; YEL='\033[1;33m'; BLU='\033[1;34m'
+MAG='\033[1;35m'; CYAN='\033[1;36m'; WHT='\033[1;37m'; NC='\033[0m'
 
 ok()   { echo -e "${GRN}$*${NC}"; }
-warn() { echo -e "${YEL}$*${NC}" >&2; }
+warn() { echo -e "${YEL}⚠  $*${NC}" >&2; }
 die()  { echo -e "${RED}❌ $*${NC}" >&2; exit 1; }
+
+section() { echo -e "\n${BOLD}${MAG}▌$*${NC}"; }
+rule()    { echo -e "${DIM}──────────────────────────────────────────────────────────${NC}"; }
+tick()    { [[ ${1:-} == true ]] && printf '%b✔%b' "$GRN" "$NC" || printf '%b✘%b' "$RED" "$NC"; }
+# pad <строка> <ширина> — дополняет пробелами по числу СИМВОЛОВ (printf %-Ns считает байты, если локаль не UTF-8)
+pad()     { local LC_ALL=C t=${1//[$'\200'-$'\277']/} n; n=$(( $2 - ${#t} )); printf '%s' "$1"; [[ $n -gt 0 ]] && printf '%*s' "$n" ""; return 0; }
+kv()      { printf ' %s %b%s%b %b\n' "$1" "$DIM" "$(pad "$2" 14)" "$NC" "$3"; }
+
+# bar <использовано> <лимит> [ширина] — полоса расхода, цвет по заполнению
+bar() {
+  local used=${1:-0} limit=${2:-0} w=${3:-12} pct=0 filled i col out=""
+  if [[ $limit -gt 0 ]]; then
+    pct=$(( used * 100 / limit )); [[ $pct -gt 100 ]] && pct=100
+    col=$GRN; [[ $pct -ge 70 ]] && col=$YEL; [[ $pct -ge 90 ]] && col=$RED
+    filled=$(( pct * w / 100 ))
+    for ((i = 0; i < w; i++)); do [[ $i -lt $filled ]] && out+="█" || out+="░"; done
+    printf '%b%s%b %3d%%' "$col" "$out" "$NC" "$pct"
+  else
+    for ((i = 0; i < w; i++)); do out+="░"; done
+    printf '%b%s%b   ∞ ' "$DIM" "$out" "$NC"
+  fi
+}
+days_left() { echo $(( ($1 - $(date +%s)) / 86400 )); }
 
 need_root()  { [[ $DRY == 1 || $EUID -eq 0 ]] || die "Нужны root права."; }
 need_state() { [[ -f $STATE ]] || die "autoXRAY не установлен: нет $STATE"; }
@@ -621,11 +646,24 @@ user_summary() {
 
 cmd_user_list() {
   need_state
-  printf "${CYAN}%-16s %-9s %-26s %s${NC}\n" "ПОЛЬЗОВАТЕЛЬ" "СТАТУС" "ТРАФИК" "ДО"
-  local name status used limit expire lim
+  if [[ ${1:-} == --plain ]]; then user_summary; return; fi
+  section "👥 Пользователи"
+  printf '%b   %s %s %s %s %s%b\n' "$DIM" "$(pad ИМЯ 14)" "$(pad СТАТУС 12)" "$(pad РАСХОД 15)" "$(pad ТРАФИК 17)" ДЕЙСТВУЕТ "$NC"
+  local name status used limit expire icon col col2 label txt left exp
   while IFS=$'\t' read -r name status used limit expire; do
-    lim=$([[ $limit -gt 0 ]] && echo "$(hbytes "$used") / $(hbytes "$limit")" || echo "$(hbytes "$used") / ∞")
-    printf "%-16s %-9s %-26s %s\n" "$name" "$status" "$lim" "$(hdate "$expire")"
+    case $status in
+      active)   icon="🟢"; col=$GRN;  label="активен" ;;
+      disabled) icon="⚫"; col=$DIM;  label="отключён" ;;
+      expired)  icon="⌛"; col=$YEL;  label="срок истёк" ;;
+      limit)    icon="🚫"; col=$RED;  label="лимит" ;;
+      *)        icon="❔"; col=$NC;   label=$status ;;
+    esac
+    txt="$(hbytes "$used")"; [[ $limit -gt 0 ]] && txt+=" / $(hbytes "$limit")"
+    if [[ $expire -gt 0 ]]; then
+      left=$(days_left "$expire"); col2=$GRN; [[ $left -le 7 ]] && col2=$YEL; [[ $left -le 3 ]] && col2=$RED
+      exp="$(hdate "$expire") ${col2}($left дн.)${NC}"
+    else exp="${DIM}бессрочно${NC}"; fi
+    printf '%s %b%s%b %b%s%b %b %s %b\n' "$icon" "$BOLD" "$(pad "$name" 14)" "$NC" "$col" "$(pad "$label" 12)" "$NC" "$(bar "$used" "$limit" 10)" "$(pad "$txt" 17)" "$exp"
   done < <(user_summary)
 }
 
@@ -700,18 +738,19 @@ qr_show() {
 
 show_user() {
   need_state
-  local name=${1:-} u domain token label link
+  local name=${1:-} u domain token label link ico
   u=$(user_must "$name"); domain=$(st .domain); token=$(jq -r .token <<<"$u")
-  echo
-  echo -e "${YEL}Страница пользователя '$name' (ссылки, QR, приложения)${NC}"
-  echo "https://$domain/$token.html"
-  echo -e "${YEL}Ссылка на подписку (вставить в Happ / v2rayTun)${NC}"
-  echo "https://$domain/$token.json"
+  section "🔗 Ссылки пользователя «$name»"
+  echo -e "\n ${BOLD}📄 Личная страница${NC} ${DIM}(приложения, QR, остаток трафика)${NC}"
+  echo -e "    ${CYAN}https://$domain/$token.html${NC}"
+  echo -e "\n ${BOLD}📥 Подписка${NC} ${DIM}(вставить в Happ / v2rayTun)${NC}"
+  echo -e "    ${CYAN}https://$domain/$token.json${NC}"
   while IFS='|' read -r label link; do
-    echo -e "\n${YEL}$label${NC}\n$link"
+    case $label in *XHTTP*) ico="⚡" ;; *VISION*) ico="🔐" ;; *HYSTERIA*) ico="🚀" ;; *Direct*) ico="🧭" ;; *) ico="🔀" ;; esac
+    echo -e "\n ${BOLD}${YEL}$ico $label${NC}\n    ${WHT}$link${NC}"
   done < <(user_links "$name")
   local tg; tg=$(st '.telegram.link // ""')
-  [[ -n $tg ]] && echo -e "\n${YEL}Telegram Web Proxy${NC}\n$tg"
+  [[ -n $tg ]] && echo -e "\n ${BOLD}${BLU}💬 Telegram Web Proxy${NC}\n    ${WHT}$tg${NC}"
   echo
 }
 
@@ -735,8 +774,8 @@ cmd_users() {
     del|rm) locked cmd_user_del "$@" ;;
     set)    locked cmd_user_set "$@" ;;
     rotate) locked cmd_user_rotate "$@" ;;
-    list|ls) cmd_user_list ;;
-    link|show) show_user "${1:-}" ;;
+    list|ls) cmd_user_list "$@" ;;
+    link|show) if [[ ${2:-} == --plain ]]; then need_state; user_must "${1:-}" >/dev/null; user_links "$1"; else show_user "${1:-}"; fi ;;
     qr)     cmd_user_qr "$@" ;;
     *) die "user: add | del | set | rotate | list | link | qr" ;;
   esac
@@ -747,8 +786,9 @@ cmd_users() {
 cmd_stats() {
   need_state
   cmd_user_list
-  echo
-  echo -e "Всего: ↑ $(hbytes "$(jq '[.[].up] | add // 0' "$TRAFFIC")")   ↓ $(hbytes "$(jq '[.[].down] | add // 0' "$TRAFFIC")")"
+  rule
+  printf ' %bИтого%b   %b↑ %s%b   %b↓ %s%b\n' "$BOLD" "$NC" "$CYAN" "$(hbytes "$(jq '[.[].up] | add // 0' "$TRAFFIC")")" "$NC" \
+    "$GRN" "$(hbytes "$(jq '[.[].down] | add // 0' "$TRAFFIC")")" "$NC"
 }
 
 # Раз в 5 минут из cron: забирает счётчики Xray (с обнулением), накапливает в traffic.json,
@@ -819,9 +859,10 @@ cmd_node() {
          [[ $(jq --arg k "$k" '[.nodes[] | select(.name != $k and (.id | tostring) != $k)] | length' "$STATE") -gt 0 ]] || die "Нельзя удалить последний узел."
          st_edit --arg k "$k" '.nodes |= map(select(.name != $k and (.id | tostring) != $k))'
          locked apply_or_die; ok "✅ Узел удалён." ;;
-    list|ls) printf "${CYAN}%-4s %-22s %-32s %s${NC}\n" ID УЗЕЛ АДРЕС ТРАНСПОРТ
+    list|ls) section "🔀 Узлы моста (EU)"
+             printf '%b   %s %s %s %s%b\n' "$DIM" "$(pad ID 4)" "$(pad УЗЕЛ 22)" "$(pad АДРЕС 32)" ТРАНСПОРТ "$NC"
              jq -r '.nodes[] | [(.id | tostring), .name, "\(.addr):\(.port)", "\(.type)/\(.security)"] | @tsv' "$STATE" \
-               | while IFS=$'\t' read -r id name addr tr; do printf "%-4s %-22s %-32s %s\n" "$id" "$name" "$addr" "$tr"; done ;;
+               | while IFS=$'\t' read -r id name addr tr; do printf ' 🇪🇺 %s %b%s%b %s %s\n' "$(pad "$id" 4)" "$BOLD" "$(pad "$name" 22)" "$NC" "$(pad "$addr" 32)" "$tr"; done ;;
     *) die "node: add <vless://...> | del <имя|id> | list" ;;
   esac
 }
@@ -903,14 +944,23 @@ cmd_warp() {
          st_edit --arg d "$d" '.warp.domains = ((.warp.domains // []) - [$d])'
          locked apply_or_die; ok "✅ $d удалён из списка WARP" ;;
     list|status)
-         echo -e "${YEL}WARP:${NC} зарегистрирован=$(st '.warp.registered // false') включён=$(st '.warp.enabled // false') RU-через-WARP=$(st '.warp.ru // false')"
-         echo -e "${YEL}Домены:${NC}"; jq -r '(.warp.domains // [])[] | "  " + .' "$STATE" ;;
+         section "🌍 Cloudflare WARP"
+         kv "🆔" "Профиль" "$(tick "$(st '.warp.registered // false')") зарегистрирован"
+         kv "🔌" "Состояние" "$(tick "$(st '.warp.enabled // false')") включён"
+         kv "🇷🇺" "Российские сайты" "$(tick "$(st '.warp.ru // false')") через WARP ${DIM}(иначе напрямую)${NC}"
+         local n; n=$(jq '(.warp.domains // []) | length' "$STATE")
+         if [[ $n -gt 0 ]]; then
+           echo -e " 🎯 ${DIM}Свои домены${NC}"
+           local dom; while IFS= read -r dom; do echo -e "    ${CYAN}•${NC} $dom"; done < <(jq -r '(.warp.domains // [])[]' "$STATE")
+         else echo -e " 🎯 ${DIM}Свои домены: не заданы (autoxray warp add <домен>)${NC}"; fi ;;
     check)
          local su sp
          su=$(st .socks.user); sp=$(st .socks.pass)
-         echo "Запрос через socks5 сервера (one.one.one.one всегда направлен в WARP):"
-         "$CURL" -fsS --max-time 15 --socks5-hostname "$su:$sp@127.0.0.1:10443" https://one.one.one.one/cdn-cgi/trace | grep -E '^(ip|loc|warp)=' \
-           || die "Нет ответа. Проверьте: autoxray warp status; systemctl status xray" ;;
+         echo -e "🔎 ${DIM}Запрос через socks5 сервера (one.one.one.one всегда идёт через WARP)${NC}"
+         local trace; trace=$("$CURL" -fsS --max-time 15 --socks5-hostname "$su:$sp@127.0.0.1:10443" https://one.one.one.one/cdn-cgi/trace | grep -E '^(ip|loc|warp)=') \
+           || die "Нет ответа. Проверьте: autoxray warp status; systemctl status xray"
+         echo "$trace" | sed 's/^/   /'
+         grep -qE '^warp=(on|plus)' <<<"$trace" && ok "✅ WARP работает" || warn "warp не включён в ответе — трафик идёт мимо WARP" ;;
     *) die "warp: register | on | off | ru on|off | add | del | list | check" ;;
   esac
 }
@@ -919,17 +969,26 @@ cmd_warp() {
 
 cmd_status() {
   need_state
-  local d; d=$(st .domain)
-  echo -e "${YEL}autoXRAY $AX_VERSION${NC}  домен: $d  fingerprint: $(st .fingerprint)"
-  local s
+  local d m s run="" cert_end days col
+  d=$(st .domain); m=$(mode)
+  section "🔐 autoXRAY $AX_VERSION"
+  kv "🌐" "Домен" "${BOLD}${CYAN}$d${NC}  ${DIM}режим: $m${NC}"
+  kv "🔑" "Fingerprint" "$(st .fingerprint)"
   for s in xray nginx telemt tproxy-server; do
-    if systemctl is-active --quiet "$s" 2>/dev/null; then echo -e "  $s: ${GRN}RUNNING${NC}"
-    elif systemctl list-unit-files "$s.service" 2>/dev/null | grep -q "$s"; then echo -e "  $s: ${RED}STOPPED${NC}"; fi
+    if systemctl is-active --quiet "$s" 2>/dev/null; then run+="$s $(tick true)  "
+    elif systemctl list-unit-files "$s.service" 2>/dev/null | grep -q "$s"; then run+="$s $(tick false)  "; fi
   done
-  echo "  пользователей: $(jq '.users | length' "$STATE"), активных: $(active_names | wc -w)"
-  echo "  WARP: registered=$(st '.warp.registered // false') enabled=$(st '.warp.enabled // false') ru=$(st '.warp.ru // false')"
+  kv "🔧 " "Службы" "$run"
+  kv "👥" "Пользователи" "$(jq '.users | length' "$STATE") ${DIM}(активных: $(active_names | wc -w))${NC}"
+  if [[ $m == bridge ]]; then
+    kv "🔀" "Узлы EU" "$(jq '.nodes | length' "$STATE")"
+  else
+    kv "🌍" "WARP" "$(tick "$(st '.warp.enabled // false')") $([[ $(st '.warp.enabled // false') == true ]] && echo "включён" || echo "выключен")  ${DIM}RU через WARP:${NC} $(tick "$(st '.warp.ru // false')")"
+  fi
   if [[ -r /var/lib/xray/cert/fullchain.pem ]] && command -v openssl >/dev/null; then
-    echo "  сертификат до: $(openssl x509 -enddate -noout -in /var/lib/xray/cert/fullchain.pem | cut -d= -f2)"
+    cert_end=$(openssl x509 -enddate -noout -in /var/lib/xray/cert/fullchain.pem | cut -d= -f2)
+    days=$(days_left "$(date -d "$cert_end" +%s)"); col=$GRN; [[ $days -le 14 ]] && col=$YEL; [[ $days -le 3 ]] && col=$RED
+    kv "📜" "Сертификат" "${col}ещё $days дн.${NC} ${DIM}(до $(date -d "$cert_end" +%F))${NC}"
   fi
 }
 
@@ -1048,6 +1107,111 @@ cmd_self_update() {
   /usr/local/bin/autoxray render
 }
 
+# Обновление geoip.dat / geosite.dat (на них опираются правила маршрутизации). Перезапуск Xray — только при изменении.
+cmd_geo_update() {
+  need_root
+  local quiet=0 dir=${XRAY_LOCATION_ASSET:-/usr/local/share/xray} before after
+  [[ ${1:-} == --quiet ]] && quiet=1
+  before=$(cat "$dir"/geoip.dat "$dir"/geosite.dat 2>/dev/null | md5sum)
+  bash -c "$("$CURL" -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install-geodata >/dev/null 2>&1 \
+    || { [[ $quiet == 1 ]] || die "Не удалось обновить гео-данные (нет доступа к GitHub?)"; return 1; }
+  after=$(cat "$dir"/geoip.dat "$dir"/geosite.dat 2>/dev/null | md5sum)
+  if [[ $before != "$after" ]]; then svc restart xray; [[ $quiet == 1 ]] || ok "🗺 Гео-данные обновлены, Xray перезапущен."
+  else [[ $quiet == 1 ]] || ok "🗺 Гео-данные уже актуальны."; fi
+}
+
+# Диагностика: частые причины «не работает».
+cmd_doctor() {
+  need_state
+  local bad=0 d ip dnsip cert_end days port k
+  d=$(st .domain)
+  pass_() { printf '  %b✔%b %s\n' "$GRN" "$NC" "$1"; }
+  warn_() { printf '  %b⚠%b %s %b— %s%b\n' "$YEL" "$NC" "$1" "$DIM" "$2" "$NC"; }
+  fail_() { printf '  %b✘%b %s %b— %s%b\n' "$RED" "$NC" "$1" "$DIM" "$2" "$NC"; bad=$((bad + 1)); }
+  section "🩺 Диагностика"
+
+  echo -e "\n ${BOLD}Службы${NC}"
+  for k in xray nginx; do
+    systemctl is-active --quiet "$k" 2>/dev/null && pass_ "$k запущен" || fail_ "$k не запущен" "systemctl status $k; journalctl -u $k -e"
+  done
+  echo -e "\n ${BOLD}Порты${NC}"
+  for port in 80/tcp 443/tcp 443/udp; do
+    k=${port#*/}; [[ $k == tcp ]] && k=ltn || k=lun
+    ss -$k 2>/dev/null | grep -q ":${port%/*} " && pass_ "$port слушается" || fail_ "$port не слушается" "проверьте конфиг и файрвол"
+  done
+  echo -e "\n ${BOLD}Конфигурация${NC}"
+  if command -v xray >/dev/null 2>&1; then
+    xray run -test -c "$XRAY_CFG" >/dev/null 2>&1 && pass_ "xray: конфиг корректен" || fail_ "xray: конфиг не проходит проверку" "autoxray render; xray run -test -c $XRAY_CFG"
+  fi
+  if command -v nginx >/dev/null 2>&1; then
+    nginx -t >/dev/null 2>&1 && pass_ "nginx: конфиг корректен" || fail_ "nginx: конфиг не проходит проверку" "nginx -t"
+  fi
+  echo -e "\n ${BOLD}Сеть и домен${NC}"
+  dnsip=$(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')
+  ip=$(hostname -I 2>/dev/null)
+  if [[ -z $dnsip ]]; then fail_ "домен $d не резолвится" "создайте A-запись на IP сервера"
+  else
+    local hit=0 a; for a in $dnsip; do [[ " $ip" == *" $a "* ]] && hit=1; done
+    if [[ $hit == 0 ]]; then
+      local ext; ext=$("$CURL" -fsS --max-time 4 https://api.ipify.org 2>/dev/null)
+      for a in $dnsip; do [[ -n $ext && $a == "$ext" ]] && hit=1; done
+    fi
+    [[ $hit == 1 ]] && pass_ "A-запись $d указывает на этот сервер" || warn_ "A-запись $d ($dnsip) не совпадает с адресами сервера" "проверьте DNS"
+    [[ $(wc -w <<<"$dnsip") -gt 1 ]] && warn_ "у домена несколько A-записей" "оставьте одну"
+  fi
+  if [[ $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) == bbr ]]; then pass_ "BBR включён"; else warn_ "BBR не включён" "ядро или контейнер не поддерживают"; fi
+  if command -v timedatectl >/dev/null 2>&1 && [[ $(timedatectl show -p NTPSynchronized --value 2>/dev/null) == no ]]; then
+    warn_ "время не синхронизировано" "TLS и сертификаты чувствительны ко времени: timedatectl set-ntp true"
+  fi
+  echo -e "\n ${BOLD}Сертификат${NC}"
+  if [[ -r /var/lib/xray/cert/fullchain.pem ]] && command -v openssl >/dev/null; then
+    cert_end=$(openssl x509 -enddate -noout -in /var/lib/xray/cert/fullchain.pem | cut -d= -f2)
+    days=$(days_left "$(date -d "$cert_end" +%s)")
+    if [[ $days -le 3 ]]; then fail_ "сертификат истекает через $days дн." "\$HOME/.acme.sh/acme.sh --renew -d $d --ecc --force"
+    elif [[ $days -le 14 ]]; then warn_ "сертификат истекает через $days дн." "проверьте автообновление acme.sh (crontab -l)"
+    else pass_ "сертификат действителен ещё $days дн."; fi
+  else warn_ "сертификат не найден" "/var/lib/xray/cert/fullchain.pem"; fi
+  crontab -l 2>/dev/null | grep -q acme.sh && pass_ "автообновление сертификата (cron acme.sh)" || warn_ "в crontab нет задачи acme.sh" "сертификат не будет обновляться сам"
+  echo -e "\n ${BOLD}Система${NC}"
+  local use; use=$(df -P / | awk 'NR == 2 {gsub("%", "", $5); print $5}')
+  [[ ${use:-0} -ge 90 ]] && warn_ "диск заполнен на ${use}%" "очистите журналы и старые бэкапы" || pass_ "диск: занято ${use:-?}%"
+  local geo=${XRAY_LOCATION_ASSET:-/usr/local/share/xray}/geosite.dat
+  if [[ -f $geo ]]; then
+    days=$(( ($(date +%s) - $(stat -c %Y "$geo")) / 86400 ))
+    [[ $days -gt 45 ]] && warn_ "гео-данные старше $days дн." "autoxray geo-update" || pass_ "гео-данные свежие ($days дн.)"
+  fi
+  if command -v ufw >/dev/null 2>&1; then
+    ufw status 2>/dev/null | grep -q 'Status: active' && pass_ "файрвол ufw активен" || warn_ "ufw установлен, но выключен" "autoxray firewall"
+  else warn_ "файрвол не настроен" "autoxray firewall"; fi
+  if [[ $(mode) == direct && $(st '.warp.enabled // false') == true ]]; then
+    echo -e "\n ${BOLD}WARP${NC}"
+    (cmd_warp check >/dev/null 2>&1) && pass_ "WARP отвечает (warp=on)" || fail_ "WARP не отвечает" "autoxray warp check; autoxray warp register"
+  fi
+  echo; rule
+  if [[ $bad -eq 0 ]]; then echo -e " 🎉 ${GRN}Критичных проблем не найдено${NC}"; else echo -e " 🚨 ${RED}Критичных проблем: $bad${NC}"; return 1; fi
+}
+
+# ufw: SSH (порт определяется автоматически), 80/tcp, 443/tcp и 443/udp; остальное входящее закрыто.
+cmd_firewall() {
+  need_root
+  local dry=0 ssh_port
+  [[ ${1:-} == --dry-run ]] && dry=1
+  ssh_port=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}'); ssh_port=${ssh_port:-22}
+  section "🔥 Файрвол (ufw)"
+  echo -e " Будут разрешены:  ${BOLD}SSH $ssh_port/tcp${NC}, ${BOLD}80/tcp${NC}, ${BOLD}443/tcp${NC}, ${BOLD}443/udp${NC}; остальной входящий трафик закрыт."
+  echo -e " ${YEL}Убедитесь, что порт SSH определён верно — иначе вы потеряете доступ к серверу.${NC}"
+  if [[ $dry == 1 ]]; then
+    echo -e " ${DIM}(dry-run) ufw allow $ssh_port/tcp; ufw allow 80/tcp; ufw allow 443/tcp; ufw allow 443/udp; ufw default deny incoming; ufw enable${NC}"
+    return 0
+  fi
+  read -rp "Для подтверждения введите yes: " a; [[ $a == yes ]] || die "Отменено."
+  command -v ufw >/dev/null 2>&1 || apt-get install -y ufw >/dev/null || die "Не удалось установить ufw"
+  ufw allow "$ssh_port/tcp" >/dev/null && ufw allow 80/tcp >/dev/null && ufw allow 443/tcp >/dev/null && ufw allow 443/udp >/dev/null \
+    && ufw default deny incoming >/dev/null && ufw default allow outgoing >/dev/null && ufw --force enable >/dev/null \
+    || die "ufw не настроен"
+  ok "✅ Файрвол включён."; ufw status | sed 's/^/   /'
+}
+
 # Полное удаление: Telegram Web Proxy, Xray, nginx, acme.sh, данные и сам autoxray.
 cmd_uninstall() {
   need_root; need_state
@@ -1122,73 +1286,106 @@ cmd_init() {
 
 # ----------------------------------------------------------------- меню
 
-pause() { read -rp "Enter — продолжить..." _; }
+pause() { echo; read -rp "$(echo -e "${DIM}Enter — продолжить...${NC}")" _; }
+prompt() { local v; read -rp "$(echo -e " ${BOLD}${CYAN}›${NC} $1: ")" v; printf '%s' "$v"; }
+mi() { printf '  %b%s%b  %s' "$BOLD$CYAN" "$1" "$NC" "$2"; }   # пункт меню
+
+menu_warp() {
+  while true; do
+    clear; cmd_warp status; echo
+    echo -e "$(mi 1 "🟢 Включить WARP")"
+    echo -e "$(mi 2 "🔴 Выключить WARP")"
+    echo -e "$(mi 3 "🇷🇺 Российские сайты ЧЕРЕЗ WARP")"
+    echo -e "$(mi 4 "🏠 Российские сайты напрямую")"
+    echo -e "$(mi 5 "➕ Добавить домен в WARP")"
+    echo -e "$(mi 6 "➖ Убрать домен из WARP")"
+    echo -e "$(mi 7 "🔎 Проверить работу")"
+    echo -e "$(mi 0 "🔙 Назад")"
+    case $(prompt "Выбор") in
+      1) (cmd_warp on); pause ;;
+      2) (cmd_warp off); pause ;;
+      3) (cmd_warp ru on); pause ;;
+      4) (cmd_warp ru off); pause ;;
+      5) (cmd_warp add "$(prompt "Домен")"); pause ;;
+      6) (cmd_warp del "$(prompt "Домен")"); pause ;;
+      7) (cmd_warp check); pause ;;
+      0|q|"") return ;;
+    esac
+  done
+}
+
+menu_update() {
+  clear; section "📦 Обновления"; echo
+  echo -e "$(mi 1 "📦 autoxray (скрипты и шаблоны) до последнего релиза")"
+  echo -e "$(mi 2 "🔧 Ядро Xray")"
+  echo -e "$(mi 3 "🗺 Гео-данные (geoip / geosite)")"
+  echo -e "$(mi 0 "🔙 Назад")"
+  case $(prompt "Выбор") in
+    1) (cmd_self_update); pause ;;
+    2) (cmd_update_core); pause ;;
+    3) (cmd_geo_update); pause ;;
+  esac
+}
 
 menu() {
   need_state
-  local c name
+  local name lim days args q
   while true; do
     clear
     cmd_status
-    echo -e "\n${CYAN}1)${NC} Пользователи        ${CYAN}6)${NC} WARP"
-    echo -e "${CYAN}2)${NC} Добавить            ${CYAN}7)${NC} Бэкап"
-    echo -e "${CYAN}3)${NC} Удалить             ${CYAN}8)${NC} Применить конфиг заново"
-    echo -e "${CYAN}4)${NC} Ссылки и QR         ${CYAN}9)${NC} Обновить ядро Xray"
-    echo -e "${CYAN}5)${NC} Статистика          ${CYAN}0)${NC} Выход"
-    read -rp "> " c
-    case $c in
+    echo
+    printf '%s     %s\n' "$(mi 1 "👥 Пользователи      ")" "$(mi 6 "🌍 WARP")"
+    printf '%s     %s\n' "$(mi 2 "➕ Добавить          ")" "$(mi 7 "💾 Бэкап")"
+    printf '%s     %s\n' "$(mi 3 "❌ Удалить           ")" "$(mi 8 "🔄 Применить конфиг")"
+    printf '%s     %s\n' "$(mi 4 "🔗 Ссылки и QR       ")" "$(mi 9 "📦 Обновления")"
+    printf '%s     %s\n' "$(mi 5 "📊 Статистика        ")" "$(mi d "🩺 Диагностика")"
+    printf '%s\n' "$(mi 0 "🚪 Выход")"
+    echo
+    case $(prompt "Выбор") in
       1) cmd_user_list; pause ;;
-      2) read -rp "Имя: " name; read -rp "Лимит трафика, ГБ (Enter — без лимита): " lim; read -rp "Срок, дней (Enter — бессрочно): " days
+      2) name=$(prompt "Имя"); lim=$(prompt "Лимит трафика, ГБ (Enter — без лимита)"); days=$(prompt "Срок, дней (Enter — бессрочно)")
          args=(); [[ -n $lim ]] && args+=(--limit "$lim"); [[ -n $days ]] && args+=(--days "$days")
          (locked cmd_user_add "$name" "${args[@]}"); pause ;;
-      3) cmd_user_list; read -rp "Кого удалить: " name; (locked cmd_user_del "$name"); pause ;;
-      4) cmd_user_list; read -rp "Пользователь: " name
-         (show_user "$name"; read -rp "Показать QR подписки? (y/N): " q; [[ $q =~ ^[Yy]$ ]] && cmd_user_qr "$name" sub); pause ;;
+      3) cmd_user_list; name=$(prompt "Кого удалить"); (locked cmd_user_del "$name"); pause ;;
+      4) cmd_user_list; name=$(prompt "Пользователь")
+         (show_user "$name"; q=$(prompt "Показать QR подписки? (y/N)"); [[ $q =~ ^[Yy]$ ]] && cmd_user_qr "$name" sub); pause ;;
       5) cmd_stats; pause ;;
-      6) cmd_warp status
-         echo -e "\n1) включить  2) выключить  3) RU через WARP вкл  4) RU напрямую  5) добавить домен  6) проверить  0) назад"
-         read -rp "> " w
-         case $w in
-           1) (cmd_warp on) ;; 2) (cmd_warp off) ;; 3) (cmd_warp ru on) ;; 4) (cmd_warp ru off) ;;
-           5) read -rp "Домен: " d; (cmd_warp add "$d") ;; 6) (cmd_warp check) ;;
-         esac; pause ;;
+      6) [[ $(mode) == direct ]] && menu_warp || { warn "WARP недоступен в режиме моста."; pause; } ;;
       7) (cmd_backup); pause ;;
       8) (cmd_render); pause ;;
-      9) (cmd_update_core); pause ;;
-      0|q) exit 0 ;;
+      9) menu_update ;;
+      d|D) (cmd_doctor); pause ;;
+      0|q|"") exit 0 ;;
     esac
   done
 }
 
 usage() {
-  cat <<EOF
-autoxray $AX_VERSION — управление autoXRAY
-
-  autoxray                         меню
-  autoxray status                  состояние служб
-  autoxray user list
-  autoxray user add <имя> [--limit ГБ] [--days N] [--reset monthly]
-  autoxray user del <имя>
-  autoxray user set <имя> [--limit ГБ] [--days N] [--reset monthly|never] [--enable|--disable] [--reset-traffic]
-  autoxray user rotate <имя>       новые ключи и ссылка
-  autoxray user link <имя>         ссылки и адрес страницы подписки
-  autoxray user qr <имя> [sub|xhttp|vision|hy2]
-  autoxray stats                   трафик по пользователям
-  autoxray node add <vless://...>|del <имя|id>|list   (режим моста)
-  autoxray migrate [имя]           перенос установки autoXRAY 2
-  autoxray warp register|on|off|status|check
-  autoxray warp ru on|off          российские сайты через WARP
-  autoxray warp add|del <домен>    свой список доменов через WARP
-  autoxray fingerprint <браузер>
-  autoxray telegram set <ссылка>|off|update|remove
-  autoxray backup [файл] | restore <файл>
-  autoxray update-core [версия]
-  autoxray render                  пересобрать конфиги Xray, nginx и подписки
-  autoxray self-update [vX.Y.Z]    обновить autoxray до релиза (по умолчанию — последнего)
-  autoxray version
-  autoxray uninstall               удалить всё (с подтверждением)
-  autoxray collect                 (cron) учёт трафика и лимитов
-EOF
+  local H="${BOLD}${MAG}" C="${CYAN}" D="${DIM}" N="${NC}"
+  echo -e "${BOLD}🔐 autoxray $AX_VERSION${N} ${D}— управление autoXRAY${N}\n"
+  echo -e "${H}Общее${N}"
+  echo -e "  ${C}autoxray${N}                       меню"
+  echo -e "  ${C}autoxray status${N}                состояние служб, сертификата, WARP"
+  echo -e "  ${C}autoxray doctor${N}                🩺 диагностика сервера"
+  echo -e "  ${C}autoxray stats${N}                 📊 трафик по пользователям"
+  echo -e "${H}Пользователи${N}"
+  echo -e "  ${C}autoxray user list${N} ${D}[--plain]${N}"
+  echo -e "  ${C}autoxray user add${N} <имя> ${D}[--limit ГБ] [--days N] [--reset monthly]${N}"
+  echo -e "  ${C}autoxray user set${N} <имя> ${D}[--limit ГБ] [--days N] [--reset monthly|never] [--enable|--disable] [--reset-traffic]${N}"
+  echo -e "  ${C}autoxray user del${N} <имя>        ${C}user rotate${N} <имя>  ${D}новые ключи и ссылка${N}"
+  echo -e "  ${C}autoxray user link${N} <имя> ${D}[--plain]${N}  ${C}user qr${N} <имя> ${D}[sub|xhttp|vision|hy2]${N}"
+  echo -e "${H}Сеть${N}"
+  echo -e "  ${C}autoxray warp${N} register|on|off|status|check|add|del"
+  echo -e "  ${C}autoxray warp ru${N} on|off        ${D}российские сайты через WARP${N}"
+  echo -e "  ${C}autoxray node${N} add <vless://…>|del <имя|id>|list   ${D}(режим моста)${N}"
+  echo -e "  ${C}autoxray fingerprint${N} <браузер> ${C}telegram${N} set <ссылка>|off|update|remove"
+  echo -e "  ${C}autoxray firewall${N} [--dry-run]  ${D}🔥 настроить ufw (SSH, 80, 443)${N}"
+  echo -e "${H}Обслуживание${N}"
+  echo -e "  ${C}autoxray backup${N} [файл]  ${C}restore${N} <файл>  ${C}render${N}  ${D}пересобрать конфиги${N}"
+  echo -e "  ${C}autoxray self-update${N} [vX.Y.Z]  ${C}update-core${N} [версия]  ${C}geo-update${N}"
+  echo -e "  ${C}autoxray migrate${N} [имя]         ${D}перенос с autoXRAY 2${N}"
+  echo -e "  ${C}autoxray uninstall${N}             ${D}удалить всё (с подтверждением)${N}"
+  echo -e "  ${C}autoxray version${N}  ${C}collect${N} ${D}(cron: учёт трафика)${N}"
 }
 
 main() {
@@ -1211,6 +1408,9 @@ main() {
     node|nodes)   cmd_node "$@" ;;
     self-update)  cmd_self_update "$@" ;;
     uninstall)    cmd_uninstall ;;
+    doctor)       cmd_doctor ;;
+    geo-update)   need_root; cmd_geo_update "$@" ;;
+    firewall)     cmd_firewall "$@" ;;
     -v|--version|version) echo "autoxray $AX_VERSION" ;;
     help|-h|--help) usage ;;
     *) usage; exit 1 ;;

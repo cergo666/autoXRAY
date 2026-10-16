@@ -32,6 +32,7 @@ fi
 step "install.sh $scenario"
 run_install 2 y && pass "install.sh завершился успешно" || { fail "install.sh упал"; tail -n 25 /tmp/install.log; finish; exit 1; }
 tail -n 12 /tmp/install.log | sed 's/\x1b\[[0-9;]*m//g'
+grep -qF '\033' /tmp/install.log && fail "в выводе установщика остались «сырые» escape-последовательности" || pass "вывод установщика без «сырых» escape-кодов"
 
 step "Результат установки"
 check "state.json создан" test -s /etc/autoxray/state.json

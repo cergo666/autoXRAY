@@ -12,9 +12,12 @@ GRN='\033[1;32m'
 RED='\033[1;31m'
 YEL='\033[1;33m'
 CYAN='\033[1;36m'
+MAG='\033[1;35m'
+BOLD='\033[1m'
+DIM='\033[2m'
 NC='\033[0m'
 
-AX_RELEASE="3.0.0"
+AX_RELEASE="3.1.0"
 AX_REF_DEFAULT="main"   # при выпуске релиза заменяется на тег (см. .github/workflows/release.yml)
 AX_REF="${AUTOXRAY_REF:-$AX_REF_DEFAULT}"
 RAW="https://raw.githubusercontent.com/cergo666/autoXRAY/$AX_REF"
@@ -328,31 +331,29 @@ mkdir -p /etc/cron.d
 cat > /etc/cron.d/autoxray <<'EOF'
 # учёт трафика, лимиты и сроки пользователей autoXRAY
 */5 * * * * root /usr/local/bin/autoxray collect >/dev/null 2>&1
+# обновление гео-данных (маршрутизация), по понедельникам
+17 4 * * 1 root /usr/local/bin/autoxray geo-update --quiet >/dev/null 2>&1
 EOF
 chmod 644 /etc/cron.d/autoxray
 
 # ==========================================
 # Итог
 # ==========================================
-echo -e "\n${YEL}=== Финальная проверка статусов ===${NC}"
+echo -e "\n${BOLD}${MAG}🎉 Установка завершена${NC}"
 autoxray status
 
-echo -e "\n${YEL}Первый пользователь «$AX_USER»:${NC}"
+echo -e "\n${BOLD}${YEL}Первый пользователь «$AX_USER»${NC}"
 autoxray user link "$AX_USER"
 
-cat <<EOF
-Скопируйте подписку в специализированное приложение:
-- iOS: Happ или v2RayTun или v2rayN
-- Android: Happ или v2RayTun или v2rayNG
-- Windows: конфиги Happ или winLoadXRAY или v2rayN
-  для vless v2RayTun или Throne
+echo -e "${BOLD}${MAG}▌📱 Куда вставить подписку${NC}"
+echo -e "  iOS / macOS ${DIM}—${NC} Happ, v2rayTun"
+echo -e "  Android     ${DIM}—${NC} Happ, v2rayTun, v2rayNG"
+echo -e "  Windows     ${DIM}—${NC} Happ, v2rayN, winLoadXRAY"
+echo -e "  ${DIM}Внутри клиента открыт socks5 на 10808 и 2080, http на 10809.${NC}"
 
-Внутри клиента открыт socks5 на 10808, 2080 и http на 10809.
-
-${CYAN}Управление пользователями, трафиком, WARP:${NC} autoxray
-  autoxray user add <имя> --limit 50 --days 30
-  autoxray stats
-  autoxray warp ru on
-
-${GRN}Поддержать автора: https://github.com/cergo666/autoXRAY ${NC}
-EOF
+echo -e "\n${BOLD}${MAG}▌🧰 Управление${NC}  ${CYAN}autoxray${NC} ${DIM}(меню)${NC}"
+echo -e "  ${CYAN}autoxray user add <имя> --limit 50 --days 30${NC}   ${DIM}новый пользователь${NC}"
+echo -e "  ${CYAN}autoxray stats${NC}                                 ${DIM}трафик${NC}"
+echo -e "  ${CYAN}autoxray doctor${NC}                                ${DIM}диагностика${NC}"
+echo -e "  ${CYAN}autoxray firewall${NC}                              ${DIM}файрвол (по желанию)${NC}"
+echo -e "\n${DIM}Документация и релизы: https://github.com/cergo666/autoXRAY${NC}\n"

@@ -65,7 +65,7 @@ client_start /tmp/client-b.json && via_proxy ok.txt >/dev/null && pass "bob: п�
 curl -fsS --max-time 8 --socks5-hostname 127.0.0.1:10808 http://93.184.216.34:8080/ok.txt -o /dev/null
 head -c 20000 /dev/urandom > /srv/target/big.bin; via_proxy big.bin >/dev/null
 autoxray collect
-autoxray user list | grep -E '^bob +limit' >/dev/null && pass "bob переведён в limit" || { fail "bob не в limit"; autoxray user list; }
+[ "$(ustatus bob)" = limit ] && pass "bob переведён в limit" || { fail "bob не в limit: $(ustatus bob)"; autoxray user list; }
 [ "$(jq '[.inbounds[0].settings.clients[].email] | index("bob")' /usr/local/etc/xray/config.json)" = null ] && pass "bob удалён из конфига Xray" || fail "bob остался в конфиге"
 client_stop; client_start /tmp/client-b.json
 via_proxy ok.txt >/dev/null 2>&1 && fail "bob всё ещё проходит после лимита" || pass "bob после лимита не проходит"
@@ -74,7 +74,7 @@ client_start /tmp/client-0.json; via_proxy ok.txt >/dev/null 2>&1 && pass "alice
 client_stop
 
 step "Управление: reset, rotate, del"
-autoxray user set bob --limit 0 --reset-traffic && autoxray user list | grep -E '^bob +active' >/dev/null && pass "bob снова active" || fail "bob не восстановился"
+autoxray user set bob --limit 0 --reset-traffic && [ "$(ustatus bob)" = active ] && pass "bob снова active" || fail "bob не восстановился"
 old_uuid=$(jq -r '.users[] | select(.name=="alice").uuid' /etc/autoxray/state.json)
 autoxray user rotate alice >/dev/null
 new_uuid=$(jq -r '.users[] | select(.name=="alice").uuid' /etc/autoxray/state.json)
@@ -99,6 +99,15 @@ client_cfg "$TOKEN_A" 1 127.0.0.1 > /tmp/client-w.json
 client_start /tmp/client-w.json && via_proxy ok.txt >/dev/null && pass "трафик идёт при включённом WARP (не-RU напрямую)" || fail "трафик сломан при WARP"
 client_stop
 autoxray warp ru off >/dev/null && check "warp ru off + xray -test" xray run -test -c /usr/local/etc/xray/config.json
+autoxray warp off >/dev/null && check "warp off + xray -test" xray run -test -c /usr/local/etc/xray/config.json
+
+step "Диагностика, гео-данные, файрвол (dry-run), интерфейс"
+autoxray doctor > /tmp/doctor.out 2>&1 && pass "doctor: критичных проблем нет" || { fail "doctor нашёл проблемы"; sed "s/\x1b\[[0-9;]*m//g" /tmp/doctor.out; }
+check "firewall --dry-run" autoxray firewall --dry-run
+check "geo-update (настоящий install-geodata)" autoxray geo-update
+check "status/stats/user list печатаются" bash -c 'autoxray status && autoxray stats && autoxray user list'
+[ "$(autoxray user list | sed "s/\x1b\[[0-9;]*m//g" | grep -c "активен")" -ge 1 ] && pass "список пользователей с русскими статусами" || fail "список пользователей"
+check "help" bash -c 'autoxray help | grep -q doctor'
 
 step "Бэкап и повторный render идемпотентен"
 autoxray backup /tmp/bk.tar.gz >/dev/null && check "бэкап создан" test -s /tmp/bk.tar.gz

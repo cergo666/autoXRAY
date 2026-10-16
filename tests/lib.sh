@@ -14,18 +14,21 @@ finish() {
     [ "$FAIL" -eq 0 ]
 }
 
+# Статус пользователя (active|limit|expired|disabled) из машиночитаемого списка
+ustatus() { autoxray user list --plain | awk -F'\t' -v n="$1" '$1 == n {print $2}'; }
+
 # Локальный CA и сертификат для домена (доверяем CA на уровне системы — клиент Xray проверяет TLS по-настоящему)
 setup_tls() { # домен [каталог общего CA]
     local domain=$1 ca=${2:-/tmp/ca}
     mkdir -p "$ca" /var/lib/xray/cert
     if [ ! -f "$ca/ca.pem" ]; then
-        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 -subj "/CN=autoxray-test-ca" \
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 30 -subj "/CN=autoxray-test-ca" \
             -keyout "$ca/ca.key" -out "$ca/ca.pem" 2>/dev/null
     fi
     openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -subj "/CN=$domain" \
         -keyout /var/lib/xray/cert/privkey.pem -out /tmp/srv.csr 2>/dev/null
     printf 'subjectAltName=DNS:%s\n' "$domain" > /tmp/san.cnf
-    openssl x509 -req -in /tmp/srv.csr -CA "$ca/ca.pem" -CAkey "$ca/ca.key" -CAcreateserial -days 2 -extfile /tmp/san.cnf \
+    openssl x509 -req -in /tmp/srv.csr -CA "$ca/ca.pem" -CAkey "$ca/ca.key" -CAcreateserial -days 30 -extfile /tmp/san.cnf \
         -out /var/lib/xray/cert/fullchain.pem 2>/dev/null
     cp "$ca/ca.pem" /usr/local/share/ca-certificates/autoxray-test-ca.crt
     update-ca-certificates >/dev/null 2>&1

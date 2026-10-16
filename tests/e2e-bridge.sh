@@ -18,7 +18,7 @@ if [ "$role" = eu ]; then
     autoxray init --domain "$DOMAIN" --fp firefox --xhttp-path eu9x2q --web "/var/www/$DOMAIN" --user bridge1 >/dev/null || fail "init"
     autoxray user add bridge2 >/dev/null || fail "user add"
     check "EU render" autoxray render
-    for u in bridge1 bridge2; do autoxray user link "$u" | grep -m1 '^vless://' > "$SHARED/$u.link"; done
+    for u in bridge1 bridge2; do autoxray user link "$u" --plain | head -n1 | cut -d'|' -f2 > "$SHARED/$u.link"; done
     check "EU: ссылки узлов выданы" test -s "$SHARED/bridge2.link"
     touch "$SHARED/eu.ready"
     finish
