@@ -9,8 +9,10 @@ set -uo pipefail
 # bash >= 5.2: '&' в замене ${var//a/b} — спецсимвол; ссылки содержат '&'
 shopt -u patsub_replacement 2>/dev/null || true
 
-AX_VERSION="3.1.0"
+AX_VERSION="3.2.0"
 AX_REPO="cergo666/autoXRAY"
+XRAY_TESTED="v26.9.9"          # версия ядра, с которой этот релиз проверен тестами
+API="${AX_API:-https://api.github.com}"
 AX_ETC="${AX_ETC:-/etc/autoxray}"
 STATE="$AX_ETC/state.json"
 TRAFFIC="$AX_ETC/traffic.json"
@@ -22,7 +24,7 @@ CURL="${AX_CURL:-curl}"
 DRY="${AX_DRY:-0}"            # 1 — не трогать службы (для тестов)
 API_ADDR="127.0.0.1:10085"
 WARP_API="https://api.cloudflareclient.com/v0i1909051800"
-WARP_ENDPOINT="engage.cloudflareclient.com:2408"
+WARP_ENDPOINT="162.159.192.1:2408"
 
 BOLD='\033[1m'; DIM='\033[2m'
 GRN='\033[1;32m'; RED='\033[1;31m'; YEL='\033[1;33m'; BLU='\033[1;34m'
@@ -53,6 +55,32 @@ bar() {
     printf '%b%s%b   ∞ ' "$DIM" "$out" "$NC"
   fi
 }
+# ver_gt A B — истина, если версия A новее B (числа через точку, префикс v допускается)
+ver_gt() {
+  local a=${1#v} b=${2#v}
+  [[ -n $a && -n $b && $a != "$b" && $(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -n1) == "$a" ]]
+}
+
+# Последний релиз autoXRAY. Кэш /etc/autoxray/.latest обновляет cron (collect раз в 12 часов);
+# интерактивный запуск ходит в сеть только если кэша ещё нет (таймаут 3 с).
+latest_ax() { # [force]
+  local cache="$AX_ETC/.latest" age=999999 tag
+  [[ -f $cache ]] && age=$(( $(date +%s) - $(stat -c %Y "$cache") ))
+  if [[ ${1:-} == force ]] && [[ $age -gt 43200 ]] || [[ ! -f $cache ]]; then
+    tag=$("$CURL" -fsS --max-time 3 "$API/repos/$AX_REPO/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null)
+    mkdir -p "$AX_ETC" 2>/dev/null
+    { [[ -n $tag ]] && printf '%s\n' "${tag#v}" || { cat "$cache" 2>/dev/null || true; }; } >"$cache.tmp" 2>/dev/null && mv "$cache.tmp" "$cache" 2>/dev/null
+  fi
+  cat "$cache" 2>/dev/null
+}
+
+update_banner() {
+  local latest; latest=$(latest_ax)
+  if ver_gt "$latest" "$AX_VERSION"; then
+    echo -e "\n 🆕 ${BOLD}${GRN}Доступна версия $latest${NC} ${DIM}(у вас $AX_VERSION)${NC}  ${CYAN}autoxray self-update${NC}"
+  fi
+}
+
 days_left() { echo $(( ($1 - $(date +%s)) / 86400 )); }
 
 need_root()  { [[ $DRY == 1 || $EUID -eq 0 ]] || die "Нужны root права."; }
@@ -813,6 +841,7 @@ cmd_collect() {
     jq --arg n "$due" 'del(.[$n])' "$TRAFFIC" >"$TRAFFIC.tmp" && mv "$TRAFFIC.tmp" "$TRAFFIC"
     st_edit --arg n "$due" --argjson nr "$(next_month)" '(.users[] | select(.name == $n) | .next_reset) = $nr'
   done < <(jq -r --argjson now "$(now)" '.users[] | select((.reset // "never") == "monthly" and (.next_reset // 0) <= $now) | .name' "$STATE")
+  latest_ax force >/dev/null
   after=$(active_names)
   if [[ $before != "$after" ]]; then apply_xray; fi
   render_subs
@@ -916,6 +945,103 @@ warp_register() {
   ok "✅ WARP-устройство зарегистрировано ($v4)."
 }
 
+# Кандидаты на endpoint: порты WARP бывают закрыты провайдером выборочно (список можно задать через AX_WARP_CANDIDATES)
+warp_candidates() {
+  local cur; cur=$(st '.warp.endpoint // empty')
+  if [[ -n ${AX_WARP_CANDIDATES:-} ]]; then tr ' ' '\n' <<<"$AX_WARP_CANDIDATES"; return; fi
+  { [[ -n $cur ]] && echo "$cur"
+    printf '%s\n' 162.159.192.1:2408 162.159.192.1:500 162.159.192.1:4500 162.159.192.1:1701 \
+      162.159.193.1:2408 188.114.97.1:2408 188.114.99.1:2408 engage.cloudflareclient.com:2408; } | awk '!seen[$0]++'
+}
+
+# warp_probe <endpoint> — отдельный Xray только с WARP спрашивает one.one.one.one/cdn-cgi/trace.
+# Результат: код 0 при warp=on; журнал сохраняется в $WARP_PROBE_LOG (секреты вырезаны).
+warp_probe() {
+  local ep=$1 cfg pid out port=10899 i
+  command -v xray >/dev/null 2>&1 || { WARP_PROBE_OUT="xray не найден"; return 2; }
+  cfg=$(mktemp --suffix=.json); WARP_PROBE_LOG=$(mktemp)
+  jq -n --slurpfile s "$STATE" --arg ep "$ep" --argjson port "$port" '
+    $s[0].warp as $W | {
+      log: {loglevel: "debug"},
+      inbounds: [{tag: "in", listen: "127.0.0.1", port: $port, protocol: "socks", settings: {udp: false}}],
+      outbounds: [{tag: "warp", protocol: "wireguard", settings: {
+        secretKey: $W.secretKey, address: $W.address,
+        peers: [{publicKey: $W.peerPublicKey, allowedIPs: ["0.0.0.0/0", "::/0"], endpoint: $ep}],
+        mtu: 1280, reserved: $W.reserved, noKernelTun: true, domainStrategy: "ForceIP"}}]}' >"$cfg"
+  xray run -c "$cfg" >"$WARP_PROBE_LOG" 2>&1 9>&- &
+  pid=$!
+  for i in $(seq 1 15); do ss -ltn 2>/dev/null | grep -q "127.0.0.1:$port " && break; sleep 0.2; done
+  WARP_PROBE_OUT=$("$CURL" -fsS --max-time 10 --socks5-hostname "127.0.0.1:$port" https://one.one.one.one/cdn-cgi/trace 2>&1)
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -f "$cfg"
+  sed -i -E 's/(secretKey|privateKey|private_key)[^,]*/\1 <скрыто>/Ig' "$WARP_PROBE_LOG" 2>/dev/null
+  grep -qE '^warp=(on|plus)' <<<"$WARP_PROBE_OUT"
+}
+
+# Перебирает endpoint'ы, оставляет первый рабочий в state.json. Код 1 — WARP недоступен с этого сервера.
+warp_pick_endpoint() {
+  local ep
+  echo -e " 🔎 ${DIM}Проверяю, отвечает ли WARP с этого сервера...${NC}"
+  while read -r ep; do
+    [[ -n $ep ]] || continue
+    printf '    %s ... ' "$ep"
+    if warp_probe "$ep"; then
+      echo -e "${GRN}✔ работает${NC}"
+      st_edit --arg ep "$ep" '.warp.endpoint = $ep'; return 0
+    fi
+    echo -e "${RED}✘${NC}"
+  done < <(warp_candidates)
+  return 1
+}
+
+warp_enable_checked() { # [--force]; печатает причину и возвращает 1, если WARP не отвечает
+  if [[ ${1:-} == --force ]]; then return 0; fi
+  if ! warp_pick_endpoint; then
+    warn "WARP не отвечает ни на одном endpoint. Включение отменено, чтобы не оборвать доступ к сайтам."
+    echo -e "   ${DIM}Запустите ${NC}${CYAN}autoxray warp debug${NC}${DIM} и пришлите вывод, либо ${NC}${CYAN}--force${NC}${DIM} чтобы включить без проверки.${NC}"
+    return 1
+  fi
+}
+
+# Один отчёт для разбора проблем с WARP, секреты скрыты.
+warp_debug() {
+  need_state
+  local quick=0 ep ok_cnt=0; [[ ${1:-} == --quick ]] && quick=1
+  section "🧪 Отладка WARP"
+  kv "🔐" "autoxray" "$AX_VERSION"
+  kv "⚙️ " "Xray" "$(xray_version)"
+  kv "🖥 " "Система" "$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-?}"), ядро $(uname -r)"
+  kv "🌐" "IPv4 наружу" "$("$CURL" -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null || echo "нет ответа")"
+  kv "🌐" "IPv6 наружу" "$("$CURL" -6 -fsS --max-time 5 https://api6.ipify.org 2>/dev/null || echo "нет")"
+  echo -e "\n ${BOLD}Состояние в state.json${NC} ${DIM}(ключи скрыты)${NC}"
+  jq '.warp | del(.secretKey, .deviceToken) | .secretKey = "<скрыто>"' "$STATE" | sed 's/^/   /'
+  if [[ -f $XRAY_CFG ]]; then
+    echo -e "\n ${BOLD}Outbound warp в рабочем конфиге${NC}"
+    jq '(.outbounds[]? | select(.tag == "warp") | .settings | del(.secretKey)) // "нет outbound warp"' "$XRAY_CFG" | sed 's/^/   /'
+    echo -e "\n ${BOLD}Правила маршрутизации на warp${NC}"
+    jq -c '.routing.rules[]? | select(.outboundTag == "warp")' "$XRAY_CFG" | sed 's/^/   /'
+  fi
+  [[ $(st '.warp.registered // false') == true ]] || { warn "WARP не зарегистрирован: autoxray warp register"; return 1; }
+  echo -e "\n ${BOLD}Проверка endpoint'ов${NC} ${DIM}(у каждого свой тестовый Xray, до 10 с)${NC}"
+  local cands; cands=$(warp_candidates); [[ $quick == 1 ]] && cands=$(head -n1 <<<"$cands")
+  while read -r ep; do
+    [[ -n $ep ]] || continue
+    if warp_probe "$ep"; then
+      ok_cnt=$((ok_cnt + 1)); echo -e "   ${GRN}✔${NC} $ep  ${DIM}$(grep -E '^(ip|loc|warp)=' <<<"$WARP_PROBE_OUT" | tr '\n' ' ')${NC}"
+    else
+      echo -e "   ${RED}✘${NC} $ep  ${DIM}${WARP_PROBE_OUT:0:110}${NC}"
+      grep -iE 'wireguard|handshake|endpoint|dial|failed|error|reserved' "$WARP_PROBE_LOG" | tail -n 6 | cut -c1-220 | sed 's/^/        /'
+    fi
+  done <<<"$cands"
+  echo; rule
+  if [[ $ok_cnt -gt 0 ]]; then
+    echo -e " ${GRN}WARP отвечает на $ok_cnt из $(wc -l <<<"$cands") endpoint'ов.${NC} Закрепить рабочий: ${CYAN}autoxray warp on${NC}"
+  else
+    echo -e " ${RED}WARP не ответил ни на одном endpoint.${NC} Пришлите этот вывод целиком."
+    echo -e " ${DIM}Частые причины: провайдер режет UDP до Cloudflare, закрыт исходящий UDP, регистрация устройства отклонена.${NC}"
+    return 1
+  fi
+}
+
 cmd_warp() {
   need_state
   [[ $(mode) == direct ]] || die "WARP не используется в режиме моста: российский трафик моста и так идёт напрямую."
@@ -924,11 +1050,16 @@ cmd_warp() {
     register) need_root; locked warp_register ;;
     on)  need_root
          [[ $(st '.warp.registered // false') == true ]] || locked warp_register
+         warp_enable_checked "${1:-}" || exit 1
          st_edit '.warp.enabled = true'; locked apply_or_die && ok "✅ WARP включён." ;;
+    debug) warp_debug "$@" ;;
+    endpoint) need_root; [[ -n ${1:-} ]] || die "warp endpoint <ip:порт>"
+         st_edit --arg ep "$1" '.warp.endpoint = $ep'; locked apply_or_die; ok "✅ endpoint → $1" ;;
     off) need_root; st_edit '.warp.enabled = false'; locked apply_or_die && ok "✅ WARP выключен." ;;
     ru)  need_root
          case ${1:-} in
            on)  [[ $(st '.warp.registered // false') == true ]] || locked warp_register
+                warp_enable_checked "${2:-}" || exit 1
                 st_edit '.warp.enabled = true | .warp.ru = true'; locked apply_or_die
                 ok "✅ Российские сайты идут через WARP."
                 warn "Обновите подписку в клиентах: теперь RU-трафик клиент отдаёт на сервер, а не напрямую." ;;
@@ -961,7 +1092,7 @@ cmd_warp() {
            || die "Нет ответа. Проверьте: autoxray warp status; systemctl status xray"
          echo "$trace" | sed 's/^/   /'
          grep -qE '^warp=(on|plus)' <<<"$trace" && ok "✅ WARP работает" || warn "warp не включён в ответе — трафик идёт мимо WARP" ;;
-    *) die "warp: register | on | off | ru on|off | add | del | list | check" ;;
+    *) die "warp: register | on | off | ru on|off | add | del | list | check | debug | endpoint" ;;
   esac
 }
 
@@ -990,6 +1121,7 @@ cmd_status() {
     days=$(days_left "$(date -d "$cert_end" +%s)"); col=$GRN; [[ $days -le 14 ]] && col=$YEL; [[ $days -le 3 ]] && col=$RED
     kv "📜" "Сертификат" "${col}ещё $days дн.${NC} ${DIM}(до $(date -d "$cert_end" +%F))${NC}"
   fi
+  update_banner
 }
 
 cmd_fingerprint() {
@@ -1035,15 +1167,56 @@ cmd_restore() {
   ok "✅ Восстановлено."
 }
 
-cmd_update_core() {
-  need_root; need_state
-  local v=${1:-$(st '.xray_version // "latest"')}
-  if [[ $v == latest ]]; then
-    bash -c "$(curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-  else
-    bash -c "$(curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version "$v"
-  fi
-  svc restart xray
+xray_version() { xray version 2>/dev/null | awk 'NR == 1 {print "v" $2}'; }
+
+# Стабильные версии Xray новее текущей (по одной в строке, свежие сверху)
+core_newer() {
+  local cur; cur=$(xray_version)
+  "$CURL" -fsS --max-time 10 "$API/repos/XTLS/Xray-core/releases" 2>/dev/null \
+    | jq -r '.[] | select(.prerelease == false and .draft == false) | .tag_name' 2>/dev/null \
+    | while read -r t; do ver_gt "$t" "$cur" && echo "$t"; done | sort -rV | head -n 12
+}
+
+core_warning() {
+  echo -e "\n ${BOLD}${YEL}⚠️  Ядро Xray лучше не обновлять без необходимости${NC}"
+  echo -e " ${DIM}Новые версии иногда меняют формат конфигов и поведение протоколов, и работающая схема может сломаться.${NC}"
+  echo -e " ${DIM}Этот релиз autoXRAY проверен с ${NC}${BOLD}$XRAY_TESTED${NC}${DIM}. Обновляйтесь, если нужна конкретная возможность или исправление.${NC}"
+}
+
+cmd_core() {
+  need_state
+  local sub=${1:-list}; shift || true
+  case $sub in
+    list)
+      local cur newer t; cur=$(xray_version)
+      section "⚙️  Ядро Xray"
+      kv "📌" "Установлено" "${BOLD}${cur:-не найдено}${NC}"
+      kv "✅" "Проверено" "$XRAY_TESTED ${DIM}(с этим релизом autoXRAY)${NC}"
+      newer=$(core_newer)
+      if [[ -n $newer ]]; then echo -e " 🆕 ${DIM}Новее установленной:${NC}"; while read -r t; do echo -e "    ${CYAN}•${NC} $t"; done <<<"$newer"
+      else echo -e " ${DIM}Новее установленной версий нет (или GitHub недоступен).${NC}"; fi
+      core_warning ;;
+    update)
+      need_root
+      local v="" yes=0 prev
+      while (($#)); do case $1 in --yes|-y) yes=1 ;; *) v=$1 ;; esac; shift; done
+      [[ -n $v ]] || v=$XRAY_TESTED
+      [[ $v == v* ]] || v="v$v"
+      prev=$(xray_version)
+      core_warning
+      echo -e "\n Сейчас: ${BOLD}${prev:-?}${NC}  →  будет установлена: ${BOLD}$v${NC}"
+      if [[ $yes != 1 ]]; then read -rp "$(echo -e " ${BOLD}Продолжить? Введите yes:${NC} ")" a; [[ $a == yes ]] || die "Отменено."; fi
+      bash -c "$("$CURL" -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version "$v" \
+        || die "Установка ядра $v не удалась."
+      if ! xray run -test -c "$XRAY_CFG" >/dev/null 2>&1; then
+        warn "Текущий конфиг не проходит проверку на $v. Возвращаю $prev."
+        [[ -n $prev ]] && bash -c "$("$CURL" -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version "$prev"
+        svc restart xray; die "Обновление отменено: $v несовместима с вашим конфигом."
+      fi
+      st_edit --arg v "$v" '.xray_version = $v'
+      svc restart xray; ok "✅ Ядро обновлено: $prev → $v" ;;
+    *) die "core: list | update [версия] [--yes]" ;;
+  esac
 }
 
 # Переносит установку autoXRAY 2 (один пользователь, config.json) в state.json:
@@ -1286,76 +1459,170 @@ cmd_init() {
 
 # ----------------------------------------------------------------- меню
 
-pause() { echo; read -rp "$(echo -e "${DIM}Enter — продолжить...${NC}")" _; }
-prompt() { local v; read -rp "$(echo -e " ${BOLD}${CYAN}›${NC} $1: ")" v; printf '%s' "$v"; }
-mi() { printf '  %b%s%b  %s' "$BOLD$CYAN" "$1" "$NC" "$2"; }   # пункт меню
+pause() { echo; read -rp "$(echo -e "${DIM}Enter, чтобы продолжить...${NC}")" _; }
+ask()   { local v; read -rp "$(echo -e " ${BOLD}${CYAN}›${NC} $1: ")" v; printf '%s' "$v"; }
+confirm() { local v; read -rp "$(echo -e " ${BOLD}${YEL}?${NC} $1 (y/N): ")" v; [[ $v =~ ^[YyДд]$ ]]; }
+
+# choose <заголовок> <пункт>... — выбор стрелками (↑ ↓, j k), цифрой или Enter; q / Esc — отмена.
+# Результат: CHOICE (индекс с нуля). Без терминала (пайп, тесты) работает как нумерованный список.
+# Пункты передавайте без цветовых кодов: выбранная строка подсвечивается инверсией.
+CHOICE=-1
+choose() {
+  local title=$1; shift
+  local items=("$@") n=$# cur=0 key rest i
+  CHOICE=-1
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    echo "$title"
+    for ((i = 0; i < n; i++)); do printf '  %d) %s\n' $((i + 1)) "${items[i]}"; done
+    read -r key
+    [[ $key =~ ^[0-9]+$ && $key -ge 1 && $key -le $n ]] || return 1
+    CHOICE=$((key - 1)); return 0
+  fi
+  draw() {
+    for ((i = 0; i < n; i++)); do
+      if [[ $i -eq $cur ]]; then printf '\033[2K\r  \033[7m %2d  %s \033[0m\n' $((i + 1)) "${items[i]}"
+      else printf '\033[2K\r  %b%2d%b  %s\n' "$DIM" $((i + 1)) "$NC" "${items[i]}"; fi
+    done
+  }
+  echo -e " ${BOLD}$title${NC}  ${DIM}↑↓ выбрать · Enter · цифра · q отмена${NC}"
+  printf '\033[?25l'
+  draw
+  while true; do
+    IFS= read -rsn1 key || { printf '\033[?25h'; return 1; }
+    case $key in
+      $'\033') IFS= read -rsn2 -t 0.05 rest
+               case $rest in '[A') ((cur > 0)) && cur=$((cur - 1)) || cur=$((n - 1)) ;;
+                             '[B') ((cur < n - 1)) && cur=$((cur + 1)) || cur=0 ;;
+                             '') printf '\033[?25h'; return 1 ;; esac ;;
+      k) ((cur > 0)) && cur=$((cur - 1)) || cur=$((n - 1)) ;;
+      j) ((cur < n - 1)) && cur=$((cur + 1)) || cur=0 ;;
+      q|Q) printf '\033[?25h'; return 1 ;;
+      [1-9]) if [[ $key -le $n ]]; then cur=$((key - 1)); [[ $n -le 9 ]] && break; fi ;;
+      '') break ;;
+    esac
+    printf '\033[%dA' "$n"; draw
+  done
+  printf '\033[?25h'
+  CHOICE=$cur
+}
+
+# pick_user — выбор пользователя; имя в PICKED
+PICKED=""
+pick_user() {
+  local labels=() names=() name status used limit expire ic
+  while IFS=$'\t' read -r name status used limit expire; do
+    case $status in active) ic="🟢" ;; disabled) ic="⚫" ;; expired) ic="⌛" ;; limit) ic="🚫" ;; *) ic="❔" ;; esac
+    names+=("$name")
+    if [[ $limit -gt 0 ]]; then labels+=("$ic $(pad "$name" 16) $(hbytes "$used") / $(hbytes "$limit")"); else labels+=("$ic $(pad "$name" 16) $(hbytes "$used")"); fi
+  done < <(user_summary)
+  [[ ${#names[@]} -gt 0 ]] || { warn "Пользователей нет."; return 1; }
+  choose "${1:-Выберите пользователя}" "${labels[@]}" || return 1
+  PICKED=${names[$CHOICE]}
+}
+
+user_menu_actions() { # имя
+  local name=$1 act lim days
+  while true; do
+    clear; cmd_user_list; echo
+    choose "Пользователь «$name»" "🔗 Ссылки и ключи" "📷 QR подписки" "📝 Лимит и срок" "🔌 Отключить / включить" "🔁 Новые ключи и ссылка" "❌ Удалить" "🔙 Назад" || return 0
+    act=$CHOICE
+    case $act in
+      0) show_user "$name"; pause ;;
+      1) cmd_user_qr "$name" sub; pause ;;
+      2) echo -e " ${DIM}Пустой ответ оставляет текущее значение. 0 снимает лимит или срок.${NC}"
+         lim=$(ask "Лимит трафика, ГБ"); days=$(ask "Срок, дней от сегодня")
+         [[ -n $lim ]] && (locked cmd_user_set "$name" --limit "$lim")
+         [[ -n $days ]] && (locked cmd_user_set "$name" --days "$days"); pause ;;
+      3) if [[ $(jq -r --arg n "$name" '.users[] | select(.name == $n) | .enabled' "$STATE") == true ]]
+         then (locked cmd_user_set "$name" --disable); else (locked cmd_user_set "$name" --enable); fi; pause ;;
+      4) confirm "Выпустить новые ключи? Старая ссылка перестанет работать" && (locked cmd_user_rotate "$name"); pause ;;
+      5) if confirm "Удалить «$name» без возможности восстановления"; then (locked cmd_user_del "$name"); pause; return 0; fi ;;
+      6) return 0 ;;
+    esac
+  done
+}
+
+menu_users() {
+  local name lim days args rs
+  while true; do
+    clear; cmd_user_list; echo
+    choose "Пользователи" "➕ Новый пользователь" "👤 Выбрать пользователя" "🔙 Назад" || return 0
+    case $CHOICE in
+      0) name=$(ask "Имя (латиница, цифры, _ -)"); [[ -n $name ]] || continue
+         lim=$(ask "Лимит трафика, ГБ (Enter: без лимита)"); days=$(ask "Срок, дней (Enter: бессрочно)")
+         rs=$(ask "Сбрасывать трафик раз в месяц? (y/N)")
+         args=(); [[ -n $lim ]] && args+=(--limit "$lim"); [[ -n $days ]] && args+=(--days "$days"); [[ $rs =~ ^[Yy]$ ]] && args+=(--reset monthly)
+         (locked cmd_user_add "$name" "${args[@]}"); pause ;;
+      1) pick_user && user_menu_actions "$PICKED" ;;
+      2) return 0 ;;
+    esac
+  done
+}
 
 menu_warp() {
+  local dom doms
   while true; do
     clear; cmd_warp status; echo
-    echo -e "$(mi 1 "🟢 Включить WARP")"
-    echo -e "$(mi 2 "🔴 Выключить WARP")"
-    echo -e "$(mi 3 "🇷🇺 Российские сайты ЧЕРЕЗ WARP")"
-    echo -e "$(mi 4 "🏠 Российские сайты напрямую")"
-    echo -e "$(mi 5 "➕ Добавить домен в WARP")"
-    echo -e "$(mi 6 "➖ Убрать домен из WARP")"
-    echo -e "$(mi 7 "🔎 Проверить работу")"
-    echo -e "$(mi 0 "🔙 Назад")"
-    case $(prompt "Выбор") in
-      1) (cmd_warp on); pause ;;
-      2) (cmd_warp off); pause ;;
-      3) (cmd_warp ru on); pause ;;
-      4) (cmd_warp ru off); pause ;;
-      5) (cmd_warp add "$(prompt "Домен")"); pause ;;
-      6) (cmd_warp del "$(prompt "Домен")"); pause ;;
-      7) (cmd_warp check); pause ;;
-      0|q|"") return ;;
+    choose "WARP" "🟢 Включить WARP" "🔴 Выключить WARP" "🇷🇺 Российские сайты ЧЕРЕЗ WARP" "🏠 Российские сайты напрямую" \
+      "➕ Добавить домен в WARP" "➖ Убрать домен из WARP" "🔎 Проверить работу" "🧪 Отладка (отчёт для разбора проблем)" "🔙 Назад" || return 0
+    case $CHOICE in
+      0) (cmd_warp on); pause ;;
+      1) (cmd_warp off); pause ;;
+      2) (cmd_warp ru on); pause ;;
+      3) (cmd_warp ru off); pause ;;
+      4) dom=$(ask "Домен, например chatgpt.com"); [[ -n $dom ]] && (cmd_warp add "$dom"); pause ;;
+      5) mapfile -t doms < <(jq -r '(.warp.domains // [])[]' "$STATE")
+         if [[ ${#doms[@]} -eq 0 ]]; then warn "Список доменов пуст."; else choose "Какой домен убрать" "${doms[@]}" && (cmd_warp del "${doms[$CHOICE]}"); fi; pause ;;
+      6) (cmd_warp check); pause ;;
+      7) (cmd_warp debug); pause ;;
+      8) return 0 ;;
     esac
   done
 }
 
 menu_update() {
-  clear; section "📦 Обновления"; echo
-  echo -e "$(mi 1 "📦 autoxray (скрипты и шаблоны) до последнего релиза")"
-  echo -e "$(mi 2 "🔧 Ядро Xray")"
-  echo -e "$(mi 3 "🗺 Гео-данные (geoip / geosite)")"
-  echo -e "$(mi 0 "🔙 Назад")"
-  case $(prompt "Выбор") in
-    1) (cmd_self_update); pause ;;
-    2) (cmd_update_core); pause ;;
-    3) (cmd_geo_update); pause ;;
-  esac
+  local latest newer
+  while true; do
+    clear; section "📦 Обновления"; echo
+    latest=$(latest_ax)
+    kv "🔐" "autoxray" "${BOLD}$AX_VERSION${NC} $(ver_gt "$latest" "$AX_VERSION" && echo -e "${GRN}→ доступна $latest${NC}" || echo -e "${DIM}последняя версия${NC}")"
+    kv "⚙️ " "Xray" "${BOLD}$(xray_version)${NC} ${DIM}(проверено с релизом: $XRAY_TESTED)${NC}"
+    echo
+    choose "Что обновить" "📦 autoxray (скрипты и шаблоны)" "⚙️  Ядро Xray: версии и обновление" "🗺 Гео-данные (geoip, geosite)" "🔙 Назад" || return 0
+    case $CHOICE in
+      0) (cmd_self_update); pause ;;
+      1) newer=$(core_newer)
+         clear; cmd_core list; echo
+         if [[ -n $newer ]]; then
+           local vers=(); mapfile -t vers <<<"$newer"
+           if choose "Установить версию (после подтверждения)" "${vers[@]}" "🔙 Не обновлять"; then
+             [[ $CHOICE -lt ${#vers[@]} ]] && (cmd_core update "${vers[$CHOICE]}")
+           fi
+         fi; pause ;;
+      2) (cmd_geo_update); pause ;;
+      3) return 0 ;;
+    esac
+  done
 }
 
 menu() {
   need_state
-  local name lim days args q
   while true; do
     clear
     cmd_status
     echo
-    printf '%s     %s\n' "$(mi 1 "👥 Пользователи      ")" "$(mi 6 "🌍 WARP")"
-    printf '%s     %s\n' "$(mi 2 "➕ Добавить          ")" "$(mi 7 "💾 Бэкап")"
-    printf '%s     %s\n' "$(mi 3 "❌ Удалить           ")" "$(mi 8 "🔄 Применить конфиг")"
-    printf '%s     %s\n' "$(mi 4 "🔗 Ссылки и QR       ")" "$(mi 9 "📦 Обновления")"
-    printf '%s     %s\n' "$(mi 5 "📊 Статистика        ")" "$(mi d "🩺 Диагностика")"
-    printf '%s\n' "$(mi 0 "🚪 Выход")"
-    echo
-    case $(prompt "Выбор") in
-      1) cmd_user_list; pause ;;
-      2) name=$(prompt "Имя"); lim=$(prompt "Лимит трафика, ГБ (Enter — без лимита)"); days=$(prompt "Срок, дней (Enter — бессрочно)")
-         args=(); [[ -n $lim ]] && args+=(--limit "$lim"); [[ -n $days ]] && args+=(--days "$days")
-         (locked cmd_user_add "$name" "${args[@]}"); pause ;;
-      3) cmd_user_list; name=$(prompt "Кого удалить"); (locked cmd_user_del "$name"); pause ;;
-      4) cmd_user_list; name=$(prompt "Пользователь")
-         (show_user "$name"; q=$(prompt "Показать QR подписки? (y/N)"); [[ $q =~ ^[Yy]$ ]] && cmd_user_qr "$name" sub); pause ;;
-      5) cmd_stats; pause ;;
-      6) [[ $(mode) == direct ]] && menu_warp || { warn "WARP недоступен в режиме моста."; pause; } ;;
-      7) (cmd_backup); pause ;;
-      8) (cmd_render); pause ;;
-      9) menu_update ;;
-      d|D) (cmd_doctor); pause ;;
-      0|q|"") exit 0 ;;
+    choose "Главное меню" "👥 Пользователи" "📊 Статистика" "🌍 WARP" "🩺 Диагностика" "💾 Бэкап" "🔄 Применить конфиг заново" \
+      "📦 Обновления" "🔥 Файрвол" "🚪 Выход" || exit 0
+    case $CHOICE in
+      0) menu_users ;;
+      1) cmd_stats; pause ;;
+      2) if [[ $(mode) == direct ]]; then menu_warp; else warn "WARP недоступен в режиме моста."; pause; fi ;;
+      3) (cmd_doctor); pause ;;
+      4) (cmd_backup); pause ;;
+      5) (cmd_render); pause ;;
+      6) menu_update ;;
+      7) (cmd_firewall); pause ;;
+      8) exit 0 ;;
     esac
   done
 }
@@ -1375,14 +1642,15 @@ usage() {
   echo -e "  ${C}autoxray user del${N} <имя>        ${C}user rotate${N} <имя>  ${D}новые ключи и ссылка${N}"
   echo -e "  ${C}autoxray user link${N} <имя> ${D}[--plain]${N}  ${C}user qr${N} <имя> ${D}[sub|xhttp|vision|hy2]${N}"
   echo -e "${H}Сеть${N}"
-  echo -e "  ${C}autoxray warp${N} register|on|off|status|check|add|del"
+  echo -e "  ${C}autoxray warp${N} register|on|off|status|check|add|del  ${C}warp debug${N} ${D}[--quick]${N} ${D}разбор проблем${N}"
   echo -e "  ${C}autoxray warp ru${N} on|off        ${D}российские сайты через WARP${N}"
   echo -e "  ${C}autoxray node${N} add <vless://…>|del <имя|id>|list   ${D}(режим моста)${N}"
   echo -e "  ${C}autoxray fingerprint${N} <браузер> ${C}telegram${N} set <ссылка>|off|update|remove"
   echo -e "  ${C}autoxray firewall${N} [--dry-run]  ${D}🔥 настроить ufw (SSH, 80, 443)${N}"
   echo -e "${H}Обслуживание${N}"
   echo -e "  ${C}autoxray backup${N} [файл]  ${C}restore${N} <файл>  ${C}render${N}  ${D}пересобрать конфиги${N}"
-  echo -e "  ${C}autoxray self-update${N} [vX.Y.Z]  ${C}update-core${N} [версия]  ${C}geo-update${N}"
+  echo -e "  ${C}autoxray self-update${N} [vX.Y.Z]  ${C}geo-update${N}"
+  echo -e "  ${C}autoxray core${N} list|update [версия]  ${D}ядро Xray: что установлено и что новее${N}"
   echo -e "  ${C}autoxray migrate${N} [имя]         ${D}перенос с autoXRAY 2${N}"
   echo -e "  ${C}autoxray uninstall${N}             ${D}удалить всё (с подтверждением)${N}"
   echo -e "  ${C}autoxray version${N}  ${C}collect${N} ${D}(cron: учёт трафика)${N}"
@@ -1401,7 +1669,8 @@ main() {
     telegram)     cmd_telegram "$@" ;;
     backup)       cmd_backup "$@" ;;
     restore)      cmd_restore "$@" ;;
-    update-core)  cmd_update_core "$@" ;;
+    update-core)  cmd_core update "$@" ;;
+    core)         cmd_core "$@" ;;
     render)       cmd_render ;;
     init)         cmd_init "$@" ;;
     migrate)      cmd_migrate "$@" ;;

@@ -90,7 +90,11 @@ if [[ "$*" == *"-X POST"* ]]; then echo '{"result":{"id":"dev-1","token":"tok","
 else echo '{"result":{"config":{"client_id":"AbCd","peers":[{"public_key":"bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="}],"interface":{"addresses":{"v4":"172.16.0.2","v6":"2606:4700:110:8a36::2"}}}}}'; fi
 FC
 chmod +x /tmp/fakecurl
-AX_CURL=/tmp/fakecurl autoxray warp ru on && pass "warp ru on" || fail "warp ru on"
+# без --force WARP обязан отказаться включаться, если профиль не отвечает (здесь профиль «ненастоящий»)
+AX_CURL=/tmp/fakecurl AX_WARP_CANDIDATES="162.159.192.1:2408" autoxray warp ru on >/tmp/warp-on.out 2>&1 && fail "warp ru on включился без рабочего WARP" || pass "warp ru on отказывается включаться без рабочего WARP"
+[ "$(jq -r '.warp.enabled' /etc/autoxray/state.json)" = false ] && pass "RU через WARP не включён после отказа" || fail "WARP включён несмотря на отказ"
+check "warp debug --quick отрабатывает и сообщает о проблеме" bash -c 'AX_WARP_CANDIDATES="162.159.192.1:2408" autoxray warp debug --quick; [ $? -eq 1 ]'
+autoxray warp ru on --force && pass "warp ru on --force" || fail "warp ru on --force"
 check "xray -test с wireguard-outbound и RU-правилами" xray run -test -c /usr/local/etc/xray/config.json
 jq -e '.outbounds[] | select(.tag=="warp" and .protocol=="wireguard")' /usr/local/etc/xray/config.json >/dev/null && pass "outbound warp в конфиге" || fail "нет outbound warp"
 TOKEN_A=$(jq -r '.users[] | select(.name=="alice").token' /etc/autoxray/state.json)
@@ -100,6 +104,20 @@ client_start /tmp/client-w.json && via_proxy ok.txt >/dev/null && pass "траф
 client_stop
 autoxray warp ru off >/dev/null && check "warp ru off + xray -test" xray run -test -c /usr/local/etc/xray/config.json
 autoxray warp off >/dev/null && check "warp off + xray -test" xray run -test -c /usr/local/etc/xray/config.json
+
+step "Версии: баннер обновления и список версий ядра (поддельный GitHub API)"
+mkdir -p /tmp/api/repos/cergo666/autoXRAY/releases /tmp/api/repos/XTLS/Xray-core
+echo '{"tag_name":"v99.0.0"}' > /tmp/api/repos/cergo666/autoXRAY/releases/latest
+echo '[{"tag_name":"v99.1.0","prerelease":false,"draft":false},{"tag_name":"v100.0.0","prerelease":true,"draft":false},{"tag_name":"v26.9.9","prerelease":false,"draft":false}]' > /tmp/api/repos/XTLS/Xray-core/releases
+rm -f /etc/autoxray/.latest
+AX_API=file:///tmp/api autoxray status 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'Доступна версия 99.0.0' && pass "баннер: доступна новая версия autoxray" || fail "баннера обновления нет"
+AX_API=file:///tmp/api autoxray core list 2>&1 | sed 's/\x1b\[[0-9;]*m//g' > /tmp/core.out
+grep -q 'v99.1.0' /tmp/core.out && ! grep -q 'v100.0.0' /tmp/core.out && pass "core list: новее текущей, без предрелизов" || { fail "core list"; cat /tmp/core.out; }
+grep -q 'лучше не обновлять без необходимости' /tmp/core.out && pass "предупреждение об обновлении ядра" || fail "нет предупреждения"
+printf 'no\n' | autoxray core update v26.9.9 >/tmp/core-up.out 2>&1; grep -q 'Отменено' /tmp/core-up.out && pass "core update без подтверждения отменяется" || { fail "core update не спросил"; cat /tmp/core-up.out; }
+step "Выбор пользователя без терминала (нумерованный список)"
+out=$(bash -c 'source <(sed -n "/^choose()/,/^}/p; /^CHOICE=/p" /opt/autoxray/autoxray); choose "T" "a" "b" "c" <<<2; echo "rc=$? CHOICE=$CHOICE"')
+echo "$out" | grep -q 'rc=0 CHOICE=1' && pass "choose: пункт 2 -> индекс 1" || fail "choose: $out"
 
 step "Диагностика, гео-данные, файрвол (dry-run), интерфейс"
 autoxray doctor > /tmp/doctor.out 2>&1 && pass "doctor: критичных проблем нет" || { fail "doctor нашёл проблемы"; sed "s/\x1b\[[0-9;]*m//g" /tmp/doctor.out; }

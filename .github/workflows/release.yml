@@ -18,7 +18,7 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME#v}"
           [ "$tag" = "$(tr -d '[:space:]' < VERSION)" ] || { echo "тег $tag != VERSION"; exit 1; }
-          tests/check-version.sh
+          tests/check-version.sh && tests/check-functions.sh
 
       - name: Тесты
         run: |

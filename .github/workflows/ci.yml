@@ -15,7 +15,7 @@ jobs:
       - name: bash -n
         run: for f in autoxray install.sh templates/gen_page.sh components/telegram/*.sh; do bash -n "$f"; done
       - name: согласованность версий
-        run: tests/check-version.sh
+        run: tests/check-version.sh && tests/check-functions.sh
 
   e2e:
     runs-on: ubuntu-latest
