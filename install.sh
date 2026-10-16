@@ -17,7 +17,7 @@ BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
 
-AX_RELEASE="3.4.0"
+AX_RELEASE="3.5.0"
 AX_REF_DEFAULT="main"   # при выпуске релиза заменяется на тег (см. .github/workflows/release.yml)
 AX_REF="${AUTOXRAY_REF:-$AX_REF_DEFAULT}"
 RAW="https://raw.githubusercontent.com/cergo666/autoXRAY/$AX_REF"
@@ -147,6 +147,26 @@ if [ "$INIT_MODE" = direct ]; then
     case $AX_WARP in y|Y) WARP_MODE=on ;; ru|RU) WARP_MODE=ru ;; esac
 fi
 
+WARP_DEPTH=quick
+WARP_NIGHTLY=on
+if [ "$WARP_MODE" != off ]; then
+    if [ -z "$AX_WARP_SCAN" ]; then
+        echo -e "\n${BOLD}${YEL}Поиск самого быстрого адреса WARP${NC}"
+        echo "  У Cloudflare тысячи адресов WARP, от выбранного зависит задержка. Скорость меряется через туннель на российских сайтах (yandex.ru, vk.ru, rutube.ru)."
+        echo -e "  ${CYAN}1${NC}  быстро: по одному адресу из каждого диапазона, около 15 адресов, несколько секунд"
+        echo -e "  ${CYAN}2${NC}  подробно: по 20 адресов из диапазона, около 280, 1-3 минуты"
+        echo -e "  ${CYAN}3${NC}  все адреса диапазонов, около 3500, может занять десятки минут"
+    fi
+    ask AX_WARP_SCAN "Ваш выбор [1]:" 1
+    case $AX_WARP_SCAN in 2|more) WARP_DEPTH="more" ;; 3|all) WARP_DEPTH="all" ;; esac
+    if [ -z "$AX_WARP_NIGHT" ]; then
+        echo -e "\n  Каждую ночь можно перепроверять 15 лучших адресов. Если все медленнее 300 мс, пересканируется весь выбранный набор,"
+        echo "  и запомнится новый лучший адрес (Xray при этом перезапускается, только если адрес заметно лучше текущего)."
+    fi
+    ask AX_WARP_NIGHT "Включить ночную проверку? (Y/n) [Y]:" Y
+    [[ "$AX_WARP_NIGHT" =~ ^[Nn]$ ]] && WARP_NIGHTLY=off
+fi
+
 # ==========================================
 # Ядро: BBR, лимиты
 # ==========================================
@@ -178,7 +198,7 @@ echo -e "${YEL}Устанавливаем autoxray...${NC}"
 fetch autoxray > /usr/local/bin/autoxray || die "Не удалось получить autoxray"
 chmod 755 /usr/local/bin/autoxray
 mkdir -p /usr/local/share/autoxray
-for t in sub.html nginx.conf; do
+for t in sub.html nginx.conf report.html; do
     fetch "templates/$t" > "/usr/local/share/autoxray/$t" || die "Не удалось получить templates/$t"
 done
 mkdir -p /usr/local/share/autoxray/telegram
@@ -331,6 +351,10 @@ fi
 # ==========================================
 # WARP, конфиг Xray, подписки, учёт трафика
 # ==========================================
+if [ "$WARP_MODE" != off ]; then
+    autoxray warp depth "$WARP_DEPTH"
+    autoxray warp nightly "$WARP_NIGHTLY"
+fi
 case $WARP_MODE in
     on) autoxray warp on || echo -e "${YEL}WARP не подключён — повторите позже: autoxray warp on${NC}" ;;
     ru) autoxray warp ru on || echo -e "${YEL}WARP не подключён — повторите позже: autoxray warp ru on${NC}" ;;

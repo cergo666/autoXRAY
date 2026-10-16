@@ -9,7 +9,7 @@ set -uo pipefail
 # bash >= 5.2: '&' в замене ${var//a/b} — спецсимвол; ссылки содержат '&'
 shopt -u patsub_replacement 2>/dev/null || true
 
-AX_VERSION="3.4.0"
+AX_VERSION="3.5.0"
 AX_REPO="cergo666/autoXRAY"
 XRAY_TESTED="v26.9.9"          # версия ядра, с которой этот релиз проверен тестами
 API="${AX_API:-https://api.github.com}"
@@ -273,7 +273,7 @@ JQ
 
 # Общее для серверных конфигов: лог доступа нужен только при лимитах IP; блокировка лишних IP по правилу user + source
 SERVER_COMMON=$(cat <<'JQ'
-def has_ip_limit($S): ([$S.users[] | select(.enabled and ((.ip_limit // 0) > 0))] | length) > 0;
+def has_ip_limit($S): ([$S.users[] | select(.enabled and (((.ip_limit // 0) > 0) or (.report == true)))] | length) > 0;
 def ban_rules: ([$b[0][] | select(.until > $now)] | group_by(.user) | map({user: [.[0].user], source: (map(.ip) | unique), outboundTag: "block"}));
 JQ
 )
@@ -662,6 +662,17 @@ render_nginx() {
   fb=$FALLBACK_STATIC
   [[ $(st '.telegram.enabled // false') == true ]] && fb=$FALLBACK_PROXY
   out=$(<"$tpl")
+  local rb=""
+  if [[ -n $(report_users) && -n $(st '.reports.token // empty') ]]; then
+    rb="    # отчёты о посещениях (секретный адрес; включаются у пользователей: autoxray user set <имя> --report on)
+    location ^~ /r/$(st .reports.token)/ {
+        alias $REPORT_WEB/;
+        index index.html;
+        add_header Cache-Control \"no-store\" always;
+        add_header X-Robots-Tag \"noindex\" always;
+    }"
+  fi
+  out=${out//'{{REPORTS}}'/$rb}
   out=${out//'{{FALLBACK}}'/$fb}
   out=${out//'{{NGX_MAP}}'/$NGX_MAP}
   out=${out//'{{DOMAIN}}'/$(st .domain)}
@@ -689,7 +700,7 @@ apply_or_die() { render_all || die "Изменения сохранены в sta
 # ------------------------------------------------------------ пользователи
 
 user_summary() {
-  jq_state -r "$JQ_DEFS"'.users[] | [.name, status(.), (used(.)|tostring), (.limit|tostring), (.expire|tostring), ((.ip_limit // 0)|tostring), (.ru // "direct")] | @tsv'
+  jq_state -r "$JQ_DEFS"'.users[] | [.name, status(.), (used(.)|tostring), (.limit|tostring), (.expire|tostring), ((.ip_limit // 0)|tostring), (.ru // "direct"), ((.report // false)|tostring)] | @tsv'
 }
 
 cmd_user_list() {
@@ -699,7 +710,7 @@ cmd_user_list() {
   printf '%b   %s %s %s %s %s %s %s%b\n' "$DIM" "$(pad ИМЯ 14)" "$(pad СТАТУС 12)" "$(pad РАСХОД 15)" "$(pad ТРАФИК 17)" "$(pad RU 7)" "$(pad IP 6)" ДЕЙСТВУЕТ "$NC"
   local name status used limit expire ipl ru icon col col2 label txt left exp rul ipt wru
   wru=$([[ $(st '.warp.enabled // false') == true && $(st '.warp.ru // false') == true ]] && echo 1 || echo 0)
-  while IFS=$'\t' read -r name status used limit expire ipl ru; do
+  while IFS=$'\t' read -r name status used limit expire ipl ru _rp; do
     case $status in
       active)   icon="🟢"; col=$GRN;  label="активен" ;;
       disabled) icon="⚫"; col=$DIM;  label="отключён" ;;
@@ -720,7 +731,7 @@ cmd_user_list() {
 
 cmd_user_add() {
   need_root; need_state
-  local name=${1:-} limit=0 expire=0 reset=never ru=direct ips=0
+  local name=${1:-} limit=0 expire=0 reset=never ru=direct ips=0 rpt=false
   valid_name "$name" || die "Имя: 1-24 символа, только A-Z a-z 0-9 _ -"
   shift
   [[ -z $(user_get "$name") ]] || die "Пользователь '$name' уже существует."
@@ -731,14 +742,17 @@ cmd_user_add() {
       --reset) [[ ${2:-} =~ ^(monthly|never)$ ]] || die "--reset monthly|never"; reset=$2; shift 2 ;;
       --ru)    [[ ${2:-} =~ ^(direct|server)$ ]] || die "--ru direct|server"; ru=$2; shift 2 ;;
       --ips)   [[ ${2:-} =~ ^[0-9]+$ ]] || die "--ips <число IP> (0 без лимита)"; ips=$2; shift 2 ;;
+      --report) [[ ${2:-} =~ ^(on|off)$ ]] || die "--report on|off"; [[ $2 == on ]] && rpt=true || rpt=false; shift 2 ;;
       *) die "Неизвестный параметр: $1" ;;
     esac
   done
-  st_edit --arg n "$name" --arg ru "$ru" --argjson ips "$ips" --arg id "$(user_uuid "$(mode)")" --arg h "$(rand 'a-f0-9' 16)" --arg t "$(rand 'A-Za-z0-9' 24)" \
+  [[ $rpt == true ]] && report_ensure_token
+  st_edit --arg n "$name" --arg ru "$ru" --argjson ips "$ips" --argjson rpt "$rpt" --arg id "$(user_uuid "$(mode)")" --arg h "$(rand 'a-f0-9' 16)" --arg t "$(rand 'A-Za-z0-9' 24)" \
           --argjson l "$limit" --argjson e "$expire" --argjson c "$(now)" --arg rs "$reset" --argjson nr "$([[ $reset == monthly ]] && next_month || echo 0)" \
-    '.users += [{name: $n, uuid: $id, hy2: $h, token: $t, created: $c, expire: $e, limit: $l, enabled: true, reset: $rs, next_reset: $nr, ru: $ru, ip_limit: $ips}]'
+    '.users += [{name: $n, uuid: $id, hy2: $h, token: $t, created: $c, expire: $e, limit: $l, enabled: true, reset: $rs, next_reset: $nr, ru: $ru, ip_limit: $ips, report: $rpt}]'
   apply_or_die
   ok "✅ Пользователь '$name' создан."
+  if [[ $rpt == true ]]; then report_build "$name"; report_build_index; echo -e " 📈 ${DIM}Отчёт:${NC} ${CYAN}$(report_url "$name")${NC}"; fi
   show_user "$name"
 }
 
@@ -747,6 +761,7 @@ cmd_user_del() {
   local name=${1:-}; user_must "$name" >/dev/null
   [[ $(jq '.users | length' "$STATE") -gt 1 ]] || warn "Это последний пользователь — доступ к серверу будет закрыт."
   st_edit --arg n "$name" '.users |= map(select(.name != $n))'
+  report_remove "$name" purge
   jq --arg n "$name" 'del(.[$n])' "$TRAFFIC" >"$TRAFFIC.tmp" && mv "$TRAFFIC.tmp" "$TRAFFIC"
   apply_or_die
   ok "✅ Пользователь '$name' удалён (ключи и ссылки подписки больше не работают)."
@@ -754,8 +769,8 @@ cmd_user_del() {
 
 cmd_user_set() {
   need_root; need_state
-  local name=${1:-}; user_must "$name" >/dev/null; shift
-  (($#)) || die "Укажите параметры: --limit ГБ | --days N | --ips N | --ru direct|server | --reset monthly|never | --enable | --disable | --reset-traffic"
+  local name=${1:-} report_after=""; user_must "$name" >/dev/null; shift
+  (($#)) || die "Укажите параметры: --report on|off | --limit ГБ | --days N | --ips N | --ru direct|server | --reset monthly|never | --enable | --disable | --reset-traffic"
   while (($#)); do
     case $1 in
       --limit)  [[ $# -ge 2 ]] && is_num "$2" || die "--limit <ГБ> (0 — без лимита)"
@@ -769,6 +784,13 @@ cmd_user_set() {
                 [[ $2 -gt 0 ]] || { jq --arg n "$name" 'del(.[$n])' "$IPS" >"$IPS.tmp" 2>/dev/null && mv "$IPS.tmp" "$IPS"; }; shift 2 ;;
       --ru)     [[ ${2:-} =~ ^(direct|server)$ ]] || die "--ru direct|server"
                 st_edit --arg n "$name" --arg v "$2" '(.users[] | select(.name == $n) | .ru) = $v'; shift 2 ;;
+      --report) [[ ${2:-} =~ ^(on|off)$ ]] || die "--report on|off"
+                if [[ $2 == on ]]; then
+                  report_ensure_token
+                  warn "Будут записываться сайты и IP-адреса, на которые заходит '$name'. Предупредите пользователя."
+                  st_edit --arg n "$name" '(.users[] | select(.name == $n) | .report) = true'; report_after=on
+                else st_edit --arg n "$name" '(.users[] | select(.name == $n) | .report) = false'; report_remove "$name"; report_after=off; fi
+                shift 2 ;;
       --enable)  st_edit --arg n "$name" '(.users[] | select(.name == $n) | .enabled) = true'; shift ;;
       --disable) st_edit --arg n "$name" '(.users[] | select(.name == $n) | .enabled) = false'; shift ;;
       --reset-traffic) jq --arg n "$name" 'del(.[$n])' "$TRAFFIC" >"$TRAFFIC.tmp" && mv "$TRAFFIC.tmp" "$TRAFFIC"; shift ;;
@@ -776,6 +798,8 @@ cmd_user_set() {
     esac
   done
   apply_or_die
+  if [[ $report_after == on ]]; then report_build "$name"; report_build_index; echo -e " 📈 ${DIM}Отчёт:${NC} ${CYAN}$(report_url "$name")${NC}"
+  elif [[ $report_after == off ]]; then report_build_index; echo -e " 📈 ${DIM}Отчёт выключен, страница удалена. Накопленные данные хранятся до истечения срока, удалить сразу: autoxray report purge $name${NC}"; fi
   ok "✅ Параметры '$name' обновлены."
 }
 
@@ -856,7 +880,7 @@ ips_count() { jq -r --arg n "$1" --argjson now "$(now)" '((.[$n] // {}) | [to_en
 # Логи Xray не должны расти и храниться: при отсутствии лимитов IP они очищаются, иначе ограничиваются по размеру.
 trim_logs() {
   local f max=${AX_LOG_MAX:-20971520} limited=0
-  jq -e 'any(.users[]; .enabled and ((.ip_limit // 0) > 0))' "$STATE" >/dev/null 2>&1 && limited=1
+  jq -e 'any(.users[]; .enabled and (((.ip_limit // 0) > 0) or (.report == true)))' "$STATE" >/dev/null 2>&1 && limited=1
   for f in "$ACCESS_LOG" "$(dirname "$ACCESS_LOG")/error.log"; do
     [[ -f $f ]] || continue
     if [[ $limited == 0 ]] || [[ $(stat -c %s "$f") -gt $max ]]; then : >"$f"; fi
@@ -878,30 +902,37 @@ ipwatch_parse() {
 cmd_ipwatch() {
   need_state
   trim_logs
-  jq -e '[.users[] | select(.enabled and ((.ip_limit // 0) > 0))] | length > 0' "$STATE" >/dev/null || return 0
+  local ipl=0 rep=0
+  jq -e '[.users[] | select(.enabled and ((.ip_limit // 0) > 0))] | length > 0' "$STATE" >/dev/null && ipl=1
+  [[ -n $(report_users) ]] && rep=1
+  [[ $ipl == 1 || $rep == 1 ]] || return 0
   [[ -f $ACCESS_LOG ]] || return 0
   local tmp seen new old_act new_act t
   t=$(now)
   tmp=$(mktemp); cp "$ACCESS_LOG" "$tmp"; : >"$ACCESS_LOG"
-  seen=$(ipwatch_parse <"$tmp" | jq -Rn '[inputs | split(" ") | select(length == 2)]'); rm -f "$tmp"
-  [[ -f $IPS ]] || echo '{}' >"$IPS"; [[ -f $BANS ]] || echo '[]' >"$BANS"
-  new=$(jq -n --argjson seen "$seen" --slurpfile st "$STATE" --slurpfile ips "$IPS" --slurpfile bans "$BANS" --argjson now "$t" '
-    ($st[0].users | map(select(.enabled and ((.ip_limit // 0) > 0)) | {key: .name, value: .ip_limit}) | from_entries) as $lim
-    | ($ips[0] // {} | with_entries(select($lim[.key] != null) | .value |= with_entries(select(.value.last >= ($now - 600))))) as $known
-    | reduce ($seen[] | select($lim[.[0]] != null)) as [$u, $ip]
-        ({ips: $known, bans: ($bans[0] // [] | map(select(.until > $now)))};
-         if .ips[$u][$ip] != null then .ips[$u][$ip].last = $now
-         elif ([.bans[] | select(.user == $u and .ip == $ip)] | length) > 0 then .
-         elif ((.ips[$u] // {}) | length) < $lim[$u] then .ips[$u][$ip] = {first: $now, last: $now}
-         else .bans += [{user: $u, ip: $ip, until: ($now + 1800)}] end)')
-  old_act=$(jq -c --argjson now "$t" '[.[] | select(.until > $now) | {user, ip}] | sort' "$BANS")
-  new_act=$(jq -c '[.bans[] | {user, ip}] | sort' <<<"$new")
-  jq '.ips' <<<"$new" >"$IPS.tmp" && mv "$IPS.tmp" "$IPS"
-  if [[ $old_act != "$new_act" ]]; then
-    jq '.bans' <<<"$new" >"$BANS.tmp" && mv "$BANS.tmp" "$BANS"
-    jq -r --argjson old "$old_act" '.bans[] | select(. as $b | ($old | index({user: $b.user, ip: $b.ip})) == null) | "🚫 \(.user): лишний IP \(.ip) заблокирован"' <<<"$new"
-    apply_xray
+  [[ $rep == 1 ]] && report_ingest "$tmp"
+  if [[ $ipl == 1 ]]; then
+    seen=$(ipwatch_parse <"$tmp" | jq -Rn '[inputs | split(" ") | select(length == 2)]')
+    [[ -f $IPS ]] || echo '{}' >"$IPS"; [[ -f $BANS ]] || echo '[]' >"$BANS"
+    new=$(jq -n --argjson seen "$seen" --slurpfile st "$STATE" --slurpfile ips "$IPS" --slurpfile bans "$BANS" --argjson now "$t" '
+      ($st[0].users | map(select(.enabled and ((.ip_limit // 0) > 0)) | {key: .name, value: .ip_limit}) | from_entries) as $lim
+      | ($ips[0] // {} | with_entries(select($lim[.key] != null) | .value |= with_entries(select(.value.last >= ($now - 600))))) as $known
+      | reduce ($seen[] | select($lim[.[0]] != null)) as [$u, $ip]
+          ({ips: $known, bans: ($bans[0] // [] | map(select(.until > $now)))};
+           if .ips[$u][$ip] != null then .ips[$u][$ip].last = $now
+           elif ([.bans[] | select(.user == $u and .ip == $ip)] | length) > 0 then .
+           elif ((.ips[$u] // {}) | length) < $lim[$u] then .ips[$u][$ip] = {first: $now, last: $now}
+           else .bans += [{user: $u, ip: $ip, until: ($now + 1800)}] end)')
+    old_act=$(jq -c --argjson now "$t" '[.[] | select(.until > $now) | {user, ip}] | sort' "$BANS")
+    new_act=$(jq -c '[.bans[] | {user, ip}] | sort' <<<"$new")
+    jq '.ips' <<<"$new" >"$IPS.tmp" && mv "$IPS.tmp" "$IPS"
+    if [[ $old_act != "$new_act" ]]; then
+      jq '.bans' <<<"$new" >"$BANS.tmp" && mv "$BANS.tmp" "$BANS"
+      jq -r --argjson old "$old_act" '.bans[] | select(. as $b | ($old | index({user: $b.user, ip: $b.ip})) == null) | "🚫 \(.user): лишний IP \(.ip) заблокирован"' <<<"$new"
+      apply_xray
+    fi
   fi
+  rm -f "$tmp"
 }
 
 cmd_ips() {
@@ -942,10 +973,159 @@ cmd_setup_cron() {
 */5 * * * * root /usr/local/bin/autoxray collect >/dev/null 2>&1
 # лимит IP: разбор лога доступа (работает, только если у кого-то задан лимит)
 * * * * * root /usr/local/bin/autoxray ipwatch >/dev/null 2>&1
+# ночная проверка endpoint'ов WARP (если включена: autoxray warp nightly on)
+23 4 * * * root /usr/local/bin/autoxray warp rescan >/dev/null 2>&1
 # обновление гео-данных (маршрутизация), по понедельникам
 17 4 * * 1 root /usr/local/bin/autoxray geo-update --quiet >/dev/null 2>&1
 EOF
   chmod 644 /etc/cron.d/autoxray
+}
+
+# ------------------------------------------------------- отчёты о посещениях
+
+REPORT_DATA="$AX_ETC/reports"                                  # суточные агрегаты по пользователям (закрыто, 700)
+REPORT_WEB="${AX_REPORT_WEB:-/var/lib/autoxray/reports}"       # готовый html, отдаётся nginx по секретному адресу
+
+report_users() { jq -r '.users[] | select(.enabled and (.report == true)) | .name' "$STATE"; }
+
+# Из access.log: «email дата час src хост порт выход число первое_время последнее_время».
+# Хосты и адреса чистятся от всего, кроме допустимых символов: имя назначения задаёт клиент, в отчёт оно попадать должно безопасным.
+report_parse() {
+  awk '/ accepted / && / email: / {
+    date = $1; time = $2; hour = substr(time, 1, 2); src = ""; dest = ""
+    for (i = 1; i <= NF; i++) { if ($i == "from") src = $(i + 1); if ($i == "accepted") dest = $(i + 1) }
+    email = $NF; if (src == "" || dest == "" || email == "") next
+    sub(/^(tcp|udp):/, "", src); sub(/:[0-9]+$/, "", src); gsub(/[^A-Za-z0-9.:_-]/, "", src)
+    sub(/^(tcp|udp):/, "", dest); port = dest; sub(/^.*:/, "", port); host = dest; sub(/:[0-9]+$/, "", host)
+    host = tolower(host); gsub(/[^a-z0-9.:_-]/, "", host); gsub(/[^0-9]/, "", port)
+    if (host == "" || src == "") next
+    out = "direct"
+    if (match($0, /\[[^\]]+\]/)) { br = substr($0, RSTART + 1, RLENGTH - 2); n = split(br, a, " "); out = a[n]; gsub(/[^a-z0-9_-]/, "", out) }
+    key = email "\t" date "\t" hour "\t" src "\t" host "\t" port "\t" out
+    cnt[key]++; if (!(key in t0) || time < t0[key]) t0[key] = time; if (time > t1[key]) t1[key] = time
+  } END { for (k in cnt) print k "\t" cnt[k] "\t" t0[k] "\t" t1[k] }'
+}
+
+REPORT_MERGE_JQ='
+  [inputs | split("\t")] as $rows
+  | $old[0]
+  | (.date //= ($rows[0][1] | gsub("/"; "-"))) | (.hours //= [range(24) | 0])
+  | reduce $rows[] as $r (.;
+      ($r[7] | tonumber) as $c | $r[3] as $src | $r[4] as $host
+      | .total += $c | .hours[($r[2] | tonumber)] += $c
+      | (if $r[6] == "block" then .blocked += $c else . end)
+      | .hosts[$host] += $c | .ports[$r[5]] += $c | .out[$r[6]] += $c
+      | .src[$src].n += $c
+      | .src[$src].first = ([(.src[$src].first // $r[8]), $r[8]] | min)
+      | .src[$src].last = ([(.src[$src].last // $r[9]), $r[9]] | max)
+      | .src[$src].hosts[$host] += $c)
+  | (if (.hosts | length) > 4000 then .hosts |= (to_entries | sort_by(-.value) | .[:3000] | from_entries) else . end)
+  | .src |= with_entries(.value.hosts |= (if length > 300 then (to_entries | sort_by(-.value) | .[:200] | from_entries) else . end))'
+
+# report_ingest <файл журнала> — добавляет разобранные записи в суточные файлы пользователей с включённым отчётом
+report_ingest() {
+  local rows u d f
+  rows=$(report_parse <"$1"); [[ -n $rows ]] || return 0
+  while read -r u; do
+    [[ -n $u ]] || continue
+    mkdir -p "$REPORT_DATA/$u"; chmod 700 "$REPORT_DATA" "$REPORT_DATA/$u"
+    while read -r d; do
+      [[ -n $d ]] || continue
+      f="$REPORT_DATA/$u/${d//\//-}.json"; [[ -f $f ]] || echo '{}' >"$f"
+      awk -F'\t' -v u="$u" -v d="$d" '$1 == u && $2 == d' <<<"$rows" | jq -Rn --slurpfile old "$f" "$REPORT_MERGE_JQ" >"$f.tmp" && mv "$f.tmp" "$f"
+    done < <(awk -F'\t' -v u="$u" '$1 == u {print $2}' <<<"$rows" | sort -u)
+  done < <(report_users)
+}
+
+report_keep_days() { st '.reports.keep_days // 30'; }
+
+report_prune() {
+  local cutoff f d; cutoff=$(date -d "-$(report_keep_days) days" +%F)
+  for f in "$REPORT_DATA"/*/*.json; do
+    [[ -e $f ]] || continue
+    d=$(basename "$f" .json); [[ $d < $cutoff ]] && rm -f "$f"
+  done
+  return 0
+}
+
+# Удаляет папку отчёта пользователя (html и, если purge, накопленные данные)
+report_remove() { # имя [purge]
+  local u=${1:?}
+  rm -rf "${REPORT_WEB:?}/${u:?}"
+  [[ ${2:-} == purge ]] && rm -rf "${REPORT_DATA:?}/${u:?}"
+  return 0
+}
+
+# report_build <имя> — собирает html пользователя из суточных файлов
+report_build() {
+  local u=$1 tpl="$TPL_DIR/report.html" dir="$REPORT_WEB/$1" data out files keep
+  [[ -f $tpl ]] || { warn "Нет шаблона $tpl, отчёт не собран."; return 1; }
+  keep=$(report_keep_days); mkdir -p "$dir"
+  mapfile -t files < <(ls "$REPORT_DATA/$u"/*.json 2>/dev/null | sort | tail -n "$keep")
+  if [[ ${#files[@]} -gt 0 ]]; then
+    data=$(cat "${files[@]}" | jq -s 'map(.hosts |= (to_entries | sort_by(-.value) | .[:150] | from_entries)
+        | .src |= with_entries(.value.hosts |= (to_entries | sort_by(-.value) | .[:25] | from_entries)))')
+  else data='[]'; fi
+  data=${data//<\//<\\/}
+  out=$(<"$tpl")
+  out=${out//'{{USER}}'/$u}
+  out=${out//'{{DOMAIN}}'/$(st .domain)}
+  out=${out//'{{GENERATED}}'/$(date '+%F %H:%M')}
+  out=${out//'{{DATA}}'/$data}
+  printf '%s\n' "$out" >"$dir/index.html"
+  chmod 755 "$REPORT_WEB" "$dir"; chmod 644 "$dir/index.html"
+}
+
+report_build_index() {
+  local u items=""
+  mkdir -p "$REPORT_WEB"
+  while read -r u; do [[ -n $u ]] && items+="<li><a href=\"$u/\">$u</a></li>"; done < <(report_users)
+  printf '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="robots" content="noindex"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Отчёты</title><style>body{font:16px system-ui;max-width:520px;margin:40px auto;padding:0 16px}a{color:#0a84d6}li{margin:8px 0}</style></head><body><h1>Отчёты</h1><ul>%s</ul></body></html>\n' "$items" >"$REPORT_WEB/index.html"
+  chmod 755 "$REPORT_WEB"; chmod 644 "$REPORT_WEB/index.html"
+}
+
+report_build_all() {
+  local u d
+  while read -r u; do [[ -n $u ]] && report_build "$u"; done < <(report_users)
+  report_build_index
+  # папки пользователей с выключенным отчётом не отдаются
+  for d in "$REPORT_WEB"/*/; do
+    [[ -d $d ]] || continue
+    u=$(basename "$d"); report_users | grep -qx "$u" || report_remove "$u"
+  done
+  return 0
+}
+
+report_ensure_token() {
+  [[ -n $(st '.reports.token // empty') ]] && return 0
+  st_edit --arg t "$(rand 'A-Za-z0-9' 32)" '.reports = ((.reports // {}) + {token: $t, keep_days: (.reports.keep_days // 30)})'
+}
+
+report_url() { echo "https://$(st .domain)/r/$(st '.reports.token // empty')/${1:+$1/}"; }
+
+cmd_report() {
+  need_state
+  local sub=${1:-list} u on any=0; shift || true
+  case $sub in
+    list)
+      section "📈 Отчёты о посещениях"
+      while IFS=$'\t' read -r u on; do
+        any=1
+        if [[ $on == true ]]; then echo -e " 🟢 $(pad "$u" 14) ${CYAN}$(report_url "$u")${NC}"
+        else echo -e " ⚫ $(pad "$u" 14) ${DIM}выключен${NC}"; fi
+      done < <(jq -r '.users[] | [.name, ((.report // false) | tostring)] | @tsv' "$STATE")
+      [[ $any == 1 ]] || echo -e " ${DIM}Пользователей нет.${NC}"
+      echo -e "\n ${DIM}Включить: autoxray user set <имя> --report on. Хранение: $(report_keep_days) дн. (autoxray report keep <дней>)${NC}" ;;
+    build) need_root
+      if [[ -n ${1:-} ]]; then user_must "$1" >/dev/null; report_build "$1"; report_build_index; else report_build_all; fi
+      ok "✅ Отчёт собран." ;;
+    url) user_must "${1:-}" >/dev/null; report_url "$1" ;;
+    purge) need_root; u=${1:-}; user_must "$u" >/dev/null
+      report_remove "$u" purge; ok "✅ Все данные отчёта '$u' удалены." ;;
+    keep) need_root; [[ ${1:-} =~ ^[0-9]+$ && $1 -ge 1 ]] || die "report keep <дней>"
+      st_edit --argjson d "$1" '.reports.keep_days = $d'; report_prune; ok "✅ Отчёты хранятся $1 дн." ;;
+    *) die "report: list | build [имя] | url <имя> | purge <имя> | keep <дней>" ;;
+  esac
 }
 
 # Раз в 5 минут из cron: забирает счётчики Xray (с обнулением), накапливает в traffic.json,
@@ -972,6 +1152,8 @@ cmd_collect() {
   done < <(jq -r --argjson now "$(now)" '.users[] | select((.reset // "never") == "monthly" and (.next_reset // 0) <= $now) | .name' "$STATE")
   latest_ax force >/dev/null
   trim_logs
+  if [[ -n $(report_users) ]]; then report_build_all; fi
+  report_prune
   after=$(active_names)
   if [[ $before != "$after" ]]; then apply_xray; fi
   render_subs
@@ -1112,42 +1294,76 @@ warp_probe() {
   grep -qE '^warp=(on|plus)' <<<"$WARP_PROBE_OUT"
 }
 
-# warp_probe_to <endpoint> <порт> <файл> — до трёх запросов trace через туннель (для параллельного сканирования).
-# При успехе пишет в файл «мс<TAB>endpoint<TAB>узел<TAB>страна<TAB>удачных из 3», иначе файл остаётся пустым.
-warp_probe_to() {
-  local ep=$1 port=$2 out=$3 cfg pid i n ok=0 best="" t body colo="" loc=""
-  cfg=$(mktemp --suffix=.json); body=$(mktemp)
-  warp_probe_cfg "$ep" "$port" | sed 's/"loglevel": "debug"/"loglevel": "none"/' >"$cfg"
-  xray run -c "$cfg" >/dev/null 2>&1 9>&- &
-  pid=$!
-  for i in $(seq 1 15); do ss -ltn 2>/dev/null | grep -q "127.0.0.1:$port " && break; sleep 0.2; done
-  for n in 1 2 3; do
-    t=$("$CURL" -fsS --max-time 6 -o "$body" -w '%{time_total}' --socks5-hostname "127.0.0.1:$port" https://one.one.one.one/cdn-cgi/trace 2>/dev/null) \
-      && grep -qE '^warp=(on|plus)' "$body" || { [[ $n -eq 1 ]] && break; continue; }
-    ok=$((ok + 1)); t=$(awk -v t="$t" 'BEGIN {printf "%d", t * 1000}')
-    if [[ -z $best || $t -lt $best ]]; then best=$t; colo=$(sed -n 's/^colo=//p' "$body"); loc=$(sed -n 's/^loc=//p' "$body"); fi
+# Диапазоны адресов WARP (список и идея сканирования: vernette/warpscout, MIT)
+WARP_POOLS=(8.6.112 8.34.70 8.34.146 8.35.211 8.39.125 8.39.204 8.39.214 8.47.69 162.159.192 162.159.195 188.114.96 188.114.97 188.114.98 188.114.99)
+WARP_PROBE_HOSTS_DEFAULT="yandex.ru vk.ru rutube.ru"   # через туннель меряется отклик популярных российских сайтов
+WARP_BATCH=40                                            # endpoint'ов на один тестовый Xray
+WARP_PORT_BASE=10900
+
+warp_probe_hosts() { local h; h=$(st '(.warp.probe_hosts // []) | join(" ")'); echo "${h:-$WARP_PROBE_HOSTS_DEFAULT}"; }
+
+# warp_probe_port <endpoint> <порт socks> <файл> — проверка одного endpoint'а через уже запущенный тестовый Xray:
+# сначала trace Cloudflare (проверка WARP, узел, страна), затем отклик каждого сайта из warp_probe_hosts.
+# Пишет строку «оценка<TAB>endpoint<TAB>узел<TAB>страна<TAB>ответили<TAB>всего<TAB>trace мс<TAB>мс по сайтам»;
+# оценка = средний отклик сайтов; если ни один сайт не ответил, 10000 + trace (такой endpoint всегда ниже остальных).
+warp_probe_port() {
+  local ep=$1 port=$2 out=$3 body t trace_ms colo loc h r code tt n=0 ok=0 sum=0 ms_list="" score
+  body=$(mktemp)
+  t=$("$CURL" -fsS --max-time 6 -o "$body" -w '%{time_total}' --socks5-hostname "127.0.0.1:$port" https://one.one.one.one/cdn-cgi/trace 2>/dev/null) \
+    && grep -qE '^warp=(on|plus)' "$body" || { rm -f "$body"; return 0; }
+  trace_ms=$(awk -v t="$t" 'BEGIN {printf "%d", t * 1000}'); colo=$(sed -n 's/^colo=//p' "$body"); loc=$(sed -n 's/^loc=//p' "$body"); rm -f "$body"
+  for h in $(warp_probe_hosts); do
+    n=$((n + 1))
+    r=$("$CURL" -sS -o /dev/null --max-time 6 -w '%{http_code} %{time_total}' --socks5-hostname "127.0.0.1:$port" "https://$h/" 2>/dev/null)
+    code=${r%% *}; tt=${r##* }
+    if [[ -n $code && $code != 000 ]]; then
+      ok=$((ok + 1)); tt=$(awk -v t="$tt" 'BEGIN {printf "%d", t * 1000}'); sum=$((sum + tt)); ms_list+="${ms_list:+,}$tt"
+    else ms_list+="${ms_list:+,}-"; fi
   done
-  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -f "$cfg" "$body"
-  [[ $ok -gt 0 ]] && printf '%s\t%s\t%s\t%s\t%s\n' "$best" "$ep" "${colo:-?}" "${loc:-?}" "$ok" >"$out"
-  return 0
+  if [[ $ok -gt 0 ]]; then score=$((sum / ok)); else score=$((10000 + trace_ms)); fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$score" "$ep" "${colo:-?}" "${loc:-?}" "$ok" "$n" "$trace_ms" "$ms_list" >"$out"
 }
 
-# Диапазоны адресов WARP, по одному случайному адресу из каждого (список и идея сканирования: vernette/warpscout, MIT)
-WARP_POOLS=(8.6.112 8.34.70 8.34.146 8.35.211 8.39.125 8.39.204 8.39.214 8.47.69 162.159.192 162.159.195 188.114.96 188.114.97 188.114.98 188.114.99)
+# warp_probe_batch <каталог> <префикс> — endpoint'ы из stdin (до WARP_BATCH штук). Один тестовый Xray на всю пачку:
+# у каждого endpoint свой локальный socks-порт и свой outbound, поэтому пачка проверяется параллельно.
+warp_probe_batch() {
+  local dir=$1 prefix=$2 eps=() i n cfg pid k pids=()
+  mapfile -t eps; n=${#eps[@]}; [[ $n -gt 0 ]] || return 0
+  cfg=$(mktemp --suffix=.json)
+  printf '%s\n' "${eps[@]}" | jq -Rn --slurpfile s "$STATE" --argjson base "$WARP_PORT_BASE" '
+    [inputs] as $eps | $s[0].warp as $W | {
+      log: {loglevel: "none"},
+      inbounds: [range(0; $eps | length) as $i | {tag: "in-\($i)", listen: "127.0.0.1", port: ($base + $i), protocol: "socks", settings: {udp: false}}],
+      outbounds: [range(0; $eps | length) as $i | {tag: "w-\($i)", protocol: "wireguard", settings: {
+        secretKey: $W.secretKey, address: $W.address,
+        peers: [{publicKey: $W.peerPublicKey, allowedIPs: ["0.0.0.0/0", "::/0"], endpoint: $eps[$i]}],
+        mtu: 1280, reserved: $W.reserved, noKernelTun: true, domainStrategy: "ForceIP"}}],
+      routing: {rules: [range(0; $eps | length) as $i | {inboundTag: ["in-\($i)"], outboundTag: "w-\($i)"}]}}' >"$cfg"
+  xray run -c "$cfg" >/dev/null 2>&1 9>&- 8>&- &
+  pid=$!
+  for k in $(seq 1 25); do ss -ltn 2>/dev/null | grep -q "127.0.0.1:$((WARP_PORT_BASE + n - 1)) " && break; sleep 0.2; done
+  for ((i = 0; i < n; i++)); do
+    warp_probe_port "${eps[i]}" $((WARP_PORT_BASE + i)) "$dir/row.$prefix.$i" 9>&- 8>&- &
+    pids+=($!)
+    if (( ${#pids[@]} >= 24 )); then wait "${pids[@]}"; pids=(); fi
+  done
+  [[ ${#pids[@]} -gt 0 ]] && wait "${pids[@]}"
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -f "$cfg"
+}
 
-warp_scan_candidates() { # quick | full | ports
-  local phase=${1:-quick} p i per=1 port
+# Кандидаты: quick (по одному адресу из каждого диапазона), more (по 20), all (все адреса диапазонов), ports (запасные порты)
+warp_scan_candidates() {
+  local phase=${1:-quick} p port
   if [[ -n ${AX_WARP_CANDIDATES:-} ]]; then [[ $phase == ports ]] || tr ' ' '\n' <<<"$AX_WARP_CANDIDATES"; return 0; fi
   case $phase in
-    quick|full)
-      [[ $phase == full ]] && per=3
-      { st '.warp.endpoint // empty'
-        for p in "${WARP_POOLS[@]}"; do for ((i = 0; i < per; i++)); do echo "$p.$((RANDOM % 254 + 1)):2408"; done; done; } | awk 'NF && !seen[$0]++' ;;
+    quick) { st '.warp.endpoint // empty'; for p in "${WARP_POOLS[@]}"; do echo "$p.$((RANDOM % 254 + 1)):2408"; done; } | awk 'NF && !seen[$0]++' ;;
+    more)  { st '.warp.endpoint // empty'; for p in "${WARP_POOLS[@]}"; do shuf -i 1-254 -n 20 | sed "s|^|$p.|; s|\$|:2408|"; done; } | awk 'NF && !seen[$0]++' ;;
+    all)   { st '.warp.endpoint // empty'; for p in "${WARP_POOLS[@]}"; do seq 1 254 | sed "s|^|$p.|; s|\$|:2408|"; done; } | awk 'NF && !seen[$0]++' ;;
     ports) for port in 500 1701 4500; do for p in 162.159.192 188.114.97 188.114.99; do echo "$p.1:$port"; done; done ;;
   esac
 }
 
-# warp_rank <только узлы> <кроме узлов> — читает TSV из stdin, лучшие (самые быстрые) сверху
+# warp_rank <только узлы> <кроме узлов> — читает TSV из stdin, лучшие (с наименьшей оценкой) сверху
 warp_rank() {
   awk -F'\t' -v inc="${1:-}" -v exc="${2:-}" 'BEGIN { n = split(inc, I, ","); m = split(exc, E, ",") }
     { keep = (inc == "") ? 1 : 0
@@ -1156,53 +1372,103 @@ warp_rank() {
       if (keep) print }' | sort -t$'\t' -k1,1n
 }
 
-# warp_scan [--full] [--colo A,B] [--exclude-colo C,D] — параллельно проверяет endpoint'ы, результат в WARP_SCAN_RESULT
+# warp_scan [--depth quick|more|all] [--list "a:1 b:2"] [--colo A,B] [--exclude-colo C,D]
+# Результат в WARP_SCAN_RESULT (TSV, лучшие сверху). Глубина по умолчанию берётся из настроек (warp.depth).
 WARP_SCAN_RESULT=""
 warp_scan() {
-  local full=0 inc="" exc="" dir ep phase k=0 jobs=8 cands=() phases
-  while (($#)); do case $1 in --full) full=1 ;; --colo) inc=${2:-}; shift ;; --exclude-colo) exc=${2:-}; shift ;; esac; shift; done
+  local depth="" inc="" exc="" list="" dir phases phase cands=() i total nb b
+  while (($#)); do case $1 in --depth) depth=${2:-}; shift ;; --full) depth="more" ;; --list) list=${2:-}; shift ;; --colo) inc=${2:-}; shift ;; --exclude-colo) exc=${2:-}; shift ;; esac; shift; done
+  [[ $depth =~ ^(quick|more|all)$ ]] || depth=$(st '.warp.depth // "quick"')
+  if [[ -n ${AX_WARP_FAKE_RESULTS:-} ]]; then   # подмена результатов для тестов
+    WARP_SCAN_RESULT=$(warp_rank "$inc" "$exc" <"$AX_WARP_FAKE_RESULTS"); [[ -n $WARP_SCAN_RESULT ]]; return
+  fi
   command -v xray >/dev/null 2>&1 || { warn "xray не найден"; return 2; }
+  exec 8>"$AX_ETC/.scan.lock"; flock -n 8 || { warn "Сканирование уже идёт."; return 3; }
   dir=$(mktemp -d); : >"$dir/all"; WARP_SCAN_RESULT=""
-  phases="quick ports"; [[ $full == 1 ]] && phases="full ports"
+  if [[ -n $list ]]; then phases="list"; else phases="$depth ports"; fi
   for phase in $phases; do
-    [[ $phase == ports && -s $dir/all ]] && continue    # запасные порты нужны, только если основной ничего не нашёл
-    mapfile -t cands < <(warp_scan_candidates "$phase")
+    [[ $phase == ports && -s $dir/all ]] && continue     # запасные порты нужны, только если основной ничего не нашёл
+    if [[ $phase == list ]]; then mapfile -t cands < <(tr ' ' '\n' <<<"$list" | awk 'NF && !seen[$0]++')
+    else mapfile -t cands < <(warp_scan_candidates "$phase"); fi
     [[ ${#cands[@]} -gt 0 ]] || continue
-    echo -e " 🔎 ${DIM}Проверяю ${#cands[@]} endpoint'ов ($phase)...${NC}"
-    for ep in "${cands[@]}"; do
-      warp_probe_to "$ep" $((10900 + k)) "$dir/r.$phase.$k" &
-      k=$((k + 1)); (( k % jobs == 0 )) && wait
+    total=${#cands[@]}; nb=$(( (total + WARP_BATCH - 1) / WARP_BATCH )); b=0
+    echo -e " 🔎 ${DIM}Проверяю $total endpoint'ов ($phase), тест: $(warp_probe_hosts)${NC}"
+    for ((i = 0; i < total; i += WARP_BATCH)); do
+      b=$((b + 1))
+      printf '%s\n' "${cands[@]:i:WARP_BATCH}" | warp_probe_batch "$dir" "$phase.$b"
+      [[ $nb -gt 1 ]] && printf '\r    пачка %d из %d, рабочих пока: %d   ' "$b" "$nb" "$(cat "$dir"/row.* 2>/dev/null | wc -l)"
     done
-    wait
-    cat "$dir"/r."$phase".* >>"$dir/all" 2>/dev/null
+    [[ $nb -gt 1 ]] && echo
+    cat "$dir"/row."$phase".* >>"$dir/all" 2>/dev/null
   done
+  exec 8>&-
   WARP_SCAN_RESULT=$(warp_rank "$inc" "$exc" <"$dir/all"); rm -rf "$dir"
   [[ -n $WARP_SCAN_RESULT ]]
 }
 
 warp_scan_table() {
-  local i=0 ms ep colo loc ok col
-  printf '%b   %s %s %s %s %s%b\n' "$DIM" "$(pad "#" 3)" "$(pad ЗАДЕРЖКА 10)" "$(pad ENDPOINT 24)" "$(pad УЗЕЛ 6)" "СТРАНА, ПОТЕРИ" "$NC"
-  while IFS=$'\t' read -r ms ep colo loc ok; do
+  local i=0 sc ep colo loc ok n _trc ms hosts h col m label arr
+  read -ra hosts <<<"$(warp_probe_hosts)"
+  printf '%b   %s %s %s %s' "$DIM" "$(pad "#" 3)" "$(pad СРЕДНЯЯ 10)" "$(pad ENDPOINT 22)" "$(pad УЗЕЛ 5)"
+  for h in "${hosts[@]}"; do printf '%s ' "$(pad "${h%%.*}" 8)"; done
+  printf '%s%b\n' СТРАНА "$NC"
+  while IFS=$'\t' read -r sc ep colo loc ok n _trc ms; do
     i=$((i + 1)); [[ $i -gt 10 ]] && break
-    col=$GRN; [[ $ms -gt 250 ]] && col=$YEL; [[ $ms -gt 600 ]] && col=$RED
-    printf ' %s %b%s%b %s %b%s%b %s%%\n' "$(pad "$i" 3)" "$col" "$(pad "$ms мс" 10)" "$NC" "$(pad "$ep" 24)" "$BOLD" "$(pad "$colo" 6)" "$NC" "$loc, $(( (3 - ok) * 100 / 3 ))"
+    if (( sc >= 10000 )); then label="RU ✘"; col=$RED
+    else label="$sc мс"; col=$GRN; (( sc > 250 )) && col=$YEL; (( sc > 600 )) && col=$RED; fi
+    printf ' %s %b%s%b %s %b%s%b ' "$(pad "$i" 3)" "$col" "$(pad "$label" 10)" "$NC" "$(pad "$ep" 22)" "$BOLD" "$(pad "$colo" 5)" "$NC"
+    IFS=, read -ra arr <<<"$ms"
+    for m in "${arr[@]}"; do [[ $m == - ]] && printf '%b%s%b ' "$RED" "$(pad ✘ 8)" "$NC" || printf '%s ' "$(pad "$m мс" 8)"; done
+    printf '%s\n' "$loc"
   done <<<"$WARP_SCAN_RESULT"
 }
 
-# Запоминает лучший (первый) endpoint из WARP_SCAN_RESULT
+# Топ-15 найденных endpoint'ов сохраняется для ночной проверки
+warp_save_top() {
+  local top
+  top=$(head -n 15 <<<"$WARP_SCAN_RESULT" | jq -Rn --argjson now "$(now)" '[inputs | split("\t") | {ep: .[1], ms: (.[0] | tonumber), colo: .[2], loc: .[3], ru_ok: (.[4] | tonumber), ru_n: (.[5] | tonumber), at: $now}]')
+  st_edit --argjson top "$top" '.warp.top = $top'
+}
+
+# Запоминает лучший (первый) endpoint из WARP_SCAN_RESULT и топ-15
 warp_apply_best() {
   local best ms colo
   best=$(head -n1 <<<"$WARP_SCAN_RESULT" | cut -f2); ms=$(head -n1 <<<"$WARP_SCAN_RESULT" | cut -f1); colo=$(head -n1 <<<"$WARP_SCAN_RESULT" | cut -f3)
+  warp_save_top
   st_edit --arg ep "$best" --arg c "$colo" --argjson ms "$ms" '.warp.endpoint = $ep | .warp.colo = $c | .warp.rtt = $ms'
-  echo -e " ⚡ ${BOLD}Выбран:${NC} ${GRN}$best${NC} ${DIM}(узел $colo, $ms мс)${NC}"
+  echo -e " ⚡ ${BOLD}Выбран:${NC} ${GRN}$best${NC} ${DIM}(узел $colo, среднее $ms мс)${NC}"
 }
 
-# Быстрое сканирование и выбор самого быстрого рабочего endpoint. Код 1: ни один не ответил.
+# Сканирование и выбор самого быстрого рабочего endpoint. Код 1: ни один не ответил.
 warp_pick_endpoint() {
   warp_scan || return 1
   warp_scan_table
   warp_apply_best
+}
+
+warp_log() { { tail -n 99 "$AX_ETC/warp-rescan.log" 2>/dev/null; echo "$(date '+%F %T') $*"; } >"$AX_ETC/warp-rescan.log.tmp" && mv "$AX_ETC/warp-rescan.log.tmp" "$AX_ETC/warp-rescan.log"; }
+warp_rescan_commit() { if [[ $1 == change ]]; then warp_apply_best >/dev/null; apply_or_die; else warp_save_top; fi; }
+
+# Ночная проверка (cron): сначала проверяются сохранённые 15 лучших endpoint'ов. Если лучший из них медленнее порога
+# (по умолчанию 300 мс) или все недоступны, пересканируется весь набор нужной глубины и запоминается новый топ.
+# Endpoint меняется, только если он заметно лучше текущего (минус 10%), чтобы зря не перезапускать Xray.
+warp_rescan() { # [now]
+  local force=${1:-} thr cur tops mode=top best bsc cur_sc act=keep
+  [[ $(st '.warp.registered // false') == true && $(st '.warp.enabled // false') == true ]] || { [[ $force == now ]] && warn "WARP не включён."; return 0; }
+  [[ $force == now || $(st '.warp.nightly // false') == true ]] || return 0
+  thr=$(st '.warp.threshold_ms // 300'); cur=$(st '.warp.endpoint // empty')
+  tops=$(jq -r '(.warp.top // [])[].ep' "$STATE" | tr '\n' ' ')
+  if [[ -z $tops ]] || ! warp_scan --list "$tops" || [[ $(head -n1 <<<"$WARP_SCAN_RESULT" | cut -f1) -gt $thr ]]; then
+    mode=full
+    warp_scan || { warp_log "режим full: ни один endpoint не ответил, остаётся $cur"; return 1; }
+  fi
+  best=$(head -n1 <<<"$WARP_SCAN_RESULT" | cut -f2); bsc=$(head -n1 <<<"$WARP_SCAN_RESULT" | cut -f1)
+  cur_sc=$(awk -F'\t' -v c="$cur" '$2 == c {print $1; exit}' <<<"$WARP_SCAN_RESULT")
+  if [[ $best != "$cur" ]] && { [[ -z $cur_sc ]] || [[ $cur_sc -gt $(( bsc * 11 / 10 + 5 )) ]]; }; then act=change; fi
+  locked warp_rescan_commit "$act"
+  warp_log "режим $mode: лучший $best ($bsc мс), ${act/change/endpoint заменён (был $cur)}"
+  [[ $force == now ]] && ok "✅ Готово: лучший $best ($bsc мс), $([[ $act == change ]] && echo заменён || echo "текущий оставлен")"
+  return 0
 }
 
 warp_enable_checked() { # [--force]; печатает причину и возвращает 1, если WARP не отвечает
@@ -1266,6 +1532,14 @@ cmd_warp() {
          st_edit '.warp.enabled = true'; locked apply_or_die && ok "✅ WARP включён." ;;
     debug) warp_debug "$@" ;;
     candidates) warp_scan_candidates "${1:-quick}" ;;
+    depth) need_root; [[ ${1:-} =~ ^(quick|more|all)$ ]] || die "warp depth quick|more|all"; st_edit --arg d "$1" '.warp.depth = $d'; ok "✅ Глубина сканирования: $1" ;;
+    nightly) need_root
+         case ${1:-} in on) st_edit '.warp.nightly = true'; ok "✅ Ночная проверка endpoint'ов включена" ;;
+                        off) st_edit '.warp.nightly = false'; ok "✅ Ночная проверка выключена" ;; *) die "warp nightly on|off" ;; esac ;;
+    threshold) need_root; [[ ${1:-} =~ ^[0-9]+$ ]] || die "warp threshold <мс>"; st_edit --argjson t "$1" '.warp.threshold_ms = $t'; ok "✅ Порог: $1 мс" ;;
+    hosts) need_root; [[ -n ${1:-} ]] || die "warp hosts <сайт> [сайт...] (по умолчанию: $WARP_PROBE_HOSTS_DEFAULT)"
+         st_edit --argjson h "$(printf '%s\n' "$@" | jq -Rn '[inputs]')" '.warp.probe_hosts = $h'; ok "✅ Сайты для замера: $*" ;;
+    rescan) need_root; local rarg=""; [[ ${1:-} == now ]] && rarg=now; warp_rescan "$rarg" ;;
     scan) need_root
          local apply=0 sargs=()
          while (($#)); do case $1 in --apply) apply=1 ;; *) sargs+=("$1") ;; esac; shift; done
@@ -1304,6 +1578,7 @@ cmd_warp() {
          kv "🆔" "Профиль" "$(tick "$(st '.warp.registered // false')") зарегистрирован"
          kv "🔌" "Состояние" "$(tick "$(st '.warp.enabled // false')") включён"
          kv "🇷🇺" "RU на сервере" "$(tick "$(st '.warp.ru // false')") российские сайты, дошедшие до сервера, идут через WARP"
+         kv "🌙" "Ночная проверка" "$(tick "$(st '.warp.nightly // false')") порог $(st '.warp.threshold_ms // 300') мс, глубина $(st '.warp.depth // "quick"') ${DIM}$(tail -n1 "$AX_ETC/warp-rescan.log" 2>/dev/null)${NC}"
          kv "📍" "Endpoint" "$(st '.warp.endpoint // "не задан"') ${DIM}$([[ -n $(st '.warp.colo // empty') ]] && echo "(узел $(st .warp.colo), $(st .warp.rtt) мс)")${NC}"
          local n; n=$(jq '(.warp.domains // []) | length' "$STATE")
          if [[ $n -gt 0 ]]; then
@@ -1510,14 +1785,14 @@ cmd_self_update() {
   [[ ${tag#v} == "$AX_VERSION" ]] && { ok "Уже установлена версия $AX_VERSION."; return 0; }
   raw="https://raw.githubusercontent.com/$AX_REPO/$tag"
   tmp=$(mktemp -d)
-  for f in autoxray templates/sub.html templates/nginx.conf components/telegram/install.sh components/telegram/update.sh components/telegram/uninstall.sh; do
+  for f in autoxray templates/sub.html templates/nginx.conf templates/report.html components/telegram/install.sh components/telegram/update.sh components/telegram/uninstall.sh; do
     mkdir -p "$tmp/$(dirname "$f")"
     "$CURL" -fsSL --max-time 30 "$raw/$f" -o "$tmp/$f" || { rm -rf "$tmp"; die "Не удалось скачать $f ($tag)"; }
   done
   bash -n "$tmp/autoxray" || { rm -rf "$tmp"; die "Скачанный autoxray не прошёл проверку синтаксиса."; }
   install -m 755 "$tmp/autoxray" /usr/local/bin/autoxray
   mkdir -p "$TPL_DIR/telegram"
-  install -m 644 "$tmp/templates/sub.html" "$tmp/templates/nginx.conf" "$TPL_DIR/"
+  install -m 644 "$tmp/templates/sub.html" "$tmp/templates/nginx.conf" "$tmp/templates/report.html" "$TPL_DIR/"
   install -m 755 "$tmp"/components/telegram/*.sh "$TPL_DIR/telegram/"
   rm -rf "$tmp"
   ok "✅ autoxray $AX_VERSION → ${tag#v}. Заметки: https://github.com/$AX_REPO/releases/tag/$tag"
@@ -1759,8 +2034,8 @@ choose() {
 # pick_user — выбор пользователя; имя в PICKED
 PICKED=""
 pick_user() {
-  local labels=() names=() name status used limit expire _ipl _ru ic
-  while IFS=$'\t' read -r name status used limit expire _ipl _ru; do
+  local labels=() names=() name status used limit expire _ipl _ru _rp ic
+  while IFS=$'\t' read -r name status used limit expire _ipl _ru _rp; do
     case $status in active) ic="🟢" ;; disabled) ic="⚫" ;; expired) ic="⌛" ;; limit) ic="🚫" ;; *) ic="❔" ;; esac
     names+=("$name")
     if [[ $limit -gt 0 ]]; then labels+=("$ic $(pad "$name" 16) $(hbytes "$used") / $(hbytes "$limit")"); else labels+=("$ic $(pad "$name" 16) $(hbytes "$used")"); fi
@@ -1775,7 +2050,7 @@ user_menu_actions() { # имя
   while true; do
     clear; cmd_user_list; echo
     choose "Пользователь «$name»" "🔗 Ссылки и ключи" "📷 QR подписки" "📝 Лимит трафика и срок" "📱 Лимит устройств (IP)" \
-      "🇷🇺 Российские сайты: куда идут" "🔌 Отключить / включить" "🔁 Новые ключи и ссылка" "❌ Удалить" "🔙 Назад" || return 0
+      "🇷🇺 Российские сайты: куда идут" "📈 Отчёт о посещениях: вкл / выкл" "🔌 Отключить / включить" "🔁 Новые ключи и ссылка" "❌ Удалить" "🔙 Назад" || return 0
     act=$CHOICE
     case $act in
       0) show_user "$name"; pause ;;
@@ -1793,11 +2068,17 @@ user_menu_actions() { # имя
            case $CHOICE in 0) (locked cmd_user_set "$name" --ru direct) ;; 1) (locked cmd_user_set "$name" --ru server) ;; esac
            echo -e " ${DIM}Подписку в приложении клиента нужно обновить.${NC}"
          fi; pause ;;
-      5) if [[ $(jq -r --arg n "$name" '.users[] | select(.name == $n) | .enabled' "$STATE") == true ]]
+      5) if [[ $(jq -r --arg n "$name" '.users[] | select(.name == $n) | (.report // false)' "$STATE") == true ]]; then
+           confirm "Выключить отчёт о посещениях «$name» и удалить страницу" && (locked cmd_user_set "$name" --report off)
+         else
+           echo -e " ${DIM}Будут записываться сайты и IP-адреса, на которые заходит пользователь. Предупредите его об этом.${NC}"
+           confirm "Включить отчёт о посещениях «$name»" && (locked cmd_user_set "$name" --report on)
+         fi; pause ;;
+      6) if [[ $(jq -r --arg n "$name" '.users[] | select(.name == $n) | .enabled' "$STATE") == true ]]
          then (locked cmd_user_set "$name" --disable); else (locked cmd_user_set "$name" --enable); fi; pause ;;
-      6) confirm "Выпустить новые ключи? Старая ссылка перестанет работать" && (locked cmd_user_rotate "$name"); pause ;;
-      7) if confirm "Удалить «$name» без возможности восстановления"; then (locked cmd_user_del "$name"); pause; return 0; fi ;;
-      8) return 0 ;;
+      7) confirm "Выпустить новые ключи? Старая ссылка перестанет работать" && (locked cmd_user_rotate "$name"); pause ;;
+      8) if confirm "Удалить «$name» без возможности восстановления"; then (locked cmd_user_del "$name"); pause; return 0; fi ;;
+      9) return 0 ;;
     esac
   done
 }
@@ -1819,12 +2100,28 @@ menu_users() {
   done
 }
 
+menu_warp_scan() {
+  local v
+  while true; do
+    clear; cmd_warp status; echo
+    choose "Сканирование endpoint'ов" "🌙 Ночная проверка: включить" "🌙 Ночная проверка: выключить" "🔎 Глубина: быстро (по адресу из каждого диапазона, ~15)" \
+      "🔎 Глубина: подробно (по 20 из диапазона, ~280)" "🔎 Глубина: все адреса (~3500, десятки минут)" "⏱ Порог задержки для пересканирования" "▶️  Проверить сейчас (как ночью)" "🔙 Назад" || return 0
+    case $CHOICE in
+      0) (cmd_warp nightly on); pause ;; 1) (cmd_warp nightly off); pause ;;
+      2) (cmd_warp depth quick); pause ;; 3) (cmd_warp depth more); pause ;; 4) (cmd_warp depth all); pause ;;
+      5) v=$(ask "Порог, мс (сейчас $(st '.warp.threshold_ms // 300'))"); [[ -n $v ]] && (cmd_warp threshold "$v"); pause ;;
+      6) (cmd_warp rescan now); pause ;;
+      7) return 0 ;;
+    esac
+  done
+}
+
 menu_warp() {
   local dom doms
   while true; do
     clear; cmd_warp status; echo
     choose "WARP" "🟢 Включить WARP" "🔴 Выключить WARP" "🇷🇺 Российские сайты ЧЕРЕЗ WARP" "🏠 Российские сайты напрямую" \
-      "➕ Добавить домен в WARP" "➖ Убрать домен из WARP" "🔎 Проверить работу" "⚡ Найти самый быстрый endpoint" "🧪 Отладка (отчёт для разбора проблем)" "🔙 Назад" || return 0
+      "➕ Добавить домен в WARP" "➖ Убрать домен из WARP" "🔎 Проверить работу" "⚡ Найти самый быстрый endpoint" "🌙 Ночная проверка и глубина сканирования" "🧪 Отладка (отчёт для разбора проблем)" "🔙 Назад" || return 0
     case $CHOICE in
       0) (cmd_warp on); pause ;;
       1) (cmd_warp off); pause ;;
@@ -1835,8 +2132,9 @@ menu_warp() {
          if [[ ${#doms[@]} -eq 0 ]]; then warn "Список доменов пуст."; else choose "Какой домен убрать" "${doms[@]}" && (cmd_warp del "${doms[$CHOICE]}"); fi; pause ;;
       6) (cmd_warp check); pause ;;
       7) (cmd_warp scan --apply); pause ;;
-      8) (cmd_warp debug); pause ;;
-      9) return 0 ;;
+      8) menu_warp_scan ;;
+      9) (cmd_warp debug); pause ;;
+      10) return 0 ;;
     esac
   done
 }
@@ -1902,11 +2200,13 @@ usage() {
   echo -e "  ${C}autoxray user add${N} <имя> ${D}[--limit ГБ] [--days N] [--ips N] [--ru direct|server] [--reset monthly]${N}"
   echo -e "  ${C}autoxray user set${N} <имя> ${D}[--limit ГБ] [--days N] [--ips N] [--ru direct|server] [--reset monthly|never] [--enable|--disable] [--reset-traffic]${N}"
   echo -e "  ${C}autoxray ips${N} ${D}[имя]${N}  ${C}unban${N} <имя|--all>   ${D}лимит устройств (IP) и блокировки${N}"
+  echo -e "  ${C}autoxray report${N} list|build [имя]|url <имя>|purge <имя>|keep <дней>   ${D}html-отчёты о посещениях (user set --report on)${N}"
   echo -e "  ${C}autoxray user del${N} <имя>        ${C}user rotate${N} <имя>  ${D}новые ключи и ссылка${N}"
   echo -e "  ${C}autoxray user link${N} <имя> ${D}[--plain]${N}  ${C}user qr${N} <имя> ${D}[sub|xhttp|vision|hy2]${N}"
   echo -e "${H}Сеть${N}"
   echo -e "  ${C}autoxray warp${N} register|on|off|status|check|add|del  ${C}warp debug${N} ${D}[--quick]${N} ${D}разбор проблем${N}"
-  echo -e "  ${C}autoxray warp scan${N} ${D}[--apply] [--full] [--colo FRA,AMS] [--exclude-colo DME]${N}  ${D}самый быстрый endpoint${N}"
+  echo -e "  ${C}autoxray warp scan${N} ${D}[--apply] [--depth quick|more|all] [--colo FRA,AMS] [--exclude-colo DME]${N}  ${D}самый быстрый endpoint${N}"
+  echo -e "  ${C}autoxray warp nightly${N} on|off  ${C}depth${N} quick|more|all  ${C}threshold${N} <мс>  ${C}rescan${N} now  ${C}hosts${N} <сайты>"
   echo -e "  ${C}autoxray warp ru${N} on|off        ${D}российские сайты через WARP${N}"
   echo -e "  ${C}autoxray node${N} add <vless://…>|del <имя|id>|list   ${D}(режим моста)${N}"
   echo -e "  ${C}autoxray fingerprint${N} <браузер> ${C}telegram${N} set <ссылка>|off|update|remove"
@@ -1942,6 +2242,7 @@ main() {
     self-update)  cmd_self_update "$@" ;;
     uninstall)    cmd_uninstall ;;
     ipwatch)      need_root; locked cmd_ipwatch ;;
+    report)       cmd_report "$@" ;;
     ips)          cmd_ips "$@" ;;
     unban)        cmd_unban "$@" ;;
     setup-cron)   cmd_setup_cron ;;

@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<meta name="color-scheme" content="dark light">
+<title>Отчёт · {{USER}}</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%234cc2ff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 3v18h18'/%3E%3Cpath d='M7 15l4-5 3 3 5-7'/%3E%3C/svg%3E">
+<style>
+:root{--bg:#0e1117;--card:#161b24;--card2:#1c2230;--line:#262e3d;--text:#e6e9ef;--muted:#8b95a7;--accent:#4cc2ff;--accent2:#7c8cff;--ok:#3ddc97;--warn:#ffb454;--bad:#ff6b6b}
+@media(prefers-color-scheme:light){:root{--bg:#f4f6fb;--card:#fff;--card2:#f0f3f9;--line:#e1e6f0;--text:#161b24;--muted:#5d687d;--accent:#0a84d6;--accent2:#5560e8;--ok:#16a870;--warn:#d98410;--bad:#d64545}}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;padding:20px 14px 60px;-webkit-font-smoothing:antialiased}
+.wrap{max-width:980px;margin:0 auto;display:grid;grid-template-columns:minmax(0,1fr);gap:16px}
+.wrap>*{min-width:0}
+.hero{background:linear-gradient(135deg,var(--accent2),var(--accent));color:#fff;border-radius:20px;padding:22px 24px}
+.hero h1{font-size:22px}.hero .sub{opacity:.85;font-size:13px;margin-top:2px}
+.bar-top{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:16px}
+select,.chip{appearance:none;background:rgba(255,255,255,.18);color:#fff;border:1px solid rgba(255,255,255,.35);border-radius:10px;padding:7px 12px;font:inherit;font-size:14px;cursor:pointer}
+select option{color:#000}
+.chip.on{background:#fff;color:#27304a;font-weight:600}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px}
+.kpi b{display:block;font-size:24px;letter-spacing:-.02em}.kpi span{color:var(--muted);font-size:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px}
+.card h2{font-size:15px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+.muted{color:var(--muted);font-size:12px;font-weight:400}
+.hours{display:flex;align-items:flex-end;gap:3px;height:120px}
+.hours i{flex:1;background:var(--accent);border-radius:3px 3px 0 0;min-height:2px;opacity:.9;position:relative}
+.hours i:hover{opacity:1;background:var(--accent2)}
+.axis{display:flex;gap:3px;margin-top:4px}.axis span{flex:1;text-align:center;font-size:10px;color:var(--muted)}
+.row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 12px;padding:6px 0;border-bottom:1px solid var(--line);align-items:center}
+.row:last-child{border-bottom:0}
+.row .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px}
+.row .val{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted)}
+.row .track{grid-column:1/3;height:5px;background:var(--card2);border-radius:99px;overflow:hidden}
+.row .track i{display:block;height:100%;background:linear-gradient(90deg,var(--accent2),var(--accent));border-radius:99px}
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}
+details{border-bottom:1px solid var(--line);padding:8px 0}details:last-child{border-bottom:0}
+summary{cursor:pointer;display:flex;justify-content:space-between;gap:10px;font-size:14px;list-style:none}
+summary::-webkit-details-marker{display:none}
+details .sub{margin:8px 0 2px 14px;font-size:13px;color:var(--muted)}
+details .sub div{display:flex;justify-content:space-between;gap:10px;padding:2px 0}
+.stack{display:flex;height:12px;border-radius:99px;overflow:hidden;background:var(--card2)}
+.stack i{display:block;height:100%}
+.legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;font-size:12px;color:var(--muted)}
+.legend b{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+.days{display:flex;align-items:flex-end;gap:4px;height:100px;margin-bottom:6px}
+.days i{flex:1;background:var(--card2);border-radius:3px 3px 0 0;min-height:3px;cursor:pointer;border:1px solid var(--line);border-bottom:0}
+.days i.sel{background:var(--accent)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{color:var(--muted);font-weight:500;text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+td{padding:6px 8px;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}
+tr.dayrow{cursor:pointer}tr.dayrow:hover td{background:var(--card2)}tr.dayrow.sel td{color:var(--accent)}
+.empty{color:var(--muted);padding:20px 0;text-align:center;font-size:14px}
+label.sw{font-size:12px;color:var(--muted);display:flex;gap:6px;align-items:center;cursor:pointer}
+footer{color:var(--muted);font-size:12px;text-align:center;margin-top:8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <section class="hero">
+    <h1>📈 {{USER}}</h1>
+    <div class="sub">Сервер {{DOMAIN}} · обновлено {{GENERATED}} (время сервера)</div>
+    <div class="bar-top">
+      <select id="day"></select>
+      <button class="chip" data-range="1">День</button>
+      <button class="chip" data-range="7">7 дней</button>
+      <button class="chip" data-range="30">30 дней</button>
+    </div>
+  </section>
+
+  <div class="cards" id="kpi"></div>
+
+  <section class="card"><h2>По часам <span class="muted" id="hoursNote"></span></h2><div class="hours" id="hours"></div><div class="axis" id="axis"></div></section>
+
+  <div class="two">
+    <section class="card"><h2>Куда ходил <label class="sw"><input type="checkbox" id="group"> по доменам</label></h2><div id="hosts"></div></section>
+    <section class="card"><h2>С каких IP <span class="muted">нажмите, чтобы раскрыть</span></h2><div id="srcs"></div></section>
+  </div>
+
+  <div class="two">
+    <section class="card"><h2>Порты</h2><div id="ports"></div></section>
+    <section class="card"><h2>Куда ушёл трафик</h2><div class="stack" id="stack"></div><div class="legend" id="legend"></div></section>
+  </div>
+
+  <section class="card"><h2>По дням <span class="muted">нажмите на день</span></h2><div class="days" id="days"></div>
+    <table><thead><tr><th>День</th><th>Подключений</th><th>Адресов</th><th>IP клиента</th></tr></thead><tbody id="rank"></tbody></table>
+  </section>
+
+  <footer>Подключение это одно TCP-соединение или UDP-поток через сервер. Адреса и домены показаны так, как их запросил клиент.</footer>
+</div>
+
+<script>
+var DATA = {{DATA}};
+(function(){
+  var $=function(i){return document.getElementById(i)};
+  var days=DATA.slice().sort(function(a,b){return a.date<b.date?-1:1});
+  var sel=days.length?days[days.length-1].date:null, range=1;
+  function esc(s){return String(s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
+  function fmt(n){return (n||0).toLocaleString("ru-RU")}
+  function isIP(h){return /^[0-9.]+$/.test(h)||h.indexOf(":")>=0}
+  function root(h){if(isIP(h))return h;var p=h.split(".");if(p.length<=2)return h;
+    var sl=/^(co|com|org|net|gov|edu|ac)$/.test(p[p.length-2])&&p[p.length-1].length===2;return p.slice(sl?-3:-2).join(".")}
+  function add(m,k,v){m[k]=(m[k]||0)+v}
+  function pick(){
+    var i=days.findIndex(function(d){return d.date===sel});if(i<0)i=days.length-1;
+    var from=Math.max(0,i-range+1);return days.slice(from,i+1)
+  }
+  function agg(list){
+    var r={total:0,blocked:0,hours:new Array(24).fill(0),hosts:{},ports:{},out:{},src:{}};
+    list.forEach(function(d){
+      r.total+=d.total||0;r.blocked+=d.blocked||0;
+      (d.hours||[]).forEach(function(v,h){r.hours[h]+=v});
+      Object.keys(d.hosts||{}).forEach(function(k){add(r.hosts,k,d.hosts[k])});
+      Object.keys(d.ports||{}).forEach(function(k){add(r.ports,k,d.ports[k])});
+      Object.keys(d.out||{}).forEach(function(k){add(r.out,k,d.out[k])});
+      Object.keys(d.src||{}).forEach(function(ip){
+        var s=d.src[ip],t=r.src[ip]||(r.src[ip]={n:0,first:s.first,last:s.last,hosts:{}});
+        t.n+=s.n;if(s.first<t.first)t.first=s.first;if(s.last>t.last)t.last=s.last;
+        Object.keys(s.hosts||{}).forEach(function(h){add(t.hosts,h,s.hosts[h])});
+      });
+    });
+    return r;
+  }
+  function top(map,n){return Object.keys(map).map(function(k){return [k,map[k]]}).sort(function(a,b){return b[1]-a[1]}).slice(0,n)}
+  function rows(el,list,total,fmtName){
+    if(!list.length){el.innerHTML='<div class="empty">Нет данных</div>';return}
+    var max=list[0][1]||1;
+    el.innerHTML=list.map(function(x){
+      var p=total?Math.round(x[1]*1000/total)/10:0;
+      return '<div class="row"><div class="name">'+(fmtName?fmtName(x[0]):esc(x[0]))+'</div><div class="val">'+fmt(x[1])+' · '+p+'%</div><div class="track"><i style="width:'+(x[1]*100/max)+'%"></i></div></div>'}).join("");
+  }
+  function render(){
+    var list=pick(),r=agg(list);
+    $("day").value=sel;
+    document.querySelectorAll(".chip").forEach(function(c){c.classList.toggle("on",+c.dataset.range===range)});
+    var hostN=Object.keys(r.hosts).length,srcN=Object.keys(r.src).length;
+    $("kpi").innerHTML=[["Подключений",fmt(r.total)],["Адресов назначения",fmt(hostN)],["IP клиента",fmt(srcN)],["Заблокировано",fmt(r.blocked)]].map(function(k){return '<div class="kpi"><b>'+k[1]+'</b><span>'+k[0]+'</span></div>'}).join("");
+    var mx=Math.max.apply(null,r.hours.concat([1]));
+    $("hours").innerHTML=r.hours.map(function(v,h){return '<i title="'+h+':00, '+fmt(v)+'" style="height:'+Math.max(2,v*100/mx)+'%"></i>'}).join("");
+    $("axis").innerHTML=r.hours.map(function(v,h){return '<span>'+(h%3===0?h:"")+'</span>'}).join("");
+    $("hoursNote").textContent=range===1?sel:list[0].date+" … "+list[list.length-1].date;
+    var hm=r.hosts;
+    if($("group").checked){hm={};Object.keys(r.hosts).forEach(function(h){add(hm,root(h),r.hosts[h])})}
+    rows($("hosts"),top(hm,20),r.total,function(h){return (isIP(h)?"🔢 ":"🌐 ")+esc(h)});
+    var s=top(Object.keys(r.src).reduce(function(m,k){m[k]=r.src[k].n;return m},{}),12);
+    $("srcs").innerHTML=s.length?s.map(function(x){
+      var d=r.src[x[0]],p=r.total?Math.round(x[1]*1000/r.total)/10:0;
+      var sub=top(d.hosts,8).map(function(h){return '<div><span>'+esc(h[0])+'</span><span>'+fmt(h[1])+'</span></div>'}).join("");
+      return '<details><summary><span>📱 '+esc(x[0])+'</span><span class="muted">'+fmt(x[1])+' · '+p+'%</span></summary><div class="sub"><div><span>Активность</span><span>'+esc(d.first)+' – '+esc(d.last)+'</span></div>'+sub+'</div></details>'}).join(""):'<div class="empty">Нет данных</div>';
+    rows($("ports"),top(r.ports,8),r.total);
+    var cols={direct:"var(--accent)",warp:"var(--accent2)",block:"var(--bad)"},tot=0;Object.keys(r.out).forEach(function(k){tot+=r.out[k]});
+    $("stack").innerHTML=Object.keys(r.out).map(function(k){return '<i style="width:'+(tot?r.out[k]*100/tot:0)+'%;background:'+(cols[k]||"var(--warn)")+'"></i>'}).join("");
+    var names={direct:"напрямую с сервера",warp:"через WARP",block:"заблокировано"};
+    $("legend").innerHTML=Object.keys(r.out).map(function(k){return '<span><b style="background:'+(cols[k]||"var(--warn)")+'"></b>'+(names[k]||esc(k))+': '+fmt(r.out[k])+'</span>'}).join("")||'<span>Нет данных</span>';
+    var dm=Math.max.apply(null,days.map(function(d){return d.total||0}).concat([1]));
+    $("days").innerHTML=days.map(function(d){return '<i data-d="'+d.date+'" class="'+(list.indexOf(d)>=0?"sel":"")+'" title="'+d.date+': '+fmt(d.total)+'" style="height:'+Math.max(3,(d.total||0)*100/dm)+'%"></i>'}).join("");
+    $("rank").innerHTML=days.slice().sort(function(a,b){return (b.total||0)-(a.total||0)}).map(function(d){
+      return '<tr class="dayrow'+(d.date===sel?" sel":"")+'" data-d="'+d.date+'"><td>'+d.date+'</td><td>'+fmt(d.total)+'</td><td>'+fmt(Object.keys(d.hosts||{}).length)+'</td><td>'+fmt(Object.keys(d.src||{}).length)+'</td></tr>'}).join("")||'<tr><td colspan="4" class="empty">Данных пока нет: отчёт наполняется по мере использования</td></tr>';
+  }
+  $("day").innerHTML=days.slice().reverse().map(function(d){return '<option>'+d.date+'</option>'}).join("")||'<option>нет данных</option>';
+  $("day").onchange=function(){sel=this.value;render()};
+  $("group").onchange=render;
+  document.addEventListener("click",function(e){
+    var c=e.target.closest(".chip"),d=e.target.closest("[data-d]");
+    if(c){range=+c.dataset.range;render()}
+    if(d){sel=d.dataset.d;render();window.scrollTo({top:0,behavior:"smooth"})}
+  });
+  render();
+})();
+</script>
+</body>
+</html>

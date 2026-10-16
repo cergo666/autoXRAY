@@ -39,7 +39,7 @@ setup_tls() { # домен [каталог общего CA]
 install_cli() {
     install -m 755 /opt/autoxray/autoxray /usr/local/bin/autoxray
     mkdir -p /usr/local/share/autoxray/telegram
-    install -m 644 /opt/autoxray/templates/sub.html /opt/autoxray/templates/nginx.conf /usr/local/share/autoxray/
+    install -m 644 /opt/autoxray/templates/sub.html /opt/autoxray/templates/nginx.conf /opt/autoxray/templates/report.html /usr/local/share/autoxray/
 }
 
 # Профиль i из подписки пользователя -> клиентский конфиг, адрес сервера заменён на $2 (DNS в тесте не нужен)

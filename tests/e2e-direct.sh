@@ -124,6 +124,43 @@ client_stop
 autoxray user set dan --ips 0 >/dev/null; [ "$(jq -r .log.loglevel /usr/local/etc/xray/config.json)" = none ] && pass "без лимитов лог доступа снова выключен" || fail "лог доступа остался включён"
 autoxray user del dan >/dev/null
 
+step "Отчёты о посещениях: сбор, агрегация, html, доступ по секретному адресу"
+check "report_parse чистит имена хостов (защита от внедрения html)" bash -c '
+  source <(sed -n "/^report_parse()/,/^}/p" /opt/autoxray/autoxray)
+  out=$(printf "%s\n" "2026/10/16 10:00:00.1 from 1.2.3.4:5 accepted tcp:<script>alert(1)</script>.evil.com:443 [i >> direct] email: u1" | report_parse)
+  case "$out" in *"<"*|*">"*|*"("*) exit 1 ;; esac; [ -n "$out" ]'
+autoxray user add erin --report on >/tmp/erin.out 2>&1 && pass "erin создан с отчётом" || { fail "user add erin --report on"; cat /tmp/erin.out; }
+RT=$(jq -r '.reports.token' /etc/autoxray/state.json); [ ${#RT} = 32 ] && pass "выдан секретный токен отчётов" || fail "токен отчётов: '$RT'"
+grep -q "location ^~ /r/$RT/" /etc/nginx/conf.d/default.conf && pass "nginx: блок отчётов добавлен" || fail "в nginx нет блока отчётов"
+check "nginx -t с блоком отчётов" nginx -t
+[ "$(jq -r .log.loglevel /usr/local/etc/xray/config.json)" = warning ] && pass "лог доступа включён ради отчёта" || fail "лог доступа не включён"
+TOKEN_E=$(jq -r '.users[] | select(.name=="erin").token' /etc/autoxray/state.json)
+code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/r/$RT/erin/"); [ "$code" = 200 ] && pass "страница отчёта открывается по секретному адресу" || fail "страница отчёта: $code"
+code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/r/ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ/erin/"); [ "$code" = 404 ] && pass "чужой токен отчётов даёт 404" || fail "чужой токен отчётов: $code"
+client_cfg "$TOKEN_E" 1 127.0.0.1 > /tmp/e1.json
+: > /var/log/xray/access.log
+client_start /tmp/e1.json
+curl -sS -o /dev/null --max-time 15 --socks5-hostname 127.0.0.1:10808 http://example.com/ || true
+for _ in 1 2; do via_proxy ok.txt >/dev/null; done
+client_stop
+autoxray ipwatch
+EDAY=$(ls /etc/autoxray/reports/erin/*.json 2>/dev/null | head -n1)
+[ -n "$EDAY" ] && pass "суточный файл данных создан" || fail "нет суточного файла"
+jq -e '.total >= 2 and (.hosts | has("93.184.216.34")) and (.src | has("127.0.0.1")) and (.out.direct >= 2) and (.hours | length == 24)' "$EDAY" >/dev/null && pass "агрегаты: адрес назначения, IP клиента, выход, часы" || { fail "агрегаты не сошлись"; jq -c . "$EDAY"; }
+jq -e '.hosts | has("example.com")' "$EDAY" >/dev/null && pass "в отчёте виден домен, который запросил клиент" || { fail "домен example.com не попал в отчёт"; jq -c '.hosts' "$EDAY"; }
+autoxray report build erin >/dev/null
+curl -fsS --max-time 8 "https://$DOMAIN/r/$RT/erin/" -o /tmp/report.html
+grep -q '93.184.216.34' /tmp/report.html && ! grep -q '</script>.evil' /tmp/report.html && pass "html отчёта содержит данные и безопасен" || fail "html отчёта"
+[ "$(stat -c %a /etc/autoxray/reports)" = 700 ] && pass "данные отчётов закрыты (700)" || fail "права данных отчётов"
+echo '{"date":"2000-01-01","total":1,"hosts":{"old.test":1},"hours":[]}' > /etc/autoxray/reports/erin/2000-01-01.json
+autoxray report keep 7 >/dev/null; [ ! -e /etc/autoxray/reports/erin/2000-01-01.json ] && pass "старые дни удаляются по сроку хранения" || fail "retention не сработал"
+autoxray user set erin --report off >/dev/null 2>&1
+[ ! -d /var/lib/autoxray/reports/erin ] && pass "после выключения папка отчёта удалена" || fail "папка отчёта осталась"
+code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/r/$RT/erin/"); [ "$code" = 404 ] && pass "после выключения адрес отчёта не отдаётся" || fail "адрес отчёта: $code"
+[ "$(jq -r .log.loglevel /usr/local/etc/xray/config.json)" = none ] && pass "лог доступа снова выключен" || fail "лог доступа остался"
+autoxray report purge erin >/dev/null; [ ! -d /etc/autoxray/reports/erin ] && pass "purge удаляет накопленные данные" || fail "purge"
+autoxray user del erin >/dev/null
+
 step "WARP: регистрация (заглушка Cloudflare API) + настоящий xray -test с wireguard-outbound"
 cat > /tmp/fakecurl <<'FC'
 #!/bin/bash
@@ -166,6 +203,34 @@ check "warp_rank: сортировка и фильтры по узлам" bash -
 [ "$(autoxray warp candidates quick | grep -cE "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:2408$")" -ge 14 ] && pass "кандидаты: по адресу из каждого диапазона Cloudflare" || fail "кандидаты quick"
 [ "$(autoxray warp candidates ports | wc -l)" = 9 ] && pass "кандидаты: запасные порты 500, 1701, 4500" || fail "кандидаты ports"
 AX_WARP_CANDIDATES="162.159.192.1:2408 188.114.97.1:2408" autoxray warp scan >/tmp/scan.out 2>&1 && fail "scan «нашёл» рабочий endpoint с поддельным профилем" || pass "scan честно сообщает, что ни один endpoint не ответил"
+
+step "WARP: глубина сканирования и ночная проверка (поддельные результаты замера)"
+[ "$(autoxray warp candidates more | wc -l)" -ge 270 ] && pass "глубина more: около 280 адресов" || fail "candidates more: $(autoxray warp candidates more | wc -l)"
+[ "$(autoxray warp candidates all | wc -l)" -ge 3550 ] && pass "глубина all: все адреса диапазонов (около 3500)" || fail "candidates all: $(autoxray warp candidates all | wc -l)"
+printf '120\t1.1.1.1:2408\tFRA\tDE\t3\t3\t30\t100,120,140\n250\t2.2.2.2:2408\tAMS\tNL\t3\t3\t35\t200,250,300\n10040\t9.9.9.9:2408\tDME\tRU\t0\t3\t40\t-,-,-\n' > /tmp/fake1.tsv
+AX_WARP_FAKE_RESULTS=/tmp/fake1.tsv autoxray warp scan 2>&1 | sed 's/\x1b\[[0-9;]*m//g' > /tmp/scan-fake.out
+grep -q 'yandex' /tmp/scan-fake.out && grep -q '1.1.1.1:2408' /tmp/scan-fake.out && grep -q 'RU ✘' /tmp/scan-fake.out && pass "таблица: отклик по российским сайтам и отметка недоступных" || { fail "таблица сканера"; cat /tmp/scan-fake.out; }
+AX_WARP_FAKE_RESULTS=/tmp/fake1.tsv autoxray warp scan --exclude-colo FRA 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -q '2.2.2.2' && pass "scan --exclude-colo учитывает фильтр" || fail "фильтр по узлам"
+autoxray warp nightly on >/dev/null; autoxray warp threshold 300 >/dev/null
+autoxray warp on --force >/dev/null 2>&1
+AX_WARP_FAKE_RESULTS=/tmp/fake1.tsv autoxray warp rescan now >/dev/null 2>&1
+[ "$(jq -r .warp.endpoint /etc/autoxray/state.json)" = "1.1.1.1:2408" ] && pass "ночная проверка: выбран самый быстрый (1.1.1.1:2408)" || fail "rescan: endpoint $(jq -r .warp.endpoint /etc/autoxray/state.json)"
+[ "$(jq '.warp.top | length' /etc/autoxray/state.json)" = 3 ] && pass "топ сохранён в настройках" || fail "топ не сохранён"
+grep -q 'режим full' /etc/autoxray/warp-rescan.log && pass "без сохранённого топа сделан полный проход" || fail "лог: $(tail -n1 /etc/autoxray/warp-rescan.log)"
+check "xray -test после смены endpoint" xray run -test -c /usr/local/etc/xray/config.json
+printf '90\t3.3.3.3:2408\tAMS\tNL\t3\t3\t30\t80,90,100\n' > /tmp/fake2.tsv
+AX_WARP_FAKE_RESULTS=/tmp/fake2.tsv autoxray warp rescan now >/dev/null 2>&1
+[ "$(jq -r .warp.endpoint /etc/autoxray/state.json)" = "3.3.3.3:2408" ] && grep -q 'режим top' /etc/autoxray/warp-rescan.log && pass "топ быстрее порога: берётся лучший из топа, полный проход не нужен" || fail "rescan по топу: $(tail -n1 /etc/autoxray/warp-rescan.log)"
+printf '100\t3.3.3.3:2408\tAMS\tNL\t3\t3\t30\t90,100,110\n95\t4.4.4.4:2408\tFRA\tDE\t3\t3\t30\t90,95,100\n' > /tmp/fake3.tsv
+AX_WARP_FAKE_RESULTS=/tmp/fake3.tsv autoxray warp rescan now >/dev/null 2>&1
+[ "$(jq -r .warp.endpoint /etc/autoxray/state.json)" = "3.3.3.3:2408" ] && pass "небольшой выигрыш не меняет endpoint (без лишнего перезапуска Xray)" || fail "гистерезис: $(jq -r .warp.endpoint /etc/autoxray/state.json)"
+printf '450\t5.5.5.5:2408\tFRA\tDE\t3\t3\t30\t400,450,500\n' > /tmp/fake4.tsv
+AX_WARP_FAKE_RESULTS=/tmp/fake4.tsv autoxray warp rescan now >/dev/null 2>&1
+grep -q 'режим full' <(tail -n1 /etc/autoxray/warp-rescan.log) && pass "все медленнее порога: выполнен полный проход" || fail "порог: $(tail -n1 /etc/autoxray/warp-rescan.log)"
+autoxray warp nightly off >/dev/null; before=$(jq -r .warp.endpoint /etc/autoxray/state.json)
+AX_WARP_FAKE_RESULTS=/tmp/fake2.tsv autoxray warp rescan >/dev/null 2>&1
+[ "$before" = "$(jq -r .warp.endpoint /etc/autoxray/state.json)" ] && pass "при выключенной ночной проверке cron ничего не меняет" || fail "rescan сработал при nightly off"
+autoxray warp off >/dev/null
 
 step "Версии: баннер обновления и список версий ядра (поддельный GitHub API)"
 mkdir -p /tmp/api/repos/cergo666/autoXRAY/releases /tmp/api/repos/XTLS/Xray-core
