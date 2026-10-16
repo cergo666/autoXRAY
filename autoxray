@@ -1553,7 +1553,7 @@ menu_users() {
          rs=$(ask "Сбрасывать трафик раз в месяц? (y/N)")
          args=(); [[ -n $lim ]] && args+=(--limit "$lim"); [[ -n $days ]] && args+=(--days "$days"); [[ $rs =~ ^[Yy]$ ]] && args+=(--reset monthly)
          (locked cmd_user_add "$name" "${args[@]}"); pause ;;
-      1) pick_user && user_menu_actions "$PICKED" ;;
+      1) pick_user "Выберите пользователя" && user_menu_actions "$PICKED" ;;
       2) return 0 ;;
     esac
   done
