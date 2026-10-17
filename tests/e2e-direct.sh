@@ -260,6 +260,97 @@ check "status/stats/user list печатаются" bash -c 'autoxray status && 
 [ "$(autoxray user list | sed "s/\x1b\[[0-9;]*m//g" | grep -c "активен")" -ge 1 ] && pass "список пользователей с русскими статусами" || fail "список пользователей"
 check "help" bash -c 'autoxray help | grep -q doctor'
 
+step "Универсальная подписка (base64 со ссылками)"
+TOKEN_A=$(jq -r '.users[] | select(.name=="alice").token' /etc/autoxray/state.json)
+curl -sS --max-time 8 -D /tmp/h2.txt -o /tmp/sub.txt "https://$DOMAIN/$TOKEN_A.txt"
+base64 -d < /tmp/sub.txt > /tmp/sub.links 2>/dev/null
+[ "$(wc -l < /tmp/sub.links)" -ge 3 ] && grep -q '^vless://' /tmp/sub.links && grep -q '^hy2://' /tmp/sub.links && pass "подписка .txt: base64 со ссылками vless и hy2" || { fail "подписка .txt"; head -c 300 /tmp/sub.links; }
+grep -qi '^subscription-userinfo:' /tmp/h2.txt && pass "у .txt есть subscription-userinfo" || fail "нет subscription-userinfo у .txt"
+curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.html" | grep -q "$TOKEN_A.txt" && pass "на личной странице есть универсальная подписка" || fail "страница без .txt"
+autoxray user qr alice links >/dev/null 2>&1 && pass "user qr links" || fail "user qr links"
+
+step "Сайт-маскировка: пересоздание и свой сайт"
+md5_a=$(md5sum "$WEB/index.html" | cut -d' ' -f1)
+autoxray site regenerate >/dev/null && [ "$md5_a" != "$(md5sum "$WEB/index.html" | cut -d' ' -f1)" ] && pass "site regenerate даёт новый сайт" || fail "site regenerate"
+mkdir -p /tmp/mysite && echo '<html><body>MYSITE-MARKER</body></html>' > /tmp/mysite/index.html
+autoxray site set /tmp/mysite >/dev/null 2>&1 && curl -fsS --max-time 8 "https://$DOMAIN/" | grep -q MYSITE-MARKER && pass "site set: отдаётся свой сайт" || fail "site set"
+curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.json" >/dev/null && pass "подписки продолжают работать со своим сайтом" || fail "подписка после site set"
+autoxray site status | sed 's/\x1b\[[0-9;]*m//g' | grep -q custom && pass "site status показывает режим custom" || fail "site status"
+autoxray site regenerate >/dev/null
+
+step "Безопасное обновление: снимок, успешное обновление, откат при сбое"
+ORIG_VER=$(autoxray version | awk '{print $2}')
+mk_release() { # версия [постфикс-код]
+  rm -rf "/tmp/rel/v$1"; mkdir -p "/tmp/rel/v$1"; cp -r /opt/autoxray/templates /opt/autoxray/components "/tmp/rel/v$1/"
+  sed "s/^AX_VERSION=\".*\"/AX_VERSION=\"$1\"/" /opt/autoxray/autoxray > "/tmp/rel/v$1/autoxray"
+  [ -n "${2:-}" ] && sed -i "s|^main \"\$@\"\$|$2\nmain \"\$@\"|" "/tmp/rel/v$1/autoxray"
+  return 0
+}
+mk_release 9.9.9
+AX_RAW_BASE=file:///tmp/rel autoxray self-update v9.9.9 >/tmp/upd1.out 2>&1 && [ "$(autoxray version | awk '{print $2}')" = 9.9.9 ] && pass "self-update до 9.9.9 прошёл проверки" || { fail "self-update"; sed 's/\x1b\[[0-9;]*m//g' /tmp/upd1.out | tail -n 8; }
+ls /var/lib/autoxray/snapshots/*-v$ORIG_VER.tar.gz >/dev/null 2>&1 && pass "перед обновлением создан снимок" || fail "снимка нет"
+mk_release 9.9.8 'post_update_check() { return 1; }'
+state_md5=$(md5sum /etc/autoxray/state.json | cut -d' ' -f1)
+AX_RAW_BASE=file:///tmp/rel autoxray self-update v9.9.8 >/tmp/upd2.out 2>&1 && fail "сломанное обновление не должно проходить" || pass "сломанное обновление отклонено"
+[ "$(autoxray version | awk '{print $2}')" = 9.9.9 ] && pass "после неудачи версия вернулась (9.9.9)" || fail "версия после отката: $(autoxray version)"
+[ "$state_md5" = "$(md5sum /etc/autoxray/state.json | cut -d' ' -f1)" ] && pass "state.json не изменился после отката" || fail "state.json изменился"
+curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.json" >/dev/null && pass "после отката подписка работает" || fail "подписка после отката"
+printf 'y\n' | autoxray rollback 2 >/tmp/rb.out 2>&1; [ "$(autoxray version | awk '{print $2}')" = "$ORIG_VER" ] && pass "rollback возвращает исходную версию ($ORIG_VER)" || { fail "rollback: $(autoxray version)"; tail -n 5 /tmp/rb.out; }
+install_cli
+
+step "Telegram-бот: команды администратора, подтверждения, уведомления (поддельный Telegram API)"
+TG=/tmp/tg; rm -rf "$TG"; mkdir -p "$TG"
+python3 /opt/autoxray/tests/mock_telegram.py 8081 "$TG" & MOCK=$!
+sleep 1
+export AX_TG_API=http://127.0.0.1:8081 AX_TG_POLL=1 AX_TG_TIMEOUT=10
+TOK=123456:TESTTOKENTESTTOKENTESTTOKEN12
+autoxray bot setup --token "$TOK" --admin 111 >/tmp/bot-setup.out 2>&1 && pass "bot setup: токен принят, администратор добавлен" || { fail "bot setup"; sed 's/\x1b\[[0-9;]*m//g' /tmp/bot-setup.out; }
+[ "$(stat -c %a /etc/autoxray/bot.token)" = 600 ] && pass "токен бота хранится с правами 600" || fail "права токена"
+jq -e '.bot.enabled == true and .bot.admins == [111]' /etc/autoxray/state.json >/dev/null && pass "в настройках только admin 111" || fail "настройки бота"
+grep -q 'ExecStart=.*autoxray bot run' /etc/systemd/system/autoxray-bot.service && pass "создан unit autoxray-bot.service" || fail "unit не создан"
+autoxray bot run >/tmp/bot-run.out 2>&1 & BOT=$!
+sleep 2
+qn=0
+tgmsg() { qn=$((qn + 1)); jq -nc --argjson i $qn --argjson f "$1" --arg t "$2" '{update_id: $i, message: {message_id: $i, from: {id: $f, first_name: "T"}, chat: {id: $f, type: "private"}, text: $t}}' >> "$TG/queue.jsonl"; }
+tgcb() { qn=$((qn + 1)); jq -nc --argjson i $qn --argjson f "$1" --arg d "$2" '{update_id: $i, callback_query: {id: ("cb" + ($i | tostring)), from: {id: $f}, message: {message_id: 7, chat: {id: $f, type: "private"}}, data: $d}}' >> "$TG/queue.jsonl"; }
+sent_has() { for _ in $(seq 1 30); do jq -e --arg p "$1" 'select((.payload.text // "") | test($p))' "$TG/sent.jsonl" >/dev/null 2>&1 && return 0; sleep 0.5; done; return 1; }
+sent_method() { for _ in $(seq 1 30); do jq -e --arg m "$1" 'select(.method == $m)' "$TG/sent.jsonl" >/dev/null 2>&1 && return 0; sleep 0.5; done; return 1; }
+
+tgmsg 111 /status;  sent_has "autoXRAY" && pass "/status отвечает администратору" || fail "/status"
+tgmsg 222 /status;  tgmsg 222 /users; sleep 3
+[ "$(jq -s '[.[] | select(.method == "sendMessage" and .payload.chat_id == 222)] | length' "$TG/sent.jsonl")" = 0 ] && pass "постороннему бот не отвечает" || fail "бот ответил постороннему"
+tgmsg 222 /id;      sent_has "222" && pass "/id работает у всех и показывает ID" || fail "/id"
+sent_kb() { for _ in $(seq 1 30); do jq -e --arg d "$1" 'select(.method == "sendMessage") | .payload.reply_markup.inline_keyboard[][] | select(.callback_data == $d)' "$TG/sent.jsonl" >/dev/null 2>&1 && return 0; sleep 0.5; done; return 1; }
+tgmsg 111 /users;   sent_kb "u:alice" && pass "/users: кнопка пользователя alice" || fail "/users"
+tgmsg 111 "/add frank 5 7"; sent_has "создан" && jq -e '.users[] | select(.name == "frank" and .limit == 5368709120 and .expire > 0)' /etc/autoxray/state.json >/dev/null && pass "/add создал frank с лимитом и сроком" || fail "/add frank"
+tgmsg 111 "/add bad!name"; sent_has "Имя:" && ! jq -e '.users[] | select(.name == "bad!name")' /etc/autoxray/state.json >/dev/null && pass "неверное имя отклонено" || fail "проверка имени"
+tgmsg 111 '/add x;touch /tmp/pwned 1'; sleep 2; [ ! -e /tmp/pwned ] && pass "внедрение команд через аргументы невозможно" || fail "ВНЕДРЕНИЕ КОМАНДЫ"
+tgmsg 111 "/limit frank 10"; sleep 2; [ "$(jq '.users[] | select(.name == "frank") | .limit' /etc/autoxray/state.json)" = 10737418240 ] && pass "/limit меняет лимит" || fail "/limit"
+tgcb 111 "u:frank:lim:50"; sleep 2; [ "$(jq '.users[] | select(.name == "frank") | .limit' /etc/autoxray/state.json)" = 53687091200 ] && pass "кнопка лимита 50 ГБ" || fail "кнопка лимита"
+tgcb 111 "u:frank:tog"; sleep 2; [ "$(jq '.users[] | select(.name == "frank") | .enabled' /etc/autoxray/state.json)" = false ] && pass "кнопка отключения" || fail "кнопка отключения"
+tgcb 111 "u:alice:qr"; sent_method sendPhoto && pass "QR отправляется картинкой" || fail "sendPhoto"
+tgcb 111 "u:alice:links"; sent_has "vless://" && pass "кнопка «Ссылки» присылает ссылки" || fail "ссылки"
+tgcb 111 "u:frank:del"; sent_method editMessageText; sleep 2
+jq -e '.users[] | select(.name == "frank")' /etc/autoxray/state.json >/dev/null && pass "удаление требует подтверждения (пользователь ещё есть)" || fail "удалился без подтверждения"
+tgcb 222 "u:frank:delok"; sleep 2
+jq -e '.users[] | select(.name == "frank")' /etc/autoxray/state.json >/dev/null && pass "callback постороннего игнорируется" || fail "посторонний удалил пользователя"
+tgcb 111 "u:frank:delok"; sleep 3
+jq -e '.users[] | select(.name == "frank")' /etc/autoxray/state.json >/dev/null && fail "подтверждённое удаление не сработало" || pass "подтверждённое удаление работает"
+! pgrep -af "TESTTOKEN" >/dev/null && pass "токен не виден в списке процессов" || fail "токен в аргументах процесса"
+! grep -q TESTTOKEN /tmp/bot-run.out && pass "токен не попадает в журнал бота" || fail "токен в журнале"
+
+# уведомления: у пользователя заканчивается лимит
+autoxray user add hank --limit 1 >/dev/null
+autoxray collect >/dev/null 2>&1          # первая проверка запоминает статусы (hank активен)
+jq '.hank = {up: 2000000000, down: 2000000000}' /etc/autoxray/traffic.json > /tmp/tr.json && cp /tmp/tr.json /etc/autoxray/traffic.json
+autoxray collect >/dev/null 2>&1          # лимит превышен: приходит уведомление
+sent_has "hank.*лимит" && pass "уведомление: исчерпан лимит трафика" || fail "уведомление о лимите"
+autoxray bot test >/dev/null 2>&1; sent_has "Проверка уведомлений" && pass "bot test присылает уведомление администратору" || fail "bot test"
+autoxray user del hank >/dev/null
+kill "$BOT" 2>/dev/null; wait "$BOT" 2>/dev/null
+autoxray bot remove >/dev/null 2>&1; [ ! -e /etc/autoxray/bot.token ] && pass "bot remove удаляет токен" || fail "токен остался"
+kill "$MOCK" 2>/dev/null; unset AX_TG_API AX_TG_POLL AX_TG_TIMEOUT
+
 step "Бэкап и повторный render идемпотентен"
 autoxray backup /tmp/bk.tar.gz >/dev/null && check "бэкап создан" test -s /tmp/bk.tar.gz
 md5_before=$(md5sum /usr/local/etc/xray/config.json | cut -d' ' -f1)

@@ -17,7 +17,7 @@ BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
 
-AX_RELEASE="3.5.0"
+AX_RELEASE="3.6.0"
 AX_REF_DEFAULT="main"   # при выпуске релиза заменяется на тег (см. .github/workflows/release.yml)
 AX_REF="${AUTOXRAY_REF:-$AX_REF_DEFAULT}"
 RAW="https://raw.githubusercontent.com/cergo666/autoXRAY/$AX_REF"
@@ -198,7 +198,7 @@ echo -e "${YEL}Устанавливаем autoxray...${NC}"
 fetch autoxray > /usr/local/bin/autoxray || die "Не удалось получить autoxray"
 chmod 755 /usr/local/bin/autoxray
 mkdir -p /usr/local/share/autoxray
-for t in sub.html nginx.conf report.html; do
+for t in sub.html nginx.conf report.html gen_page.sh; do
     fetch "templates/$t" > "/usr/local/share/autoxray/$t" || die "Не удалось получить templates/$t"
 done
 mkdir -p /usr/local/share/autoxray/telegram
@@ -365,6 +365,16 @@ autoxray render || die "Не удалось применить конфигур�
 autoxray setup-cron
 
 # ==========================================
+# Telegram-бот администратора (по желанию)
+# ==========================================
+if [ -n "$AX_BOT_TOKEN" ]; then
+    autoxray bot setup --token "$AX_BOT_TOKEN" ${AX_BOT_ADMIN:+--admin "$AX_BOT_ADMIN"} || echo -e "${YEL}Бот не настроен, повторите: autoxray bot setup${NC}"
+elif [ -t 0 ] && [ -z "$AX_NO_BOT" ]; then
+    read -r -p "$(echo -e "\n${YEL}Настроить Telegram-бота для управления сервером сейчас? (y/N):${NC} ")" want_bot
+    if [[ "$want_bot" =~ ^[Yy]$ ]]; then autoxray bot setup || echo -e "${YEL}Бот не настроен, повторите: autoxray bot setup${NC}"; fi
+fi
+
+# ==========================================
 # Итог
 # ==========================================
 echo -e "\n${BOLD}${MAG}🎉 Установка завершена${NC}"
@@ -383,5 +393,6 @@ echo -e "\n${BOLD}${MAG}▌🧰 Управление${NC}  ${CYAN}autoxray${NC} 
 echo -e "  ${CYAN}autoxray user add <имя> --limit 50 --days 30${NC}   ${DIM}новый пользователь${NC}"
 echo -e "  ${CYAN}autoxray stats${NC}                                 ${DIM}трафик${NC}"
 echo -e "  ${CYAN}autoxray doctor${NC}                                ${DIM}диагностика${NC}"
+echo -e "  ${CYAN}autoxray bot setup${NC}                             ${DIM}Telegram-бот для управления${NC}"
 echo -e "  ${CYAN}autoxray firewall${NC}                              ${DIM}файрвол (по желанию)${NC}"
 echo -e "\n${DIM}Документация и релизы: https://github.com/cergo666/autoXRAY${NC}\n"

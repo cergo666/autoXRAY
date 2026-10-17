@@ -9,7 +9,7 @@ set -uo pipefail
 # bash >= 5.2: '&' в замене ${var//a/b} — спецсимвол; ссылки содержат '&'
 shopt -u patsub_replacement 2>/dev/null || true
 
-AX_VERSION="3.5.0"
+AX_VERSION="3.6.0"
 AX_REPO="cergo666/autoXRAY"
 XRAY_TESTED="v26.9.9"          # версия ядра, с которой этот релиз проверен тестами
 API="${AX_API:-https://api.github.com}"
@@ -553,6 +553,9 @@ def direct_eu($n): {mux: {concurrency: -1, enabled: false}, tag: "proxy", protoc
 JQ
 )
 
+# Универсальная подписка: ссылки vless:// и hy2:// через перевод строки в base64 (v2rayNG, NekoBox, Streisand, Hiddify и др.)
+sub_txt() { user_links "$1" | cut -d'|' -f2- | base64 -w0; echo; }
+
 sub_json() {
   local prog="$CLIENT_JQ"$'\n'"$CLIENT_DIRECT_TAIL"
   [[ $(mode) == bridge ]] && prog="$BRIDGE_COMMON"$'\n'"$CLIENT_JQ"$'\n'"$CLIENT_BRIDGE_TAIL"
@@ -586,6 +589,7 @@ sub_html() {
   out=${out//'{{NAME}}'/$(html_esc <<<"$name")}
   out=${out//'{{DOMAIN}}'/$(html_esc <<<"$domain")}
   out=${out//'{{SUB_URL}}'/$(html_esc <<<"$sub_url")}
+  out=${out//'{{LINKS_URL}}'/$(html_esc <<<"https://$domain/$token.txt")}
   out=${out//'{{USED}}'/$used}
   out=${out//'{{LIMIT}}'/$limit}
   out=${out//'{{EXPIRE}}'/$expire}
@@ -604,19 +608,21 @@ render_subs() {
     token=$(user_get "$name" | jq -r .token)
     sub_json "$name" >"$web/$token.json" || warn "Не удалось собрать подписку для $name"
     sub_html "$name" >"$web/$token.html" 2>/dev/null || rm -f "$web/$token.html"
-    chmod 644 "$web/$token.json" "$web/$token.html" 2>/dev/null
+    sub_txt "$name" >"$web/$token.txt"
+    chmod 644 "$web/$token.json" "$web/$token.html" "$web/$token.txt" 2>/dev/null
     keep+="$token "
     jq -r --arg n "$name" --arg tok "$token" --slurpfile t "$TRAFFIC" '
       .users[] | select(.name == $n) as $u
       | (($t[0][$n].up // 0)) as $up | (($t[0][$n].down // 0)) as $dn
-      | "\"/\($tok).json\" \"upload=\($up); download=\($dn)"
-        + (if $u.limit > 0 then "; total=\($u.limit)" else "" end)
-        + (if $u.expire > 0 then "; expire=\($u.expire)" else "" end) + "\";"' "$STATE" >>"$map_new"
+      | ("upload=\($up); download=\($dn)"
+         + (if $u.limit > 0 then "; total=\($u.limit)" else "" end)
+         + (if $u.expire > 0 then "; expire=\($u.expire)" else "" end)) as $info
+      | "\"/\($tok).json\" \"\($info)\";", "\"/\($tok).txt\" \"\($info)\";"' "$STATE" >>"$map_new"
   done < <(jq -r '.users[].name' "$STATE")
 
   # удаляем файлы подписок отозванных пользователей
   local f base
-  for f in "$web"/*.json "$web"/*.html; do
+  for f in "$web"/*.json "$web"/*.html "$web"/*.txt; do
     [[ -e $f ]] || continue
     base=$(basename "$f"); base=${base%.*}
     [[ $base =~ ^[A-Za-z0-9]{20,32}$ ]] || continue
@@ -827,6 +833,8 @@ show_user() {
   echo -e "    ${CYAN}https://$domain/$token.html${NC}"
   echo -e "\n ${BOLD}📥 Подписка${NC} ${DIM}(вставить в Happ / v2rayTun)${NC}"
   echo -e "    ${CYAN}https://$domain/$token.json${NC}"
+  echo -e "\n ${BOLD}📱 Универсальная подписка${NC} ${DIM}(v2rayNG, NekoBox, Streisand, Hiddify: обычный список ссылок)${NC}"
+  echo -e "    ${CYAN}https://$domain/$token.txt${NC}"
   while IFS='|' read -r label link; do
     case $label in *XHTTP*) ico="⚡" ;; *VISION*) ico="🔐" ;; *HYSTERIA*) ico="🚀" ;; *Direct*) ico="🧭" ;; *) ico="🔀" ;; esac
     echo -e "\n ${BOLD}${YEL}$ico $label${NC}\n    ${WHT}$link${NC}"
@@ -842,10 +850,11 @@ cmd_user_qr() {
   u=$(user_must "$name"); token=$(jq -r .token <<<"$u"); domain=$(st .domain)
   case $what in
     sub)    qr_show "https://$domain/$token.json" ;;
+    links)  qr_show "https://$domain/$token.txt" ;;
     xhttp)  qr_show "$(user_links "$name" | sed -n 1p | cut -d'|' -f2)" ;;
     vision) qr_show "$(user_links "$name" | sed -n 2p | cut -d'|' -f2)" ;;
     hy2)    qr_show "$(user_links "$name" | sed -n 3p | cut -d'|' -f2)" ;;
-    *) die "QR: sub | xhttp | vision | hy2" ;;
+    *) die "QR: sub | links | xhttp | vision | hy2" ;;
   esac
 }
 
@@ -928,7 +937,9 @@ cmd_ipwatch() {
     jq '.ips' <<<"$new" >"$IPS.tmp" && mv "$IPS.tmp" "$IPS"
     if [[ $old_act != "$new_act" ]]; then
       jq '.bans' <<<"$new" >"$BANS.tmp" && mv "$BANS.tmp" "$BANS"
-      jq -r --argjson old "$old_act" '.bans[] | select(. as $b | ($old | index({user: $b.user, ip: $b.ip})) == null) | "🚫 \(.user): лишний IP \(.ip) заблокирован"' <<<"$new"
+      local msg
+      msg=$(jq -r --argjson old "$old_act" '.bans[] | select(. as $b | ($old | index({user: $b.user, ip: $b.ip})) == null) | "🚫 \(.user): лишний IP \(.ip) заблокирован на 30 минут"' <<<"$new")
+      [[ -n $msg ]] && { echo "$msg"; bot_notify "$msg"; }
       apply_xray
     fi
   fi
@@ -1128,6 +1139,48 @@ cmd_report() {
   esac
 }
 
+# Уведомления об изменении статуса пользователей (лимит, срок) и о возвращении доступа.
+# Прошлые статусы хранятся в файле: так видно и то, что поменялось между проверками.
+bot_status_changes() {
+  bot_enabled || return 0
+  local f="$AX_ETC/.status-map" cur old n new
+  cur=$(user_summary | cut -f1,2)
+  if [[ -f $f ]]; then
+    old=$(<"$f")
+    while IFS=$'\t' read -r n new; do
+      local was; was=$(awk -F'\t' -v n="$n" '$1 == n {print $2}' <<<"$old")
+      [[ -n $was && $was != "$new" ]] || continue
+      if [[ $was == active ]]; then
+        case $new in limit) bot_notify "🚫 <b>$n</b>: исчерпан лимит трафика, доступ закрыт" ;; expired) bot_notify "⌛ <b>$n</b>: истёк срок, доступ закрыт" ;; esac
+      elif [[ $new == active ]]; then bot_notify "✅ <b>$n</b>: доступ снова открыт"; fi
+    done <<<"$cur"
+  fi
+  printf '%s\n' "$cur" >"$f"
+}
+
+# Раз в 5 минут: новая версия, срок сертификата, упавшие службы (каждое уведомление не чаще положенного)
+bot_watch() {
+  bot_enabled || return 0
+  [[ $DRY == 1 ]] && return 0
+  local latest today days svc_ last
+  latest=$(latest_ax)
+  if ver_gt "$latest" "$AX_VERSION" && [[ $(cat "$AX_ETC/.notified-version" 2>/dev/null) != "$latest" ]]; then
+    printf '%s\n' "$latest" >"$AX_ETC/.notified-version"
+    bot_notify "🆕 Доступна версия autoXRAY <b>$latest</b> (у вас $AX_VERSION). На сервере: <code>autoxray self-update</code>"
+  fi
+  today=$(date +%F)
+  if [[ -r /var/lib/xray/cert/fullchain.pem && $(cat "$AX_ETC/.notified-cert" 2>/dev/null) != "$today" ]]; then
+    days=$(days_left "$(date -d "$(openssl x509 -enddate -noout -in /var/lib/xray/cert/fullchain.pem | cut -d= -f2)" +%s)")
+    if [[ $days -le 7 ]]; then printf '%s\n' "$today" >"$AX_ETC/.notified-cert"; bot_notify "📜 Сертификат истекает через $days дн. Проверьте автообновление: <code>autoxray doctor</code>"; fi
+  fi
+  for svc_ in xray nginx; do
+    if ! systemctl is-active --quiet "$svc_" 2>/dev/null; then
+      last=$(cat "$AX_ETC/.notified-down-$svc_" 2>/dev/null || echo 0)
+      if [[ $(( $(now) - last )) -gt 3600 ]]; then printf '%s\n' "$(now)" >"$AX_ETC/.notified-down-$svc_"; bot_notify "🔥 Служба <b>$svc_</b> не запущена. Проверьте: <code>autoxray doctor</code>"; fi
+    fi
+  done
+}
+
 # Раз в 5 минут из cron: забирает счётчики Xray (с обнулением), накапливает в traffic.json,
 # отключает пользователей с исчерпанным лимитом или истёкшим сроком, обновляет страницы.
 cmd_collect() {
@@ -1157,6 +1210,8 @@ cmd_collect() {
   after=$(active_names)
   if [[ $before != "$after" ]]; then apply_xray; fi
   render_subs
+  bot_status_changes
+  bot_watch
 }
 
 # --------------------------------------------------- узлы моста (EU)
@@ -1467,6 +1522,7 @@ warp_rescan() { # [now]
   if [[ $best != "$cur" ]] && { [[ -z $cur_sc ]] || [[ $cur_sc -gt $(( bsc * 11 / 10 + 5 )) ]]; }; then act=change; fi
   locked warp_rescan_commit "$act"
   warp_log "режим $mode: лучший $best ($bsc мс), ${act/change/endpoint заменён (был $cur)}"
+  [[ $act == change ]] && bot_notify "🌍 WARP: endpoint заменён <code>$cur</code> → <code>$best</code> ($bsc мс)"
   [[ $force == now ]] && ok "✅ Готово: лучший $best ($bsc мс), $([[ $act == change ]] && echo заменён || echo "текущий оставлен")"
   return 0
 }
@@ -1772,33 +1828,110 @@ cmd_migrate() {
   warn "Прежний config.json сохранён: $AX_ETC/config.v2.json.bak"
 }
 
-# Обновление самого autoxray, шаблонов и компонентов до релиза (по умолчанию — последнего).
+# --------------------------------------- безопасное обновление: снимок, проверка, откат
+
+SNAP_DIR="${AX_SNAP_DIR:-/var/lib/autoxray/snapshots}"
+AX_BIN="${AX_BIN:-/usr/local/bin/autoxray}"
+RELEASE_FILES=(autoxray templates/sub.html templates/nginx.conf templates/report.html templates/gen_page.sh
+               components/telegram/install.sh components/telegram/update.sh components/telegram/uninstall.sh)
+
+# Снимок всего, что меняет обновление: скрипт, шаблоны, настройки, конфиги Xray и nginx, расписание
+snapshot_create() {
+  local f p paths=()
+  mkdir -p "$SNAP_DIR"; chmod 700 "$SNAP_DIR"
+  f="$SNAP_DIR/$(date +%Y%m%d-%H%M%S)-v$AX_VERSION.tar.gz"
+  for p in "$AX_BIN" "$TPL_DIR" "$AX_ETC" "$XRAY_CFG" "$NGX_CONF" "$NGX_MAP" /etc/cron.d/autoxray; do
+    [[ -e $p ]] && paths+=("${p#/}")
+  done
+  (umask 077; tar -C / -czf "$f" "${paths[@]}") || return 1
+  echo "$f"
+  # хранятся три последних снимка
+  ls -1t "$SNAP_DIR"/*.tar.gz 2>/dev/null | tail -n +4 | while read -r old; do rm -f "$old"; done
+}
+
+snapshot_restore() { # файл
+  tar -C / -xzf "$1" || return 1
+  svc daemon-reload; svc restart xray; svc reload nginx 2>/dev/null
+  return 0
+}
+
+# Проверка после обновления: конфиги, службы, подписка по HTTPS
+post_update_check() {
+  local d tok i
+  if command -v xray >/dev/null 2>&1; then xray run -test -c "$XRAY_CFG" >/dev/null 2>&1 || { warn "xray не принял конфиг"; return 1; }; fi
+  if command -v nginx >/dev/null 2>&1; then nginx -t >/dev/null 2>&1 || { warn "nginx не принял конфиг"; return 1; }; fi
+  if [[ $DRY != 1 ]]; then
+    systemctl is-active --quiet xray 2>/dev/null || { warn "xray не запущен"; return 1; }
+    systemctl is-active --quiet nginx 2>/dev/null || { warn "nginx не запущен"; return 1; }
+    d=$(st .domain); tok=$(jq -r '.users[0].token // empty' "$STATE")
+    if [[ -n $tok ]]; then
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        "$CURL" -fsS --max-time 6 --resolve "$d:443:127.0.0.1" "https://$d/$tok.json" >/dev/null 2>&1 && return 0
+        sleep 1
+      done
+      warn "подписка не отдаётся по https://$d/"; return 1
+    fi
+  fi
+  return 0
+}
+
+cmd_rollback() {
+  need_root
+  local want=${1:-} f list=()
+  mapfile -t list < <(ls -1t "$SNAP_DIR"/*.tar.gz 2>/dev/null)
+  [[ ${#list[@]} -gt 0 ]] || die "Снимков нет: $SNAP_DIR (они создаются перед каждым self-update)."
+  if [[ $want == list || -z $want && ! -t 0 ]]; then
+    section "🕘 Снимки"; for f in "${list[@]}"; do echo "  $(basename "$f")  $(du -h "$f" | cut -f1)"; done; return 0
+  fi
+  if [[ -z $want ]]; then
+    local labels=(); for f in "${list[@]}"; do labels+=("$(basename "$f" .tar.gz)"); done
+    choose "Вернуться к состоянию" "${labels[@]}" "🔙 Отмена" || return 0
+    [[ $CHOICE -lt ${#list[@]} ]] || return 0
+    f=${list[$CHOICE]}
+  elif [[ $want =~ ^[0-9]+$ && $want -ge 1 && $want -le ${#list[@]} ]]; then f=${list[$((want - 1))]}
+  elif [[ -f $want ]]; then f=$want
+  elif [[ -f $SNAP_DIR/$want ]]; then f=$SNAP_DIR/$want
+  else die "rollback [list|номер|файл]"; fi
+  confirm "Восстановить $(basename "$f")? Текущие настройки будут заменены" || die "Отменено."
+  snapshot_restore "$f" || die "Не удалось распаковать снимок"
+  ok "✅ Восстановлено: $(basename "$f")"
+}
+
+# Обновление autoxray, шаблонов и компонентов до релиза (по умолчанию последнего).
+# Перед заменой делается снимок; если после обновления конфиги или подписка не проходят проверку, всё возвращается назад.
 cmd_self_update() {
   need_root
-  local tag=${1:-} raw tmp f
+  local tag=${1:-} raw tmp f snap
   if [[ -z $tag ]]; then
-    tag=$("$CURL" -fsS --max-time 15 "https://api.github.com/repos/$AX_REPO/releases/latest" | jq -r '.tag_name // empty')
+    tag=$("$CURL" -fsS --max-time 15 "$API/repos/$AX_REPO/releases/latest" | jq -r '.tag_name // empty')
     [[ -n $tag ]] || die "Не удалось узнать последний релиз (GitHub API недоступен)."
   fi
   [[ $tag == v* ]] || tag="v$tag"
   [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Версия вида vX.Y.Z"
   [[ ${tag#v} == "$AX_VERSION" ]] && { ok "Уже установлена версия $AX_VERSION."; return 0; }
-  raw="https://raw.githubusercontent.com/$AX_REPO/$tag"
+  raw="${AX_RAW_BASE:-https://raw.githubusercontent.com/$AX_REPO}/$tag"
   tmp=$(mktemp -d)
-  for f in autoxray templates/sub.html templates/nginx.conf templates/report.html components/telegram/install.sh components/telegram/update.sh components/telegram/uninstall.sh; do
+  for f in "${RELEASE_FILES[@]}"; do
     mkdir -p "$tmp/$(dirname "$f")"
-    "$CURL" -fsSL --max-time 30 "$raw/$f" -o "$tmp/$f" || { rm -rf "$tmp"; die "Не удалось скачать $f ($tag)"; }
+    "$CURL" -fsSL --max-time 30 "$raw/$f" -o "$tmp/$f" || { rm -rf "${tmp:?}"; die "Не удалось скачать $f ($tag)"; }
   done
-  bash -n "$tmp/autoxray" || { rm -rf "$tmp"; die "Скачанный autoxray не прошёл проверку синтаксиса."; }
-  install -m 755 "$tmp/autoxray" /usr/local/bin/autoxray
+  bash -n "$tmp/autoxray" || { rm -rf "${tmp:?}"; die "Скачанный autoxray не прошёл проверку синтаксиса."; }
+  snap=$(snapshot_create) || { rm -rf "${tmp:?}"; die "Не удалось сделать снимок перед обновлением."; }
+  echo -e " 💾 ${DIM}Снимок для отката: $snap${NC}"
+  install -m 755 "$tmp/autoxray" "$AX_BIN"
   mkdir -p "$TPL_DIR/telegram"
-  install -m 644 "$tmp/templates/sub.html" "$tmp/templates/nginx.conf" "$tmp/templates/report.html" "$TPL_DIR/"
+  install -m 644 "$tmp"/templates/* "$TPL_DIR/"
   install -m 755 "$tmp"/components/telegram/*.sh "$TPL_DIR/telegram/"
-  rm -rf "$tmp"
+  rm -rf "${tmp:?}"
+  if ! { "$AX_BIN" setup-cron && "$AX_BIN" render && "$AX_BIN" selfcheck; }; then
+    warn "Новая версия не прошла проверку. Возвращаю $AX_VERSION."
+    snapshot_restore "$snap" || die "Откат не удался, снимок: $snap"
+    die "Обновление до ${tag#v} отменено, восстановлено состояние $AX_VERSION."
+  fi
   ok "✅ autoxray $AX_VERSION → ${tag#v}. Заметки: https://github.com/$AX_REPO/releases/tag/$tag"
-  /usr/local/bin/autoxray setup-cron
-  /usr/local/bin/autoxray render
+  echo -e " ${DIM}Откат при необходимости: autoxray rollback${NC}"
 }
+
 
 # Обновление geoip.dat / geosite.dat (на них опираются правила маршрутизации). Перезапуск Xray — только при изменении.
 cmd_geo_update() {
@@ -1868,6 +2001,9 @@ cmd_doctor() {
   echo -e "\n ${BOLD}Система${NC}"
   local use; use=$(df -P / | awk 'NR == 2 {gsub("%", "", $5); print $5}')
   [[ ${use:-0} -ge 90 ]] && warn_ "диск заполнен на ${use}%" "очистите журналы и старые бэкапы" || pass_ "диск: занято ${use:-?}%"
+  if [[ $(st '.bot.enabled // false') == true ]]; then
+    systemctl is-active --quiet autoxray-bot 2>/dev/null && pass_ "Telegram-бот работает" || warn_ "Telegram-бот включён, но служба не запущена" "systemctl status autoxray-bot; autoxray bot on"
+  fi
   local lsz; lsz=$(stat -c %s "$ACCESS_LOG" 2>/dev/null || echo 0)
   if [[ $lsz -gt 5242880 ]]; then warn_ "лог доступа $(hbytes "$lsz")" "должен очищаться раз в минуту: проверьте cron (/etc/cron.d/autoxray), autoxray ipwatch"
   elif [[ $lsz -gt 0 ]] && ! jq -e 'any(.users[]; .enabled and ((.ip_limit // 0) > 0))' "$STATE" >/dev/null 2>&1; then
@@ -1910,6 +2046,381 @@ cmd_firewall() {
   ok "✅ Файрвол включён."; ufw status | sed 's/^/   /'
 }
 
+# ---------------------------------------------------------- сайт-маскировка
+
+# site regenerate — новый случайный дизайн; site set <папка> — свой сайт (статика, нужен index.html)
+cmd_site() {
+  need_root; need_state
+  local sub=${1:-status} web dir; shift || true
+  web=$(st .web)
+  case $sub in
+    regenerate|new)
+      [[ -f $TPL_DIR/gen_page.sh ]] || die "Нет $TPL_DIR/gen_page.sh (autoxray self-update)."
+      bash "$TPL_DIR/gen_page.sh" "$web" "$(st .paths.auth)" >/dev/null || die "Генератор сайта завершился с ошибкой"
+      chmod -R a+rX "$web"; st_edit '.site = {mode: "generated"}'
+      ok "✅ Сайт-маскировка пересоздана: новый дизайн, тексты и идентификаторы." ;;
+    set)
+      dir=${1:-}; [[ -d $dir && -f $dir/index.html ]] || die "site set <папка>: нужна папка со статическим сайтом (index.html внутри)."
+      cp -a "$dir"/. "$web"/ || die "Не удалось скопировать сайт"
+      chmod -R a+rX "$web"; st_edit --arg d "$dir" '.site = {mode: "custom", source: $d}'
+      render_subs
+      ok "✅ Сайт из $dir установлен."
+      warn "Файлы с именами из 20-32 латинских букв и цифр с расширением .json, .html или .txt зарезервированы под подписки и удаляются." ;;
+    status)
+      section "🌐 Сайт-маскировка"
+      kv "📁" "Папка" "$web"
+      local mode_; mode_=$(st '.site.mode // "generated"')
+      [[ $mode_ == custom ]] && mode_+=" ($(st '.site.source // empty'))"
+      kv "🎨" "Режим" "$mode_"
+      kv "📝" "Страница" "$(stat -c '%y' "$web/index.html" 2>/dev/null | cut -d. -f1) $(hbytes "$(stat -c %s "$web/index.html" 2>/dev/null || echo 0)")"
+      echo -e " ${DIM}Новый случайный: autoxray site regenerate. Свой сайт: autoxray site set <папка>${NC}" ;;
+    *) die "site: status | regenerate | set <папка>" ;;
+  esac
+}
+
+# ------------------------------------------------------ Telegram-бот администратора
+# Бот работает как служба (long polling) и отвечает только администраторам из списка ID. Токен хранится в
+# /etc/autoxray/bot.token (права 600) и передаётся curl через stdin, а не аргументами. Опасные действия идут через подтверждение.
+# Кроме команд бот присылает уведомления: лимит и срок, блокировка IP, смена endpoint WARP, новая версия, сертификат, упавшие службы.
+
+TG_API="${AX_TG_API:-https://api.telegram.org}"
+BOT_TOKEN_FILE="$AX_ETC/bot.token"
+BOT_UNIT="${AX_UNIT_DIR:-/etc/systemd/system}/autoxray-bot.service"
+
+bot_enabled() { [[ -s $BOT_TOKEN_FILE ]] && [[ $(st '.bot.enabled // false') == true ]]; }
+strip_ansi() { sed 's/\x1b\[[0-9;?]*[A-Za-z]//g'; }
+
+tg_cfg() { printf 'url = "%s/bot%s/%s"\n' "$TG_API" "$(cat "$BOT_TOKEN_FILE" 2>/dev/null)" "$1"; }
+tg_proxy() { local p; p=$(st '.bot.proxy // empty'); [[ -n $p ]] && printf '%s\n' --proxy "$p"; return 0; }
+
+# tg_call <метод> <json> [таймаут] — ответ API в stdout
+tg_call() {
+  local px=() line
+  while IFS= read -r line; do px+=("$line"); done < <(tg_proxy)
+  curl -sS --max-time "${3:-${AX_TG_TIMEOUT:-70}}" "${px[@]}" -H 'Content-Type: application/json' -d "${2:-{\}}" -K <(tg_cfg "$1")
+}
+
+tg_send() { # chat text [клавиатура json] [таймаут]
+  local payload
+  payload=$(jq -n --arg c "$1" --arg t "$2" --argjson m "${3:-null}" \
+    '{chat_id: ($c | tonumber), text: $t, parse_mode: "HTML", disable_web_page_preview: true} + (if $m != null then {reply_markup: $m} else {} end)')
+  tg_call sendMessage "$payload" "${4:-}" >/dev/null
+}
+tg_edit() { # chat message_id text [клавиатура json]
+  local payload
+  payload=$(jq -n --arg c "$1" --arg i "$2" --arg t "$3" --argjson m "${4:-null}" \
+    '{chat_id: ($c | tonumber), message_id: ($i | tonumber), text: $t, parse_mode: "HTML", disable_web_page_preview: true} + (if $m != null then {reply_markup: $m} else {} end)')
+  tg_call editMessageText "$payload" >/dev/null
+}
+tg_answer() { tg_call answerCallbackQuery "$(jq -n --arg i "$1" --arg t "${2:-}" '{callback_query_id: $i, text: $t}')" 15 >/dev/null; }
+tg_photo() { # chat файл подпись
+  local px=() line
+  while IFS= read -r line; do px+=("$line"); done < <(tg_proxy)
+  curl -sS --max-time 30 "${px[@]}" -F "chat_id=$1" -F "photo=@$2" -F "caption=$3" -F parse_mode=HTML -K <(tg_cfg sendPhoto) >/dev/null
+}
+tg_pre() { printf '<pre>%s</pre>' "$(strip_ansi | head -c 3500 | html_esc)"; }   # вывод команды -> блок кода
+
+bot_admins() { jq -r '(.bot.admins // [])[]' "$STATE"; }
+bot_is_admin() { jq -e --argjson i "$1" '(.bot.admins // []) | index($i) != null' "$STATE" >/dev/null 2>&1; }
+
+# Уведомление всем администраторам (не мешает работе, если Telegram недоступен)
+bot_notify() {
+  bot_enabled || return 0
+  local a; for a in $(bot_admins); do tg_send "$a" "$1" "" 8 || true; done
+  return 0
+}
+
+BOT_MAIN_KB='{"inline_keyboard":[[{"text":"📊 Статус","callback_data":"status"},{"text":"👥 Пользователи","callback_data":"list"}],[{"text":"🩺 Диагностика","callback_data":"doctor"},{"text":"🌍 WARP","callback_data":"warp"}]]}'
+
+bot_help() {
+  cat <<'EOF'
+<b>autoXRAY: управление сервером</b>
+
+/status — состояние
+/users — пользователи (кнопки)
+/user <code>имя</code> — карточка
+/add <code>имя [ГБ] [дней]</code> — новый пользователь
+/link <code>имя</code> — ссылки
+/limit <code>имя ГБ</code> — лимит трафика (0 без лимита)
+/days <code>имя дней</code> — срок (0 бессрочно)
+/ips <code>имя N</code> — лимит устройств (0 без лимита)
+/ru <code>имя direct|server</code> — российские сайты
+/report <code>имя on|off</code> — отчёт о посещениях
+/enable, /disable <code>имя</code>
+/del <code>имя</code> — удалить (с подтверждением)
+/stats — трафик
+/doctor — диагностика
+/warp — состояние WARP
+/id — ваш Telegram ID
+EOF
+}
+
+# Карточка пользователя (текст HTML) и клавиатура
+bot_user_card() {
+  local line name status used limit expire ipl ru rpt icon label pct="" left="∞" ipt="∞" rul rptt
+  line=$(user_summary | awk -F'\t' -v n="$1" '$1 == n') || true
+  [[ -n $line ]] || return 1
+  IFS=$'\t' read -r name status used limit expire ipl ru rpt <<<"$line"
+  case $status in active) icon="🟢"; label="активен" ;; disabled) icon="⚫"; label="отключён" ;; expired) icon="⌛"; label="срок истёк" ;; limit) icon="🚫"; label="лимит" ;; *) icon="❔"; label=$status ;; esac
+  [[ $limit -gt 0 ]] && pct=" ($(( used * 100 / limit ))%)"
+  [[ $expire -gt 0 ]] && left="$(hdate "$expire") ($(days_left "$expire") дн.)"
+  [[ ${ipl:-0} -gt 0 ]] && ipt="$(ips_count "$name")/$ipl"
+  [[ $ru == server ]] && rul="через сервер" || rul="напрямую"
+  [[ $rpt == true ]] && rptt="вкл" || rptt="выкл"
+  printf '👤 <b>%s</b>  %s %s\n📊 %s%s%s\n⏳ срок: %s\n📱 IP: %s   🇷🇺 RU: %s   📈 отчёт: %s' \
+    "$name" "$icon" "$label" "$(hbytes "$used")" "$([[ $limit -gt 0 ]] && echo " / $(hbytes "$limit")")" "$pct" "$left" "$ipt" "$rul" "$rptt"
+}
+bot_user_kb() {
+  local n=$1 enabled
+  enabled=$(jq -r --arg n "$n" '.users[] | select(.name == $n) | .enabled' "$STATE")
+  jq -nc --arg n "$n" --arg tog "$([[ $enabled == true ]] && echo "⏸ Отключить" || echo "▶️ Включить")" '
+    {inline_keyboard: [
+      [{text: "🔗 Ссылки", callback_data: "u:\($n):links"}, {text: "📷 QR", callback_data: "u:\($n):qr"}],
+      [{text: "∞", callback_data: "u:\($n):lim:0"}, {text: "10 ГБ", callback_data: "u:\($n):lim:10"}, {text: "50 ГБ", callback_data: "u:\($n):lim:50"}, {text: "100 ГБ", callback_data: "u:\($n):lim:100"}],
+      [{text: $tog, callback_data: "u:\($n):tog"}, {text: "🔁 Новые ключи", callback_data: "u:\($n):rot"}],
+      [{text: "📈 Отчёт", callback_data: "u:\($n):rep"}, {text: "🗑 Удалить", callback_data: "u:\($n):del"}],
+      [{text: "⬅️ К списку", callback_data: "list"}]]}'
+}
+bot_confirm_kb() { jq -nc --arg y "$1" --arg n "$2" '{inline_keyboard: [[{text: "✅ Да", callback_data: $y}, {text: "↩️ Отмена", callback_data: $n}]]}'; }
+
+bot_list_kb() {
+  local rows="[]" name status used limit expire ipl ru rpt ic lbl
+  while IFS=$'\t' read -r name status used limit expire ipl ru rpt; do
+    case $status in active) ic="🟢" ;; disabled) ic="⚫" ;; expired) ic="⌛" ;; limit) ic="🚫" ;; *) ic="❔" ;; esac
+    lbl="$ic $name  $(hbytes "$used")"; [[ $limit -gt 0 ]] && lbl+=" / $(hbytes "$limit")"
+    rows=$(jq -c --arg t "$lbl" --arg d "u:$name" '. + [[{text: $t, callback_data: $d}]]' <<<"$rows")
+  done < <(user_summary)
+  jq -c '{inline_keyboard: (. + [[{text: "➕ Новый пользователь", callback_data: "new"}]])}' <<<"$rows"
+}
+
+# Выполняет CLI-действие в подпроцессе (die/exit не должны останавливать бота); вывод в BOT_OUT, код в BOT_RC
+BOT_OUT=""; BOT_RC=0
+bot_do() {
+  local out; out=$( ( "$@" ) 2>&1; echo "@@RC=$?" )
+  BOT_RC=${out##*@@RC=}; BOT_OUT=$(printf '%s' "${out%@@RC=*}" | strip_ansi)
+}
+
+bot_links_text() {
+  local name=$1 domain token label link txt
+  domain=$(st .domain); token=$(jq -r --arg n "$name" '.users[] | select(.name == $n) | .token' "$STATE")
+  txt="🔗 <b>$name</b>\n\n📄 Страница: https://$domain/$token.html\n📥 Подписка (Happ, v2rayTun): https://$domain/$token.json\n📱 Универсальная: https://$domain/$token.txt"
+  while IFS='|' read -r label link; do txt+="\n\n<b>$(html_esc <<<"$label")</b>\n<code>$(html_esc <<<"$link")</code>"; done < <(user_links "$name")
+  printf '%b' "$txt"
+}
+
+bot_send_qr() { # chat имя
+  local name=$1 domain token f
+  command -v qrencode >/dev/null 2>&1 || { tg_send "$1" "qrencode не установлен: apt install qrencode"; return 0; }
+  domain=$(st .domain); token=$(jq -r --arg n "$name" '.users[] | select(.name == $n) | .token' "$STATE")
+  f=$(mktemp --suffix=.png); qrencode -t PNG -s 8 -m 2 -o "$f" "https://$domain/$token.json"
+  tg_photo "$2" "$f" "📷 $name: подписка"; rm -f "$f"
+}
+
+bot_show_user() { # chat message_id|"" имя
+  local card kb
+  card=$(bot_user_card "$3") || { tg_send "$1" "Пользователь не найден."; return 0; }
+  kb=$(bot_user_kb "$3")
+  if [[ -n $2 ]]; then tg_edit "$1" "$2" "$card" "$kb"; else tg_send "$1" "$card" "$kb"; fi
+}
+bot_show_list() { # chat message_id|""
+  local text="👥 <b>Пользователи</b>" kb; kb=$(bot_list_kb)
+  if [[ -n $2 ]]; then tg_edit "$1" "$2" "$text" "$kb"; else tg_send "$1" "$text" "$kb"; fi
+}
+
+bot_report_text() { # результат bot_do
+  if [[ $BOT_RC -eq 0 ]]; then echo "✅ Готово"; else printf '❌ <pre>%s</pre>' "$(html_esc <<<"${BOT_OUT:0:900}")"; fi
+}
+
+bot_callback() { # chat message_id callback_id data
+  local chat=$1 mid=$2 cbid=$3 data=$4 a b c d name
+  IFS=: read -r a b c d <<<"$data"
+  tg_answer "$cbid"
+  case $a in
+    list) bot_show_list "$chat" "$mid" ;;
+    new) tg_send "$chat" "Создайте пользователя: <code>/add имя [ГБ] [дней]</code>" ;;
+    status) bot_do cmd_status; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" "$BOT_MAIN_KB" ;;
+    doctor) bot_do cmd_doctor; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" ;;
+    warp) bot_do cmd_warp status; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" ;;
+    u)
+      name=$b; valid_name "$name" && [[ -n $(user_get "$name") ]] || { tg_send "$chat" "Пользователь не найден."; return 0; }
+      case $c in
+        "") bot_show_user "$chat" "$mid" "$name" ;;
+        links) tg_send "$chat" "$(bot_links_text "$name")" ;;
+        qr) bot_send_qr "$chat" "$name" ;;
+        lim) [[ $d =~ ^[0-9]+$ ]] || return 0; bot_do locked cmd_user_set "$name" --limit "$d"; bot_show_user "$chat" "$mid" "$name" ;;
+        tog) if [[ $(jq -r --arg n "$name" '.users[] | select(.name == $n) | .enabled' "$STATE") == true ]]
+             then bot_do locked cmd_user_set "$name" --disable; else bot_do locked cmd_user_set "$name" --enable; fi
+             bot_show_user "$chat" "$mid" "$name" ;;
+        rot) tg_edit "$chat" "$mid" "🔁 Выпустить новые ключи для <b>$name</b>? Старая ссылка перестанет работать." "$(bot_confirm_kb "u:$name:rotok" "u:$name")" ;;
+        rotok) bot_do locked cmd_user_rotate "$name"; tg_send "$chat" "$(bot_report_text)"; [[ $BOT_RC -eq 0 ]] && tg_send "$chat" "$(bot_links_text "$name")" ;;
+        del) tg_edit "$chat" "$mid" "🗑 Удалить <b>$name</b> без возможности восстановления?" "$(bot_confirm_kb "u:$name:delok" "u:$name")" ;;
+        delok) bot_do locked cmd_user_del "$name"; tg_send "$chat" "$(bot_report_text)"; bot_show_list "$chat" "$mid" ;;
+        rep) if [[ $(jq -r --arg n "$name" '.users[] | select(.name == $n) | (.report // false)' "$STATE") == true ]]
+             then tg_edit "$chat" "$mid" "📈 Выключить отчёт о посещениях <b>$name</b> и удалить страницу?" "$(bot_confirm_kb "u:$name:repoff" "u:$name")"
+             else tg_edit "$chat" "$mid" "📈 Включить отчёт о посещениях <b>$name</b>? Будут записываться сайты и IP, на которые он заходит. Предупредите пользователя." "$(bot_confirm_kb "u:$name:repon" "u:$name")"; fi ;;
+        repon) bot_do locked cmd_user_set "$name" --report on; tg_send "$chat" "$(bot_report_text)"; bot_show_user "$chat" "$mid" "$name" ;;
+        repoff) bot_do locked cmd_user_set "$name" --report off; bot_show_user "$chat" "$mid" "$name" ;;
+      esac ;;
+  esac
+}
+
+bot_command() { # chat текст
+  local chat=$1 text=$2 cmd rest a name
+  read -r cmd rest <<<"$text"; cmd=${cmd%%@*}; read -ra a <<<"$rest"; name=${a[0]:-}
+  need_name() { valid_name "$name" && [[ -n $(user_get "$name") ]] || { tg_send "$chat" "Укажите существующего пользователя: <code>$cmd имя</code>"; return 1; }; }
+  case $cmd in
+    /start|/help) tg_send "$chat" "$(bot_help)" "$BOT_MAIN_KB" ;;
+    /status) bot_do cmd_status; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" "$BOT_MAIN_KB" ;;
+    /users) bot_show_list "$chat" "" ;;
+    /user) need_name && bot_show_user "$chat" "" "$name" ;;
+    /add)
+      valid_name "$name" || { tg_send "$chat" "Имя: латиница, цифры, _ и -, до 24 символов. Пример: <code>/add anna 50 30</code>"; return 0; }
+      [[ -z $(user_get "$name") ]] || { tg_send "$chat" "Такой пользователь уже есть."; return 0; }
+      local args=()
+      [[ -n ${a[1]:-} ]] && { is_num "${a[1]}" || { tg_send "$chat" "ГБ: число"; return 0; }; args+=(--limit "${a[1]}"); }
+      [[ -n ${a[2]:-} ]] && { is_num "${a[2]}" || { tg_send "$chat" "Дней: число"; return 0; }; args+=(--days "${a[2]}"); }
+      bot_do locked cmd_user_add "$name" "${args[@]}"
+      if [[ $BOT_RC -eq 0 ]]; then tg_send "$chat" "✅ Пользователь <b>$name</b> создан"; bot_show_user "$chat" "" "$name"; tg_send "$chat" "$(bot_links_text "$name")"
+      else tg_send "$chat" "$(bot_report_text)"; fi ;;
+    /link) need_name && tg_send "$chat" "$(bot_links_text "$name")" ;;
+    /limit) need_name || return 0; is_num "${a[1]:-}" || { tg_send "$chat" "Пример: <code>/limit $name 50</code>"; return 0; }
+      bot_do locked cmd_user_set "$name" --limit "${a[1]}"; tg_send "$chat" "$(bot_report_text)" ;;
+    /days) need_name || return 0; [[ ${a[1]:-} =~ ^[0-9]+$ ]] || { tg_send "$chat" "Пример: <code>/days $name 30</code>"; return 0; }
+      bot_do locked cmd_user_set "$name" --days "${a[1]}"; tg_send "$chat" "$(bot_report_text)" ;;
+    /ips) need_name || return 0; [[ ${a[1]:-} =~ ^[0-9]+$ ]] || { tg_send "$chat" "Пример: <code>/ips $name 3</code>"; return 0; }
+      bot_do locked cmd_user_set "$name" --ips "${a[1]}"; tg_send "$chat" "$(bot_report_text)" ;;
+    /ru) need_name || return 0; [[ ${a[1]:-} =~ ^(direct|server)$ ]] || { tg_send "$chat" "Пример: <code>/ru $name server</code>"; return 0; }
+      bot_do locked cmd_user_set "$name" --ru "${a[1]}"; tg_send "$chat" "$(bot_report_text)" ;;
+    /report) need_name || return 0; [[ ${a[1]:-} =~ ^(on|off)$ ]] || { tg_send "$chat" "Пример: <code>/report $name on</code>"; return 0; }
+      bot_do locked cmd_user_set "$name" --report "${a[1]}"; tg_send "$chat" "$(bot_report_text)" ;;
+    /enable) need_name || return 0; bot_do locked cmd_user_set "$name" --enable; bot_show_user "$chat" "" "$name" ;;
+    /disable) need_name || return 0; bot_do locked cmd_user_set "$name" --disable; bot_show_user "$chat" "" "$name" ;;
+    /del) need_name || return 0; tg_send "$chat" "🗑 Удалить <b>$name</b> без возможности восстановления?" "$(bot_confirm_kb "u:$name:delok" "u:$name")" ;;
+    /stats) bot_do cmd_stats; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" ;;
+    /doctor) bot_do cmd_doctor; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" ;;
+    /warp) bot_do cmd_warp status; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" ;;
+    *) tg_send "$chat" "Не знаю такой команды. /help" ;;
+  esac
+}
+
+bot_handle_update() { # json одного update
+  local u=$1 uid chat ctype text cbid data mid
+  uid=$(jq -r '(.message.from.id // .callback_query.from.id // empty)' <<<"$u")
+  chat=$(jq -r '(.message.chat.id // .callback_query.message.chat.id // empty)' <<<"$u")
+  ctype=$(jq -r '(.message.chat.type // .callback_query.message.chat.type // empty)' <<<"$u")
+  text=$(jq -r '.message.text // empty' <<<"$u")
+  cbid=$(jq -r '.callback_query.id // empty' <<<"$u"); data=$(jq -r '.callback_query.data // empty' <<<"$u")
+  mid=$(jq -r '.callback_query.message.message_id // empty' <<<"$u")
+  [[ -n $uid && -n $chat ]] || return 0
+  # /id работает у всех: так проще узнать свой числовой ID для настройки
+  if [[ $text == /id || $text == /id@* ]]; then tg_send "$chat" "Ваш Telegram ID: <code>$uid</code>"; return 0; fi
+  bot_is_admin "$uid" || return 0                      # посторонним бот не отвечает
+  [[ $ctype == private ]] || return 0                  # только личные чаты
+  if [[ -n $cbid ]]; then bot_callback "$chat" "$mid" "$cbid" "$data"
+  elif [[ $text == /* ]]; then bot_command "$chat" "$text"; fi
+}
+
+cmd_bot_run() {
+  need_state
+  [[ -s $BOT_TOKEN_FILE ]] || die "Бот не настроен: autoxray bot setup"
+  local off resp upd poll=${AX_TG_POLL:-50}
+  off=$(cat "$AX_ETC/bot.offset" 2>/dev/null || echo 0)
+  trap 'exit 0' TERM INT
+  echo "autoxray bot: запущен (long polling, администраторов: $(bot_admins | wc -l))"
+  while true; do
+    resp=$(tg_call getUpdates "$(jq -nc --argjson o "$off" --argjson t "$poll" '{offset: $o, timeout: $t, allowed_updates: ["message", "callback_query"]}')") || { sleep 5; continue; }
+    jq -e '.ok == true' <<<"$resp" >/dev/null 2>&1 || { sleep 5; continue; }
+    while IFS= read -r upd; do
+      [[ -n $upd ]] || continue
+      off=$(( $(jq -r '.update_id' <<<"$upd") + 1 ))
+      printf '%s\n' "$off" >"$AX_ETC/bot.offset"
+      ( bot_handle_update "$upd" ) || true
+    done < <(jq -c '.result[]?' <<<"$resp")
+  done
+}
+
+bot_write_unit() {
+  mkdir -p "$(dirname "$BOT_UNIT")"
+  cat >"$BOT_UNIT" <<EOF
+[Unit]
+Description=autoXRAY Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$AX_BIN bot run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+bot_setup() { # [--token T] [--admin ID] [--proxy URL]
+  local tok="" adm="" prx="" me uname base resp first fn fid a
+  while (($#)); do case $1 in --token) tok=${2:-}; shift ;; --admin) adm=${2:-}; shift ;; --proxy) prx=${2:-}; shift ;; esac; shift; done
+  if [[ -z $tok ]]; then
+    echo -e " ${BOLD}1.${NC} Создайте бота у @BotFather (команда /newbot) и скопируйте токен."
+    read -rsp "$(echo -e " ${BOLD}${CYAN}›${NC} Токен бота: ")" tok; echo
+  fi
+  [[ $tok =~ ^[0-9]+:[A-Za-z0-9_-]{20,}$ ]] || die "Это не похоже на токен бота (вид 123456:ABC...)"
+  (umask 077; printf '%s\n' "$tok" >"$BOT_TOKEN_FILE")
+  [[ -n $prx ]] && st_edit --arg p "$prx" '.bot = ((.bot // {}) + {proxy: $p})'
+  me=$(tg_call getMe '{}' 20) || me=""
+  if ! jq -e '.ok == true' <<<"$me" >/dev/null 2>&1; then
+    rm -f "$BOT_TOKEN_FILE"
+    die "Telegram не принял токен или api.telegram.org недоступен с этого сервера. Для доступа через прокси: --proxy socks5h://адрес:порт"
+  fi
+  uname=$(jq -r '.result.username' <<<"$me")
+  if [[ -z $adm ]]; then
+    echo -e " ${BOLD}2.${NC} Откройте ${CYAN}https://t.me/$uname${NC} и отправьте боту любое сообщение. Жду до двух минут..."
+    base=$(tg_call getUpdates '{"offset": -1, "timeout": 0}' 20 | jq -r '(.result[-1].update_id // 0)')
+    for _ in $(seq 1 24); do
+      resp=$(tg_call getUpdates "$(jq -nc --argjson o "$((base + 1))" '{offset: $o, timeout: 5, allowed_updates: ["message"]}')" 20) || continue
+      first=$(jq -c '[.result[]? | select(.message.chat.type == "private")] | .[0] // empty' <<<"$resp")
+      [[ -n $first ]] && break
+    done
+    [[ -n $first ]] || die "Сообщение не получено. Повторите: autoxray bot setup"
+    fid=$(jq -r '.message.from.id' <<<"$first"); fn=$(jq -r '.message.from | (.first_name // "") + " " + ("@" + (.username // "-"))' <<<"$first")
+    echo -e " Сообщение от ${BOLD}$fn${NC}, ID ${BOLD}$fid${NC}."
+    confirm "Сделать этого пользователя администратором" || die "Отменено."
+    adm=$fid
+  fi
+  [[ $adm =~ ^[0-9]+$ ]] || die "ID администратора: число"
+  st_edit --argjson a "$adm" '.bot = ((.bot // {}) + {enabled: true, admins: (((.bot.admins // []) + [$a]) | unique)})'
+  bot_write_unit; svc daemon-reload; svc enable --now autoxray-bot
+  tg_send "$adm" "✅ <b>autoXRAY</b>: бот подключён. Нажмите /help." "$BOT_MAIN_KB" 10 || true
+  ok "✅ Бот @$uname настроен, администратор: $adm"
+}
+
+cmd_bot() {
+  need_root; need_state
+  local sub=${1:-status} a; shift || true
+  case $sub in
+    setup) bot_setup "$@" ;;
+    run) cmd_bot_run ;;
+    status)
+      section "🤖 Telegram-бот"
+      kv "🔌" "Состояние" "$(tick "$(st '.bot.enabled // false')") включён   служба: $(systemctl is-active autoxray-bot 2>/dev/null || echo "нет")"
+      kv "👮" "Администраторы" "$(bot_admins | tr '\n' ' ')"
+      if [[ -s $BOT_TOKEN_FILE ]]; then kv "🆔" "Бот" "@$(tg_call getMe '{}' 10 | jq -r '.result.username // "нет связи с Telegram"')"; fi
+      echo -e " ${DIM}Настроить: autoxray bot setup. Администратор: bot add-admin <ID> (свой ID покажет команда /id в боте)${NC}" ;;
+    on) [[ -s $BOT_TOKEN_FILE ]] || die "Сначала: autoxray bot setup"; st_edit '.bot.enabled = true'; bot_write_unit; svc daemon-reload; svc enable --now autoxray-bot; ok "✅ Бот включён" ;;
+    off) st_edit '.bot.enabled = false'; svc disable --now autoxray-bot 2>/dev/null; ok "✅ Бот выключен" ;;
+    add-admin) a=${1:-}; [[ $a =~ ^[0-9]+$ ]] || die "bot add-admin <числовой ID>"
+      st_edit --argjson a "$a" '.bot.admins = (((.bot.admins // []) + [$a]) | unique)'; ok "✅ Администратор $a добавлен" ;;
+    del-admin) a=${1:-}; [[ $a =~ ^[0-9]+$ ]] || die "bot del-admin <числовой ID>"
+      st_edit --argjson a "$a" '.bot.admins = ((.bot.admins // []) - [$a])'; ok "✅ Администратор $a удалён" ;;
+    proxy) [[ -n ${1:-} ]] || die "bot proxy <socks5h://адрес:порт | off>"
+      if [[ $1 == off ]]; then st_edit '.bot.proxy = ""'; else st_edit --arg p "$1" '.bot.proxy = $p'; fi; ok "✅ Прокси для Telegram: $1" ;;
+    test) bot_enabled || die "Бот не включён"; bot_notify "🔔 Проверка уведомлений autoXRAY"; ok "✅ Отправлено" ;;
+    remove) svc disable --now autoxray-bot 2>/dev/null; rm -f "$BOT_UNIT" "$BOT_TOKEN_FILE" "$AX_ETC/bot.offset"; st_edit 'del(.bot)'; svc daemon-reload; ok "✅ Бот удалён" ;;
+    *) die "bot: setup | status | on | off | add-admin <ID> | del-admin <ID> | proxy <url|off> | test | remove" ;;
+  esac
+}
+
 # Полное удаление: Telegram Web Proxy, Xray, nginx, acme.sh, данные и сам autoxray.
 cmd_uninstall() {
   need_root; need_state
@@ -1917,6 +2428,7 @@ cmd_uninstall() {
   warn "Будут удалены: Xray, nginx, acme.sh, сайт-маскировка ($web), Telegram Web Proxy, ключи и данные пользователей."
   warn "Сначала сделайте бэкап, если он может понадобиться: autoxray backup"
   read -rp "Для подтверждения введите yes: " a; [[ $a == yes ]] || die "Отменено."
+  svc disable --now autoxray-bot 2>/dev/null; rm -f "$BOT_UNIT"
   [[ -f $TPL_DIR/telegram/uninstall.sh ]] && bash "$TPL_DIR/telegram/uninstall.sh" || true
   bash -c "$("$CURL" -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge
   svc disable --now nginx 2>/dev/null; apt-get remove -y nginx >/dev/null 2>&1
@@ -2147,7 +2659,7 @@ menu_update() {
     kv "🔐" "autoxray" "${BOLD}$AX_VERSION${NC} $(ver_gt "$latest" "$AX_VERSION" && echo -e "${GRN}→ доступна $latest${NC}" || echo -e "${DIM}последняя версия${NC}")"
     kv "⚙️ " "Xray" "${BOLD}$(xray_version)${NC} ${DIM}(проверено с релизом: $XRAY_TESTED)${NC}"
     echo
-    choose "Что обновить" "📦 autoxray (скрипты и шаблоны)" "⚙️  Ядро Xray: версии и обновление" "🗺 Гео-данные (geoip, geosite)" "🔙 Назад" || return 0
+    choose "Что обновить" "📦 autoxray (скрипты и шаблоны)" "⚙️  Ядро Xray: версии и обновление" "🗺 Гео-данные (geoip, geosite)" "🕘 Откат к предыдущей версии" "🔙 Назад" || return 0
     case $CHOICE in
       0) (cmd_self_update); pause ;;
       1) newer=$(core_newer)
@@ -2160,7 +2672,40 @@ menu_update() {
            fi
          fi; pause ;;
       2) (cmd_geo_update); pause ;;
-      3) return 0 ;;
+      3) (cmd_rollback); pause ;;
+      4) return 0 ;;
+    esac
+  done
+}
+
+menu_bot() {
+  local id
+  while true; do
+    clear; cmd_bot status; echo
+    choose "Telegram-бот" "⚙️  Настроить (токен и первый администратор)" "➕ Добавить администратора по ID" "🔔 Тестовое уведомление" \
+      "🟢 Включить" "🔴 Выключить" "🗑 Удалить бота" "🔙 Назад" || return 0
+    case $CHOICE in
+      0) (cmd_bot setup); pause ;;
+      1) id=$(ask "Числовой Telegram ID (его покажет команда /id в боте)"); [[ -n $id ]] && (cmd_bot add-admin "$id"); pause ;;
+      2) (cmd_bot test); pause ;;
+      3) (cmd_bot on); pause ;;
+      4) (cmd_bot off); pause ;;
+      5) confirm "Удалить бота и токен" && (cmd_bot remove); pause ;;
+      6) return 0 ;;
+    esac
+  done
+}
+
+menu_maint() {
+  while true; do
+    clear; section "🧰 Обслуживание"; echo
+    choose "Обслуживание" "💾 Бэкап" "🔄 Применить конфиг заново" "🎨 Сайт-маскировка: новый случайный дизайн" "🕘 Откат к снимку перед обновлением" "🔙 Назад" || return 0
+    case $CHOICE in
+      0) (cmd_backup); pause ;;
+      1) (cmd_render); pause ;;
+      2) (cmd_site regenerate); pause ;;
+      3) (cmd_rollback); pause ;;
+      4) return 0 ;;
     esac
   done
 }
@@ -2171,16 +2716,16 @@ menu() {
     clear
     cmd_status
     echo
-    choose "Главное меню" "👥 Пользователи" "📊 Статистика" "🌍 WARP" "🩺 Диагностика" "💾 Бэкап" "🔄 Применить конфиг заново" \
-      "📦 Обновления" "🔥 Файрвол" "🚪 Выход" || exit 0
+    choose "Главное меню" "👥 Пользователи" "📊 Статистика" "🌍 WARP" "🩺 Диагностика" "🤖 Telegram-бот" "📦 Обновления" \
+      "🧰 Обслуживание" "🔥 Файрвол" "🚪 Выход" || exit 0
     case $CHOICE in
       0) menu_users ;;
       1) cmd_stats; pause ;;
       2) if [[ $(mode) == direct ]]; then menu_warp; else warn "WARP недоступен в режиме моста."; pause; fi ;;
       3) (cmd_doctor); pause ;;
-      4) (cmd_backup); pause ;;
-      5) (cmd_render); pause ;;
-      6) menu_update ;;
+      4) menu_bot ;;
+      5) menu_update ;;
+      6) menu_maint ;;
       7) (cmd_firewall); pause ;;
       8) exit 0 ;;
     esac
@@ -2202,7 +2747,7 @@ usage() {
   echo -e "  ${C}autoxray ips${N} ${D}[имя]${N}  ${C}unban${N} <имя|--all>   ${D}лимит устройств (IP) и блокировки${N}"
   echo -e "  ${C}autoxray report${N} list|build [имя]|url <имя>|purge <имя>|keep <дней>   ${D}html-отчёты о посещениях (user set --report on)${N}"
   echo -e "  ${C}autoxray user del${N} <имя>        ${C}user rotate${N} <имя>  ${D}новые ключи и ссылка${N}"
-  echo -e "  ${C}autoxray user link${N} <имя> ${D}[--plain]${N}  ${C}user qr${N} <имя> ${D}[sub|xhttp|vision|hy2]${N}"
+  echo -e "  ${C}autoxray user link${N} <имя> ${D}[--plain]${N}  ${C}user qr${N} <имя> ${D}[sub|links|xhttp|vision|hy2]${N}"
   echo -e "${H}Сеть${N}"
   echo -e "  ${C}autoxray warp${N} register|on|off|status|check|add|del  ${C}warp debug${N} ${D}[--quick]${N} ${D}разбор проблем${N}"
   echo -e "  ${C}autoxray warp scan${N} ${D}[--apply] [--depth quick|more|all] [--colo FRA,AMS] [--exclude-colo DME]${N}  ${D}самый быстрый endpoint${N}"
@@ -2210,10 +2755,12 @@ usage() {
   echo -e "  ${C}autoxray warp ru${N} on|off        ${D}российские сайты через WARP${N}"
   echo -e "  ${C}autoxray node${N} add <vless://…>|del <имя|id>|list   ${D}(режим моста)${N}"
   echo -e "  ${C}autoxray fingerprint${N} <браузер> ${C}telegram${N} set <ссылка>|off|update|remove"
+  echo -e "  ${C}autoxray bot${N} setup|status|on|off|add-admin|del-admin|proxy|test|remove   ${D}Telegram-бот администратора и уведомления${N}"
+  echo -e "  ${C}autoxray site${N} status|regenerate|set <папка>   ${D}сайт-маскировка: новый дизайн или свой сайт${N}"
   echo -e "  ${C}autoxray firewall${N} [--dry-run]  ${D}🔥 настроить ufw (SSH, 80, 443)${N}"
   echo -e "${H}Обслуживание${N}"
   echo -e "  ${C}autoxray backup${N} [файл]  ${C}restore${N} <файл>  ${C}render${N}  ${D}пересобрать конфиги${N}"
-  echo -e "  ${C}autoxray self-update${N} [vX.Y.Z]  ${C}geo-update${N}"
+  echo -e "  ${C}autoxray self-update${N} [vX.Y.Z]  ${C}rollback${N} ${D}[list|N]${N}  ${C}geo-update${N}   ${D}обновление со снимком и откатом при сбое${N}"
   echo -e "  ${C}autoxray core${N} list|update [версия]  ${D}ядро Xray: что установлено и что новее${N}"
   echo -e "  ${C}autoxray migrate${N} [имя]         ${D}перенос с autoXRAY 2${N}"
   echo -e "  ${C}autoxray uninstall${N}             ${D}удалить всё (с подтверждением)${N}"
@@ -2241,6 +2788,10 @@ main() {
     node|nodes)   cmd_node "$@" ;;
     self-update)  cmd_self_update "$@" ;;
     uninstall)    cmd_uninstall ;;
+    selfcheck)    post_update_check ;;
+    site)         cmd_site "$@" ;;
+    bot)          cmd_bot "$@" ;;
+    rollback)     cmd_rollback "$@" ;;
     ipwatch)      need_root; locked cmd_ipwatch ;;
     report)       cmd_report "$@" ;;
     ips)          cmd_ips "$@" ;;
