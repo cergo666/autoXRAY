@@ -259,9 +259,11 @@ autoxray warp keepwarm off >/dev/null; rm -f /etc/autoxray/.warp-warm; autoxray 
 autoxray warp keepwarm on >/dev/null
 autoxray warp coldtest --timeout 4 --site example.com > /tmp/cold.out 2>&1; cold_rc=$?; sed -i 's/\x1b\[[0-9;]*m//g' /tmp/cold.out
 [ "$cold_rc" = 0 ] && pass "coldtest завершается без ошибок оболочки" || { fail "coldtest rc=$cold_rc"; tail -n 3 /tmp/cold.out; }
-grep -q 'ошибка через [0-9]* мс' /tmp/cold.out && grep -q 'Через рабочий Xray сервера' /tmp/cold.out && grep -q 'Адреса сайта' /tmp/cold.out && pass "coldtest: настоящая ошибка и время, путь через рабочий Xray, адреса сайта" || { fail "разделы coldtest"; cat /tmp/cold.out; }
+grep -q 'ошибка через [0-9]* мс' /tmp/cold.out && grep -q 'Через рабочий Xray сервера' /tmp/cold.out && grep -q 'Адреса сайта' /tmp/cold.out && grep -q 'Маршрут на сервере' /tmp/cold.out && pass "coldtest: настоящая ошибка и время, путь через рабочий Xray, адреса сайта" || { fail "разделы coldtest"; cat /tmp/cold.out; }
 grep -q 'Холодный старт WARP' /tmp/cold.out && grep -q 'отправлено: [1-9]' /tmp/cold.out && pass "coldtest: keepalive запускает рукопожатие сразу, в отчёте счётчики" || { fail "coldtest"; cat /tmp/cold.out; }
-grep -q 'не состоялось вообще' /tmp/cold.out && pass "coldtest: вывод для недоступного endpoint" || { fail "вердикт coldtest"; tail -n 6 /tmp/cold.out; }
+grep -q 'не состоялось: endpoint недоступен' /tmp/cold.out && pass "coldtest: вывод для недоступного endpoint" || { fail "вердикт coldtest"; tail -n 6 /tmp/cold.out; }
+autoxray warp warmhosts example.com >/dev/null && [ "$(jq -c '.warp.warm_hosts' /etc/autoxray/state.json)" = '["example.com"]' ] && pass "warmhosts сохраняет список сайтов для прогрева" || fail "warmhosts"
+AX_WARM_TIMEOUT=3 autoxray warp warm; autoxray warp warmhosts off >/dev/null; [ "$(jq -c '.warp.warm_hosts' /etc/autoxray/state.json)" = '[]' ] && pass "warmhosts off очищает список" || fail "warmhosts off"
 autoxray warp off >/dev/null
 autoxray debug on 5 >/dev/null 2>&1
 [ "$(jq -r .log.loglevel /usr/local/etc/xray/config.json)" = debug ] && [ "$(jq -r .log.dnsLog /usr/local/etc/xray/config.json)" = true ] && pass "debug on: уровень debug и журнал DNS" || fail "debug on"

@@ -9,7 +9,7 @@ set -uo pipefail
 # bash >= 5.2: '&' в замене ${var//a/b} — спецсимвол; ссылки содержат '&'
 shopt -u patsub_replacement 2>/dev/null || true
 
-AX_VERSION="3.7.1"
+AX_VERSION="3.7.2"
 AX_REPO="cergo666/autoXRAY"
 XRAY_TESTED="v26.9.9"          # версия ядра, с которой этот релиз проверен тестами
 API="${AX_API:-https://api.github.com}"
@@ -1371,6 +1371,9 @@ warp_warm() {
   su=$(st .socks.user); sp=$(st .socks.pass)
   prev=$(awk '{print $4}' "$WARP_WARM_FILE" 2>/dev/null); prev=${prev:-0}
   t=$("$CURL" -sS -o /dev/null -w '%{time_total}' --max-time "${AX_WARM_TIMEOUT:-12}" --socks5-hostname "$su:$sp@127.0.0.1:10443" https://one.one.one.one/cdn-cgi/trace 2>/dev/null) || rc=$?
+  local h; for h in $(jq -r '(.warp.warm_hosts // [])[]' "$STATE"); do
+    "$CURL" -sS -o /dev/null --max-time 8 -r 0-0 --socks5-hostname "$su:$sp@127.0.0.1:10443" "https://$h/" >/dev/null 2>&1 || true
+  done
   if [[ $rc -eq 0 ]]; then
     printf '%s ok %s 0\n' "$(now)" "$(awk -v t="$t" 'BEGIN {printf "%d", t * 1000}')" >"$WARP_WARM_FILE"
     [[ $prev -ge 3 ]] && bot_notify "🌍 WARP снова отвечает"
@@ -1393,13 +1396,13 @@ warp_hs_stats() {
 ms_of() { awk -v t="${1:-0}" 'BEGIN {printf "%d", t * 1000}'; }
 
 # warp coldtest [--idle СЕК] [--site домен] [--keepalive СЕК] [--endpoint ip:порт] [--timeout СЕК]
-# Поднимает отдельный Xray с WARP (настройки и DNS как у сервера) и сравнивает первый запрос, второй и запрос после простоя;
-# затем повторяет запросы через рабочий Xray сервера. Показывает реальную ошибку curl, время и фрагмент журнала.
+# Поднимает отдельный Xray с WARP (настройки и DNS как у сервера). Сначала запрос к самому Cloudflare (trace: проверка
+# туннеля и IP выхода), потом несколько запросов к сайту подряд и один после простоя. Так видно, виноват ли туннель или сайт.
 warp_coldtest() {
-  local idle=0 tmo=25 site=sweb.ru ka ep port=10898 cfg log pid i hs init resp first r d s v=0 k
-  local c1 c2 c3="" m1 m2 m3=0 e1 e2 e3 a4 a6 inlist
+  local idle=0 tmo=12 site=sweb.ru ka ep port=10898 cfg log pid i hs init resp first d s v=0 a4 a6 inlist
+  local tc tms tip tcolo f1="" f2="" f3="" ip0="" ip1="" r code ms k e n
   ka=$(st '.warp.keepalive // 25'); ep=$(st '.warp.endpoint // empty'); [[ -n $ep ]] || ep=$WARP_ENDPOINT
-  while (($#)); do case $1 in --idle) idle=${2:-0}; shift ;; --timeout) tmo=${2:-25}; shift ;; --site) site=${2:-$site}; shift ;; --keepalive) ka=${2:-0}; shift ;; --endpoint) ep=${2:-$ep}; shift ;; esac; shift; done
+  while (($#)); do case $1 in --idle) idle=${2:-0}; shift ;; --timeout) tmo=${2:-12}; shift ;; --site) site=${2:-$site}; shift ;; --keepalive) ka=${2:-0}; shift ;; --endpoint) ep=${2:-$ep}; shift ;; esac; shift; done
   command -v xray >/dev/null 2>&1 || die "xray не найден"
   [[ $(st '.warp.registered // false') == true ]] || die "WARP не зарегистрирован: autoxray warp register"
   [[ $idle =~ ^[0-9]+$ ]] || die "--idle <секунды>"
@@ -1409,7 +1412,15 @@ warp_coldtest() {
   kv "🌐" "Сайт" "$site"
   a4=$(getent ahostsv4 "$site" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' '); a6=$(getent ahostsv6 "$site" 2>/dev/null | awk '$1 ~ /:/ {print $1}' | sort -u | head -n2 | tr '\n' ' ')
   kv "🔢" "Адреса сайта" "A: ${a4:-нет}  AAAA: ${a6:-нет}"
-  echo -e "\n ${BOLD}DNS${NC} ${DIM}(так Xray сервера узнаёт адрес сайта; нужно до первого пакета в туннель)${NC}"
+  inlist=no
+  jq -e --arg d "$site" '((.warp.domains // []) | map(select(. == ("domain:" + $d) or . == $d)) | length) > 0' "$STATE" >/dev/null && inlist=list
+  [[ $inlist == no && $(st '.warp.ru // false') == true && $site =~ \.(ru|su|xn--p1ai)$ ]] && inlist=ru
+  case $inlist in
+    list) kv "🎯" "Маршрут на сервере" "${GRN}через WARP${NC} (сайт в списке WARP)" ;;
+    ru)   kv "🎯" "Маршрут на сервере" "${GRN}через WARP${NC} (включён режим «российские сайты через WARP»)" ;;
+    *)    kv "🎯" "Маршрут на сервере" "${YEL}напрямую с сервера${NC} ${DIM}(WARP не участвует; добавить: autoxray warp add $site)${NC}" ;;
+  esac
+  echo -e "\n ${BOLD}DNS${NC} ${DIM}(так Xray сервера узнаёт адрес сайта)${NC}"
   for s in 8.8.4.4 8.8.8.8 1.1.1.1; do
     d=$("$CURL" -sS -o /dev/null -w '%{time_total}' --max-time 6 -H 'accept: application/dns-json' "https://$s/dns-query?name=$site&type=A" 2>/dev/null) \
       && { d=$(ms_of "$d"); [[ $d -gt 1000 ]] && v=$((v + 1)); echo -e "   DoH $s: ${d} мс"; } || { v=$((v + 1)); echo -e "   DoH $s: ${RED}нет ответа${NC}"; }
@@ -1419,49 +1430,61 @@ warp_coldtest() {
   xray run -c "$cfg" >"$log" 2>&1 9>&- &
   pid=$!
   for i in $(seq 1 20); do ss -ltn 2>/dev/null | grep -q "127.0.0.1:$port " && break; sleep 0.2; done
-  # treq <socks-адрес>: «код мс curl-код сообщение»; ошибка и время настоящие, а не подставленные
   treq() { "$CURL" -sS -o /dev/null -w '%{http_code} %{time_total} %{exitcode} %{errormsg}' --max-time "$tmo" --socks5-hostname "$1" "https://$site/" 2>/dev/null || true; }
-  show_req() { # метка код секунды curl-код сообщение
-    local ms; ms=$(ms_of "$3")
-    if [[ $2 == 000 ]]; then echo -e "   $1 ${RED}ошибка через ${ms} мс${NC}: ${5:-нет ответа} ${DIM}(curl $4)${NC}"; else echo -e "   $1 ${ms} мс ${DIM}(HTTP $2)${NC}"; fi
+  ttrace() { # «мс ip колo» через новый туннель или «-»
+    local out t; out=$(mktemp)
+    t=$("$CURL" -sS -o "$out" -w '%{time_total}' --max-time 8 --socks5-hostname "127.0.0.1:$port" https://one.one.one.one/cdn-cgi/trace 2>/dev/null) \
+      && grep -qE '^warp=(on|plus)' "$out" && echo "$(ms_of "$t") $(sed -n 's/^ip=//p' "$out") $(sed -n 's/^colo=//p' "$out")" || echo "-"
+    rm -f "$out"
   }
-  echo -e "\n ${BOLD}Запросы через новый туннель${NC} ${DIM}(отдельный Xray, DNS как у сервера)${NC}"
-  read -r c1 m1 k e1 <<<"$(treq "127.0.0.1:$port")"; show_req "🧊 холодный:                 " "$c1" "$m1" "$k" "$e1"; m1=$(ms_of "$m1")
-  read -r c2 m2 k e2 <<<"$(treq "127.0.0.1:$port")"; show_req "🔥 сразу второй (тёплый):   " "$c2" "$m2" "$k" "$e2"; m2=$(ms_of "$m2")
+  show_req() { # метка код секунды curl-код сообщение
+    local m; m=$(ms_of "$3")
+    if [[ $2 == 000 ]]; then echo -e "   $1 ${RED}ошибка через ${m} мс${NC}: ${5:-нет ответа} ${DIM}(curl $4)${NC}"; else echo -e "   $1 ${m} мс ${DIM}(HTTP $2)${NC}"; fi
+  }
+  echo -e "\n ${BOLD}Новый туннель${NC} ${DIM}(отдельный Xray, DNS как у сервера)${NC}"
+  r=$(ttrace)
+  if [[ $r == "-" ]]; then echo -e "   🧊 запрос к самому Cloudflare: ${RED}не прошёл${NC}: туннель не работает"; tc=fail
+  else read -r tms tip tcolo <<<"$r"; ip0=$tip; tc=ok; echo -e "   🧊 запрос к Cloudflare (trace): $tms мс, IP выхода ${BOLD}$tip${NC}, узел $tcolo"; fi
+  for n in 1 2 3; do
+    read -r code ms k e <<<"$(treq "127.0.0.1:$port")"
+    show_req "$([[ $n == 1 ]] && echo "🧊 $site, 1-й запрос:" || echo "🔥 $site, $n-й запрос:")" "$code" "$ms" "$k" "$e"
+    case $n in 1) f1=$code ;; 2) f2=$code ;; 3) f3=$code ;; esac
+  done
   if [[ $idle -gt 0 ]]; then
     echo -e "   ⏳ ${DIM}простой $idle с (дольше 180 с сессия WireGuard устаревает)...${NC}"
     sleep "$idle"
-    read -r c3 m3 k e3 <<<"$(treq "127.0.0.1:$port")"; show_req "🕐 после простоя:           " "$c3" "$m3" "$k" "$e3"; m3=$(ms_of "$m3")
+    r=$(ttrace)
+    if [[ $r == "-" ]]; then echo -e "   🕐 после простоя, Cloudflare: ${RED}не отвечает${NC}"
+    else read -r tms tip tcolo <<<"$r"; ip1=$tip; echo -e "   🕐 после простоя, Cloudflare: $tms мс, IP выхода ${BOLD}$tip${NC}$([[ -n $ip0 && $ip0 != "$tip" ]] && echo " ${YEL}(изменился!)${NC}")"; fi
+    read -r code ms k e <<<"$(treq "127.0.0.1:$port")"; show_req "🕐 $site после простоя:" "$code" "$ms" "$k" "$e"
   fi
   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -f "$cfg"
   hs=$(warp_hs_stats "$log"); read -r init resp first <<<"$hs"
   echo -e "\n ${BOLD}Рукопожатие WireGuard${NC}"
   echo -e "   отправлено: $init, получено ответов: $resp$([[ -n $first ]] && echo ", до первого ответа: $first мс")"
 
-  inlist=$(jq -r --arg d "$site" '((.warp.domains // []) | map(select(. == ("domain:" + $d) or . == $d)) | length) > 0' "$STATE")
   echo -e "\n ${BOLD}Через рабочий Xray сервера${NC} ${DIM}(socks 10443 и маршрутизация, как у клиентов)${NC}"
-  echo -e "   сайт в списке WARP: $([[ $inlist == true ]] && echo "${GRN}да${NC}" || echo "${YEL}нет${NC} ${DIM}(запрос уйдёт напрямую с сервера, WARP не участвует; добавить: autoxray warp add $site)${NC}")"
   local su sp; su=$(st .socks.user); sp=$(st .socks.pass)
-  for i in 1 2 3; do
-    read -r r m3p k e3p <<<"$(treq "$su:$sp@127.0.0.1:10443")"; show_req "▫️ запрос $i:                  " "$r" "$m3p" "$k" "$e3p"
+  for n in 1 2 3; do
+    read -r code ms k e <<<"$(treq "$su:$sp@127.0.0.1:10443")"; show_req "▫️ запрос $n:" "$code" "$ms" "$k" "$e"
   done
 
   echo -e "\n ${BOLD}Журнал тестового Xray${NC} ${DIM}(фрагмент: рукопожатия, DNS, ошибки соединений)${NC}"
   grep -aiE "$site|dial|failed|error|timeout|reset|refused|handshake|dns" "$log" | grep -av 'Routine:\|UAPI' | sed -E 's/^[0-9]{4}\/[0-9]{2}\/[0-9]{2} //' | cut -c1-200 | head -n 24 | sed 's/^/   /'
 
   echo -e "\n ${BOLD}Вывод${NC}"
-  if [[ $c1 == 000 && $resp -eq 0 ]]; then echo -e "   ${RED}✘${NC} Рукопожатие с Cloudflare не состоялось вообще: endpoint недоступен. ${CYAN}autoxray warp scan --apply${NC}"
+  if [[ $tc == fail && $resp -eq 0 ]]; then echo -e "   ${RED}✘${NC} Рукопожатие с Cloudflare не состоялось: endpoint недоступен. ${CYAN}autoxray warp scan --apply${NC}"
+  elif [[ $tc == fail ]]; then echo -e "   ${RED}✘${NC} Рукопожатие есть, но данные через туннель не ходят. ${CYAN}autoxray warp scan --apply${NC}"
   else
-    if [[ $c1 == 000 && $c2 != 000 ]]; then
-      echo -e "   ${YEL}⚠${NC} Первый запрос не прошёл (${e1:-ошибка}), хотя рукопожатие заняло ${first:-?} мс, а второй сразу открылся. Значит, дело не в рукопожатии: первое соединение через свежий туннель не доходит."
-      echo -e "     Посмотрите журнал выше и пришлите этот вывод целиком."
-    elif [[ $c1 == 000 ]]; then echo -e "   ${RED}✘${NC} Сайт не открылся ни разу: проверьте, принимает ли $site адреса Cloudflare."
-    fi
+    if [[ $f1 == 000 && ( $f2 != 000 || $f3 != 000 ) ]]; then
+      echo -e "   ${YEL}⚠${NC} Туннель исправен (Cloudflare ответил, IP $ip0), но ${BOLD}первое соединение к $site не доходит, а следующие открываются${NC}."
+      echo -e "     Это поведение стороны сайта: защита от DDoS у хостинга часто не пускает первые соединения с незнакомого IP (у WARP выход меняется). Не туннель и не DNS."
+      echo -e "     Что можно сделать: держать сайт «знакомым» запросом раз в минуту через WARP: ${CYAN}autoxray warp warmhosts $site${NC}"
+    elif [[ $f1 == 000 ]]; then echo -e "   ${RED}✘${NC} Сайт не открылся ни разу, хотя туннель исправен: $site, скорее всего, не принимает адреса Cloudflare."
+    else echo -e "   ${GRN}✔${NC} Первое соединение к $site открылось сразу: холодный старт в порядке."; fi
+    [[ -n $ip0 && -n $ip1 && $ip0 != "$ip1" ]] && echo -e "   ${YEL}⚠${NC} IP выхода WARP менялся после простоя ($ip0 → $ip1). Для сайтов с защитой это каждый раз «новый посетитель»."
     [[ $init -gt 2 ]] && echo -e "   ${YEL}⚠${NC} Рукопожатие повторялось ($init попыток): потери UDP до этого endpoint. Смените его: ${CYAN}autoxray warp scan --apply${NC}"
-    [[ $c1 != 000 && $m1 -gt $((m2 + 1500)) ]] && echo -e "   ${YEL}⚠${NC} Холодный запрос на $((m1 - m2)) мс медленнее тёплого: время уходит на создание туннеля."
     [[ $v -gt 0 ]] && echo -e "   ${YEL}⚠${NC} Часть DNS-серверов отвечает медленно или не отвечает."
-    [[ -n $c3 && $c3 == 000 ]] && echo -e "   ${YEL}⚠${NC} После простоя запрос не прошёл (${e3:-ошибка}): keepalive не удержал туннель."
-    [[ $c1 != 000 && $init -le 2 && $v -eq 0 ]] && echo -e "   ${GRN}✔${NC} Холодный старт в порядке: проблема не в туннеле. Смотрите путь клиента (роутер, XHTTP) и ${CYAN}autoxray debug on${NC}."
   fi
   rm -f "$log"
 }
@@ -1741,6 +1764,15 @@ cmd_warp() {
     coldtest) need_root; warp_coldtest "$@" ;;
     keepalive) need_root; [[ ${1:-} =~ ^[0-9]+$ ]] || die "warp keepalive <секунды, 0 выключает> (по умолчанию 25)"
          st_edit --argjson k "$1" '.warp.keepalive = $k'; locked apply_or_die; ok "✅ Keepalive WireGuard: $1 с" ;;
+    warmhosts) need_root
+         case ${1:-} in
+           ""|list) echo -e " ${BOLD}Сайты, которые прогреваются раз в минуту через WARP:${NC} $(jq -r '(.warp.warm_hosts // []) | join(", ") | if . == "" then "нет" else . end' "$STATE")" ;;
+           off) st_edit '.warp.warm_hosts = []'; ok "✅ Прогрев сайтов выключен" ;;
+           *) local h bad=0; for h in "$@"; do [[ $h =~ ^[A-Za-z0-9.-]+$ ]] || bad=1; done; [[ $bad == 0 ]] || die "warp warmhosts <домен> [домен...] | off | list"
+              st_edit --argjson h "$(printf '%s\n' "$@" | jq -Rn '[inputs]')" '.warp.warm_hosts = $h'
+              ok "✅ Раз в минуту через WARP запрашивается: $*"
+              echo -e " ${DIM}Сайты должны идти через WARP (в списке warp add или режим российских сайтов), иначе запрос уйдёт напрямую.${NC}" ;;
+         esac ;;
     keepwarm) need_root; case ${1:-} in on) st_edit '.warp.keepwarm = true'; ok "✅ Прогрев туннеля раз в минуту включён" ;; off) st_edit '.warp.keepwarm = false'; ok "✅ Прогрев выключен" ;; *) die "warp keepwarm on|off" ;; esac ;;
     depth) need_root; [[ ${1:-} =~ ^(quick|more|all)$ ]] || die "warp depth quick|more|all"; st_edit --arg d "$1" '.warp.depth = $d'; ok "✅ Глубина сканирования: $1" ;;
     nightly) need_root
@@ -1817,7 +1849,7 @@ cmd_warp() {
            || die "Нет ответа. Проверьте: autoxray warp status; systemctl status xray"
          echo "$trace" | sed 's/^/   /'
          grep -qE '^warp=(on|plus)' <<<"$trace" && ok "✅ WARP работает" || warn "warp не включён в ответе — трафик идёт мимо WARP" ;;
-    *) die "warp: register | on | off | ru on|off | add | del | list | check | scan | coldtest | warm | keepalive | keepwarm | debug | endpoint" ;;
+    *) die "warp: register | on | off | ru on|off | add | del | list | check | scan | coldtest | warm | warmhosts | keepalive | keepwarm | debug | endpoint" ;;
   esac
 }
 
