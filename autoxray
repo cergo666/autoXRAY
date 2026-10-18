@@ -9,7 +9,7 @@ set -uo pipefail
 # bash >= 5.2: '&' в замене ${var//a/b} — спецсимвол; ссылки содержат '&'
 shopt -u patsub_replacement 2>/dev/null || true
 
-AX_VERSION="3.7.2"
+AX_VERSION="3.8.0"
 AX_REPO="cergo666/autoXRAY"
 XRAY_TESTED="v26.9.9"          # версия ядра, с которой этот релиз проверен тестами
 API="${AX_API:-https://api.github.com}"
@@ -1699,6 +1699,93 @@ warp_rescan() { # [now]
   return 0
 }
 
+# ------------------------------------------------- стабильность endpoint'ов и смена устройства
+
+# warp_soak_one <endpoint> <раундов> <пауза> <простой> <таймаут> — один endpoint в отдельном Xray (как у сервера: свой keepalive и DNS).
+# Раунд = запрос к российскому сайту через туннель; посередине пауза «простой» без трафика (сессия остывает, как ночью).
+# Печатает «endpoint<TAB>ок<TAB>всего<TAB>провалов<TAB>средняя мс<TAB>макс мс<TAB>повторов рукопожатия».
+warp_soak_one() {
+  local ep=$1 rounds=$2 gap=$3 idle=$4 tmo=$5 port=10897 cfg log pid i n ok=0 fail=0 sum=0 max=0 r code t ms hosts h half
+  local ka; ka=$(st '.warp.keepalive // 25')
+  read -ra hosts <<<"$(warp_probe_hosts)"
+  cfg=$(mktemp --suffix=.json); log=$(mktemp)
+  warp_probe_cfg "$ep" "$port" "$ka" 1 >"$cfg"
+  xray run -c "$cfg" >"$log" 2>&1 9>&- &
+  pid=$!
+  for i in $(seq 1 20); do ss -ltn 2>/dev/null | grep -q "127.0.0.1:$port " && break; sleep 0.2; done
+  half=$((rounds / 2))
+  for ((n = 0; n < rounds; n++)); do
+    [[ $n -eq $half && $idle -gt 0 ]] && sleep "$idle"
+    h=${hosts[$((n % ${#hosts[@]}))]}
+    r=$("$CURL" -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time "$tmo" --socks5-hostname "127.0.0.1:$port" "https://$h/" 2>/dev/null) || r="000 0"
+    code=${r%% *}; t=${r##* }
+    if [[ $code == 000 ]]; then fail=$((fail + 1))
+    else ms=$(ms_of "$t"); ok=$((ok + 1)); sum=$((sum + ms)); [[ $ms -gt $max ]] && max=$ms; fi
+    sleep "$gap"
+  done
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -f "$cfg"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ep" "$ok" "$rounds" "$fail" "$([[ $ok -gt 0 ]] && echo $((sum / ok)) || echo 0)" "$max" "$(grep -ac 'Retrying handshake' "$log")"
+  rm -f "$log"
+}
+
+# Ранжирование: меньше провалов, затем меньше повторов рукопожатия, затем быстрее
+warp_soak_rank() { sort -t$'\t' -k4,4n -k7,7n -k5,5n; }
+
+# warp soak [--rounds 8] [--gap 3] [--idle 30] [--timeout 8] [--top 4] [--apply] [endpoint...]
+# Проверка стабильности: быстрый endpoint с «зависаниями» хуже чуть более медленного, но надёжного.
+warp_soak() {
+  local rounds=8 gap=3 idle=30 tmo=8 top=4 apply=0 eps=() ep res="" line
+  while (($#)); do
+    case $1 in
+      --rounds) rounds=${2:-8}; shift ;; --gap) gap=${2:-3}; shift ;; --idle) idle=${2:-30}; shift ;;
+      --timeout) tmo=${2:-8}; shift ;; --top) top=${2:-4}; shift ;; --apply) apply=1 ;;
+      *) eps+=("$1") ;;
+    esac; shift
+  done
+  command -v xray >/dev/null 2>&1 || die "xray не найден"
+  [[ $(st '.warp.registered // false') == true ]] || die "WARP не зарегистрирован: autoxray warp register"
+  if [[ ${#eps[@]} -eq 0 ]]; then
+    ep=$(st '.warp.endpoint // empty'); [[ -n $ep ]] && eps+=("$ep")
+    while read -r ep; do [[ -n $ep ]] && eps+=("$ep"); done < <(jq -r --argjson n "$top" '(.warp.top // [])[:$n][].ep' "$STATE")
+  fi
+  mapfile -t eps < <(printf '%s\n' "${eps[@]}" | awk 'NF && !seen[$0]++')
+  [[ ${#eps[@]} -gt 0 ]] || die "Нет endpoint'ов: autoxray warp scan --apply или укажите адреса"
+  section "🧪 Стабильность WARP"
+  echo -e " ${DIM}По $rounds запросов к российским сайтам на каждый endpoint, посередине простой ${idle} с. Займёт около $(( ${#eps[@]} * (rounds * (gap + 1) + idle) / 60 + 1 )) мин.${NC}"
+  for ep in "${eps[@]}"; do
+    printf '   %s ... ' "$ep"
+    line=$(warp_soak_one "$ep" "$rounds" "$gap" "$idle" "$tmo")
+    res+="$line"$'\n'
+    echo -e "$(cut -f2,3 <<<"$line" | awk -F'\t' '{printf "%s из %s", $1, $2}')"
+  done
+  res=$(printf '%s' "$res" | warp_soak_rank)
+  echo
+  printf '%b   %s %s %s %s %s %s%b\n' "$DIM" "$(pad "#" 3)" "$(pad ENDPOINT 22)" "$(pad УСПЕШНО 10)" "$(pad ПРОВАЛОВ 10)" "$(pad СРЕДНЯЯ 10)" "ПОВТОРОВ РУКОПОЖАТИЯ" "$NC"
+  local i=0 e o t f a m h col
+  while IFS=$'\t' read -r e o t f a m h; do
+    [[ -n $e ]] || continue
+    i=$((i + 1)); col=$GRN; [[ $f -gt 0 ]] && col=$YEL; [[ $f -ge $((t / 2)) ]] && col=$RED
+    printf ' %s %b%s%b %s %b%s%b %s %s\n' "$(pad "$i" 3)" "$BOLD" "$(pad "$e" 22)" "$NC" "$(pad "$o/$t" 10)" "$col" "$(pad "$f" 10)" "$NC" "$(pad "$a мс" 10)" "$h"
+  done <<<"$res"
+  local best bf; best=$(head -n1 <<<"$res" | cut -f1); bf=$(head -n1 <<<"$res" | cut -f4)
+  echo
+  if [[ $bf -eq 0 ]]; then echo -e " ${GRN}✔${NC} Самый стабильный: ${BOLD}$best${NC} (без провалов)"
+  else echo -e " ${YEL}⚠${NC} Безупречных нет: лучший ${BOLD}$best${NC} ($bf провалов). Если проваливаются все, дело не в endpoint'е: ${CYAN}autoxray warp renew${NC}"; fi
+  if [[ $apply == 1 ]]; then
+    st_edit --arg ep "$best" '.warp.endpoint = $ep'; locked apply_or_die; ok "✅ Endpoint: $best"
+  else echo -e " ${DIM}Применить: autoxray warp soak --apply${NC}"; fi
+}
+
+# warp renew — новое устройство Cloudflare (новый ключ). Домены, режимы и endpoint сохраняются, старое устройство удаляется.
+warp_renew() {
+  local old_id old_tk ep top
+  old_id=$(st '.warp.deviceId // empty'); old_tk=$(st '.warp.deviceToken // empty')
+  ep=$(st '.warp.endpoint // empty'); top=$(jq -c '.warp.top // []' "$STATE")
+  warp_register
+  [[ -n $ep ]] && st_edit --arg ep "$ep" --argjson top "$top" '.warp.endpoint = $ep | .warp.top = $top'
+  [[ -n $old_id && -n $old_tk ]] && curl_warp DELETE "reg/$old_id" -H "Authorization: Bearer $old_tk" >/dev/null 2>&1 || true
+}
+
 warp_enable_checked() { # [--force]; печатает причину и возвращает 1, если WARP не отвечает
   if [[ ${1:-} == --force ]]; then return 0; fi
   if ! warp_pick_endpoint; then
@@ -1761,6 +1848,10 @@ cmd_warp() {
     debug) warp_debug "$@" ;;
     candidates) warp_scan_candidates "${1:-quick}" ;;
     warm) warp_warm ;;
+    soak) need_root; warp_soak "$@" ;;
+    renew) need_root
+         warn "Будет зарегистрировано новое устройство Cloudflare (новый ключ). Домены, режимы и endpoint сохранятся."
+         locked warp_renew; locked apply_or_die; ok "✅ Новое устройство WARP подключено. Проверьте: autoxray warp coldtest" ;;
     coldtest) need_root; warp_coldtest "$@" ;;
     keepalive) need_root; [[ ${1:-} =~ ^[0-9]+$ ]] || die "warp keepalive <секунды, 0 выключает> (по умолчанию 25)"
          st_edit --argjson k "$1" '.warp.keepalive = $k'; locked apply_or_die; ok "✅ Keepalive WireGuard: $1 с" ;;
@@ -1849,7 +1940,7 @@ cmd_warp() {
            || die "Нет ответа. Проверьте: autoxray warp status; systemctl status xray"
          echo "$trace" | sed 's/^/   /'
          grep -qE '^warp=(on|plus)' <<<"$trace" && ok "✅ WARP работает" || warn "warp не включён в ответе — трафик идёт мимо WARP" ;;
-    *) die "warp: register | on | off | ru on|off | add | del | list | check | scan | coldtest | warm | warmhosts | keepalive | keepwarm | debug | endpoint" ;;
+    *) die "warp: register | on | off | ru on|off | add | del | list | check | scan | coldtest | soak | renew | warm | warmhosts | keepalive | keepwarm | debug | endpoint" ;;
   esac
 }
 
@@ -2939,6 +3030,7 @@ usage() {
   echo -e "${H}Сеть${N}"
   echo -e "  ${C}autoxray warp${N} register|on|off|status|check|add|del  ${C}warp debug${N} ${D}[--quick]${N} ${D}разбор проблем${N}"
   echo -e "  ${C}autoxray warp scan${N} ${D}[--apply] [--depth quick|more|all] [--colo FRA,AMS] [--exclude-colo DME]${N}  ${D}самый быстрый endpoint${N}"
+  echo -e "  ${C}autoxray warp soak${N} ${D}[--apply] [--rounds N] [endpoint...]${N}  ${D}стабильность endpoint'ов${N}   ${C}warp renew${N} ${D}новое устройство Cloudflare${N}"
   echo -e "  ${C}autoxray warp coldtest${N} ${D}[--idle 200] [--site сайт]${N}  ${D}почему первый запрос после простоя медленный${N}"
   echo -e "  ${C}autoxray debug${N} on [минут]|show [сайт]|off   ${D}временный подробный лог (адреса видны, выключается сам)${N}"
   echo -e "  ${C}autoxray warp nightly${N} on|off  ${C}depth${N} quick|more|all  ${C}threshold${N} <мс>  ${C}rescan${N} now  ${C}hosts${N} <сайты>"

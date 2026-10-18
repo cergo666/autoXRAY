@@ -262,6 +262,16 @@ autoxray warp coldtest --timeout 4 --site example.com > /tmp/cold.out 2>&1; cold
 grep -q 'ошибка через [0-9]* мс' /tmp/cold.out && grep -q 'Через рабочий Xray сервера' /tmp/cold.out && grep -q 'Адреса сайта' /tmp/cold.out && grep -q 'Маршрут на сервере' /tmp/cold.out && pass "coldtest: настоящая ошибка и время, путь через рабочий Xray, адреса сайта" || { fail "разделы coldtest"; cat /tmp/cold.out; }
 grep -q 'Холодный старт WARP' /tmp/cold.out && grep -q 'отправлено: [1-9]' /tmp/cold.out && pass "coldtest: keepalive запускает рукопожатие сразу, в отчёте счётчики" || { fail "coldtest"; cat /tmp/cold.out; }
 grep -q 'не состоялось: endpoint недоступен' /tmp/cold.out && pass "coldtest: вывод для недоступного endpoint" || { fail "вердикт coldtest"; tail -n 6 /tmp/cold.out; }
+check "warp_soak_rank: меньше провалов, потом повторов рукопожатия, потом быстрее" bash -c '
+  source <(sed -n "/^warp_soak_rank()/,/^}/p" /opt/autoxray/autoxray)
+  t=$(printf "a:1\t6\t8\t2\t300\t900\t1\nb:1\t8\t8\t0\t700\t1200\t0\nc:1\t8\t8\t0\t400\t800\t0\nd:1\t8\t8\t0\t350\t800\t2\n")
+  [ "$(printf "%s\n" "$t" | warp_soak_rank | cut -f1 | tr "\n" " ")" = "c:1 b:1 d:1 a:1 " ]'
+autoxray warp soak --rounds 2 --gap 1 --idle 0 --timeout 2 162.159.192.1:2408 > /tmp/soak.out 2>&1; soak_rc=$?; sed -i 's/\x1b\[[0-9;]*m//g' /tmp/soak.out
+[ "$soak_rc" = 0 ] && grep -q 'Стабильность WARP' /tmp/soak.out && grep -q '0 из 2' /tmp/soak.out && grep -q 'Безупречных нет' /tmp/soak.out && pass "warp soak: таблица стабильности и вывод для недоступного endpoint" || { fail "warp soak (rc=$soak_rc)"; cat /tmp/soak.out; }
+old_key=$(jq -r .warp.secretKey /etc/autoxray/state.json); old_ep=$(jq -r .warp.endpoint /etc/autoxray/state.json); old_dom=$(jq -c .warp.domains /etc/autoxray/state.json)
+AX_CURL=/tmp/fakecurl autoxray warp renew >/tmp/renew.out 2>&1
+[ "$old_key" != "$(jq -r .warp.secretKey /etc/autoxray/state.json)" ] && [ "$old_ep" = "$(jq -r .warp.endpoint /etc/autoxray/state.json)" ] && [ "$old_dom" = "$(jq -c .warp.domains /etc/autoxray/state.json)" ] && pass "warp renew: новый ключ, endpoint и домены сохранены" || { fail "warp renew"; cat /tmp/renew.out; }
+check "xray -test после warp renew" xray run -test -c /usr/local/etc/xray/config.json
 autoxray warp warmhosts example.com >/dev/null && [ "$(jq -c '.warp.warm_hosts' /etc/autoxray/state.json)" = '["example.com"]' ] && pass "warmhosts сохраняет список сайтов для прогрева" || fail "warmhosts"
 AX_WARM_TIMEOUT=3 autoxray warp warm; autoxray warp warmhosts off >/dev/null; [ "$(jq -c '.warp.warm_hosts' /etc/autoxray/state.json)" = '[]' ] && pass "warmhosts off очищает список" || fail "warmhosts off"
 autoxray warp off >/dev/null
