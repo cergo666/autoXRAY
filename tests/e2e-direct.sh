@@ -211,6 +211,7 @@ check "warp_rank: сортировка и фильтры по узлам" bash -
 AX_WARP_CANDIDATES="162.159.192.1:2408 188.114.97.1:2408" autoxray warp scan >/tmp/scan.out 2>&1 && fail "scan «нашёл» рабочий endpoint с поддельным профилем" || pass "scan честно сообщает, что ни один endpoint не ответил"
 
 step "WARP: глубина сканирования и ночная проверка (поддельные результаты замера)"
+autoxray warp stable off >/dev/null   # здесь проверяется выбор по скорости; выбор по стабильности ниже
 [ "$(autoxray warp candidates more | wc -l)" -ge 270 ] && pass "глубина more: около 280 адресов" || fail "candidates more: $(autoxray warp candidates more | wc -l)"
 [ "$(autoxray warp candidates all | wc -l)" -ge 3550 ] && pass "глубина all: все адреса диапазонов (около 3500)" || fail "candidates all: $(autoxray warp candidates all | wc -l)"
 printf '120\t1.1.1.1:2408\tFRA\tDE\t3\t3\t30\t100,120,140\n250\t2.2.2.2:2408\tAMS\tNL\t3\t3\t35\t200,250,300\n10040\t9.9.9.9:2408\tDME\tRU\t0\t3\t40\t-,-,-\n' > /tmp/fake1.tsv
@@ -237,6 +238,30 @@ autoxray warp nightly off >/dev/null; before=$(jq -r .warp.endpoint /etc/autoxra
 AX_WARP_FAKE_RESULTS=/tmp/fake2.tsv autoxray warp rescan >/dev/null 2>&1
 [ "$before" = "$(jq -r .warp.endpoint /etc/autoxray/state.json)" ] && pass "при выключенной ночной проверке cron ничего не меняет" || fail "rescan сработал при nightly off"
 autoxray warp off >/dev/null
+
+step "WARP: сначала скорость, затем стабильность среди лучших (поддельные замеры)"
+autoxray warp stable on >/dev/null; autoxray warp stable top 3 >/dev/null
+printf '120\tA.A.A.A:2408\tFRA\tDE\t3\t3\t30\t100,120,140\n250\tB.B.B.B:2408\tAMS\tNL\t3\t3\t35\t200,250,300\n300\tC.C.C.C:2408\tARN\tSE\t3\t3\t35\t280,300,320\n' | sed 's/A\.A\.A\.A/1.1.1.1/; s/B\.B\.B\.B/2.2.2.2/; s/C\.C\.C\.C/3.3.3.3/' > /tmp/sc1.tsv
+printf '1.1.1.1:2408\t6\t8\t2\t130\t900\t1\n2.2.2.2:2408\t8\t8\t0\t260\t500\t0\n3.3.3.3:2408\t8\t8\t0\t310\t600\t0\n' > /tmp/sk1.tsv
+AX_WARP_FAKE_RESULTS=/tmp/sc1.tsv AX_WARP_FAKE_SOAK=/tmp/sk1.tsv autoxray warp scan --apply >/tmp/sc.out 2>&1
+[ "$(jq -r .warp.endpoint /etc/autoxray/state.json)" = "2.2.2.2:2408" ] && pass "самый быстрый (1.1.1.1) с провалами отвергнут, выбран быстрый и стабильный (2.2.2.2)" || { fail "выбор по стабильности: $(jq -r .warp.endpoint /etc/autoxray/state.json)"; sed 's/\x1b\[[0-9;]*m//g' /tmp/sc.out | tail -n 8; }
+sed 's/\x1b\[[0-9;]*m//g' /tmp/sc.out | grep -q 'Самый стабильный из быстрых' && pass "в выводе видна проверка стабильности" || fail "нет вывода про стабильность"
+printf '250\t2.2.2.2:2408\tAMS\tNL\t3\t3\t35\t200,250,300\n240\t4.4.4.4:2408\tFRA\tDE\t3\t3\t30\t200,240,280\n' > /tmp/sc2.tsv
+printf '2.2.2.2:2408\t8\t8\t0\t260\t500\t0\n4.4.4.4:2408\t8\t8\t0\t250\t450\t0\n' > /tmp/sk2.tsv
+AX_WARP_FAKE_RESULTS=/tmp/sc2.tsv AX_WARP_FAKE_SOAK=/tmp/sk2.tsv autoxray warp scan --apply >/dev/null 2>&1
+[ "$(jq -r .warp.endpoint /etc/autoxray/state.json)" = "2.2.2.2:2408" ] && pass "текущий стабильный endpoint не меняется ради выигрыша меньше 10%" || fail "гистерезис по стабильности: $(jq -r .warp.endpoint /etc/autoxray/state.json)"
+printf '2.2.2.2:2408\t5\t8\t3\t260\t900\t2\n5.5.5.5:2408\t8\t8\t0\t400\t700\t0\n' > /tmp/sk3.tsv
+printf '250\t2.2.2.2:2408\tAMS\tNL\t3\t3\t35\t200,250,300\n280\t5.5.5.5:2408\tFRA\tDE\t3\t3\t30\t250,280,310\n' > /tmp/sc3.tsv
+autoxray warp on --force >/dev/null 2>&1; autoxray warp nightly on >/dev/null
+AX_WARP_FAKE_RESULTS=/tmp/sc3.tsv AX_WARP_FAKE_SOAK=/tmp/sk3.tsv autoxray warp rescan now >/dev/null 2>&1
+[ "$(jq -r .warp.endpoint /etc/autoxray/state.json)" = "5.5.5.5:2408" ] && pass "ночная проверка уходит с нестабильного текущего на стабильный, хотя он медленнее" || fail "rescan по стабильности: $(jq -r .warp.endpoint /etc/autoxray/state.json); $(tail -n1 /etc/autoxray/warp-rescan.log)"
+printf '5.5.5.5:2408\t0\t8\t8\t0\t0\t0\n1.1.1.1:2408\t0\t8\t8\t0\t0\t0\n' > /tmp/sk4.tsv
+AX_WARP_FAKE_RESULTS=/tmp/sc1.tsv AX_WARP_FAKE_SOAK=/tmp/sk4.tsv autoxray warp scan --apply >/dev/null 2>&1
+[ "$(jq -r .warp.endpoint /etc/autoxray/state.json)" = "1.1.1.1:2408" ] && pass "если стабильных нет, выбор возвращается к скорости" || fail "запасной выбор: $(jq -r .warp.endpoint /etc/autoxray/state.json)"
+autoxray warp stable off >/dev/null
+AX_WARP_FAKE_RESULTS=/tmp/sc1.tsv AX_WARP_FAKE_SOAK=/tmp/sk1.tsv autoxray warp scan --apply >/dev/null 2>&1
+[ "$(jq -r .warp.endpoint /etc/autoxray/state.json)" = "1.1.1.1:2408" ] && pass "warp stable off: выбор только по скорости" || fail "stable off"
+autoxray warp stable on >/dev/null; autoxray warp nightly off >/dev/null; autoxray warp off >/dev/null
 
 step "Холодный старт WARP: keepalive, прогрев, coldtest, временный подробный лог"
 check "warp_hs_stats разбирает журнал рукопожатий" bash -c '

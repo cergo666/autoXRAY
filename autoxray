@@ -9,7 +9,7 @@ set -uo pipefail
 # bash >= 5.2: '&' в замене ${var//a/b} — спецсимвол; ссылки содержат '&'
 shopt -u patsub_replacement 2>/dev/null || true
 
-AX_VERSION="3.8.0"
+AX_VERSION="3.9.0"
 AX_REPO="cergo666/autoXRAY"
 XRAY_TESTED="v26.9.9"          # версия ядра, с которой этот релиз проверен тестами
 API="${AX_API:-https://api.github.com}"
@@ -1605,6 +1605,7 @@ WARP_SCAN_RESULT=""
 warp_scan() {
   local depth="" inc="" exc="" list="" dir phases phase cands=() i total nb b
   while (($#)); do case $1 in --depth) depth=${2:-}; shift ;; --full) depth="more" ;; --list) list=${2:-}; shift ;; --colo) inc=${2:-}; shift ;; --exclude-colo) exc=${2:-}; shift ;; esac; shift; done
+  WARP_CHOSEN=""
   [[ $depth =~ ^(quick|more|all)$ ]] || depth=$(st '.warp.depth // "quick"')
   if [[ -n ${AX_WARP_FAKE_RESULTS:-} ]]; then   # подмена результатов для тестов
     WARP_SCAN_RESULT=$(warp_rank "$inc" "$exc" <"$AX_WARP_FAKE_RESULTS"); [[ -n $WARP_SCAN_RESULT ]]; return
@@ -1659,17 +1660,25 @@ warp_save_top() {
 
 # Запоминает лучший (первый) endpoint из WARP_SCAN_RESULT и топ-15
 warp_apply_best() {
-  local best ms colo
-  best=$(head -n1 <<<"$WARP_SCAN_RESULT" | cut -f2); ms=$(head -n1 <<<"$WARP_SCAN_RESULT" | cut -f1); colo=$(head -n1 <<<"$WARP_SCAN_RESULT" | cut -f3)
+  local best row ms colo
+  best=${WARP_CHOSEN:-$(head -n1 <<<"$WARP_SCAN_RESULT" | cut -f2)}
+  row=$(awk -F'\t' -v e="$best" '$2 == e' <<<"$WARP_SCAN_RESULT" | head -n1)
   warp_save_top
-  st_edit --arg ep "$best" --arg c "$colo" --argjson ms "$ms" '.warp.endpoint = $ep | .warp.colo = $c | .warp.rtt = $ms'
-  echo -e " ⚡ ${BOLD}Выбран:${NC} ${GRN}$best${NC} ${DIM}(узел $colo, среднее $ms мс)${NC}"
+  if [[ -n $row ]]; then
+    ms=$(cut -f1 <<<"$row"); colo=$(cut -f3 <<<"$row")
+    st_edit --arg ep "$best" --arg c "$colo" --argjson ms "$ms" '.warp.endpoint = $ep | .warp.colo = $c | .warp.rtt = $ms'
+    echo -e " ⚡ ${BOLD}Выбран:${NC} ${GRN}$best${NC} ${DIM}(узел $colo, среднее $ms мс)${NC}"
+  else
+    st_edit --arg ep "$best" '.warp.endpoint = $ep'
+    echo -e " ⚡ ${BOLD}Выбран:${NC} ${GRN}$best${NC}"
+  fi
 }
 
 # Сканирование и выбор самого быстрого рабочего endpoint. Код 1: ни один не ответил.
 warp_pick_endpoint() {
   warp_scan || return 1
   warp_scan_table
+  warp_choose_stable || true
   warp_apply_best
 }
 
@@ -1689,9 +1698,14 @@ warp_rescan() { # [now]
     mode=full
     warp_scan || { warp_log "режим full: ни один endpoint не ответил, остаётся $cur"; return 1; }
   fi
-  best=$(head -n1 <<<"$WARP_SCAN_RESULT" | cut -f2); bsc=$(head -n1 <<<"$WARP_SCAN_RESULT" | cut -f1)
-  cur_sc=$(awk -F'\t' -v c="$cur" '$2 == c {print $1; exit}' <<<"$WARP_SCAN_RESULT")
-  if [[ $best != "$cur" ]] && { [[ -z $cur_sc ]] || [[ $cur_sc -gt $(( bsc * 11 / 10 + 5 )) ]]; }; then act=change; fi
+  if warp_choose_stable; then
+    best=$WARP_CHOSEN; bsc=$(awk -F'\t' -v e="$best" '$1 == e {print $5; exit}' <<<"$WARP_SOAK_RESULT")
+    [[ $best != "$cur" ]] && act=change
+  else
+    best=$(head -n1 <<<"$WARP_SCAN_RESULT" | cut -f2); bsc=$(head -n1 <<<"$WARP_SCAN_RESULT" | cut -f1)
+    cur_sc=$(awk -F'\t' -v c="$cur" '$2 == c {print $1; exit}' <<<"$WARP_SCAN_RESULT")
+    if [[ $best != "$cur" ]] && { [[ -z $cur_sc ]] || [[ $cur_sc -gt $(( bsc * 11 / 10 + 5 )) ]]; }; then act=change; fi
+  fi
   locked warp_rescan_commit "$act"
   warp_log "режим $mode: лучший $best ($bsc мс), ${act/change/endpoint заменён (был $cur)}"
   [[ $act == change ]] && bot_notify "🌍 WARP: endpoint заменён <code>$cur</code> → <code>$best</code> ($bsc мс)"
@@ -1706,6 +1720,9 @@ warp_rescan() { # [now]
 # Печатает «endpoint<TAB>ок<TAB>всего<TAB>провалов<TAB>средняя мс<TAB>макс мс<TAB>повторов рукопожатия».
 warp_soak_one() {
   local ep=$1 rounds=$2 gap=$3 idle=$4 tmo=$5 port=10897 cfg log pid i n ok=0 fail=0 sum=0 max=0 r code t ms hosts h half
+  if [[ -n ${AX_WARP_FAKE_SOAK:-} ]]; then   # подмена результатов для тестов
+    awk -F'\t' -v e="$ep" '$1 == e {print; f = 1} END {if (!f) printf "%s\t0\t8\t8\t0\t0\t0\n", e}' "$AX_WARP_FAKE_SOAK"; return 0
+  fi
   local ka; ka=$(st '.warp.keepalive // 25')
   read -ra hosts <<<"$(warp_probe_hosts)"
   cfg=$(mktemp --suffix=.json); log=$(mktemp)
@@ -1731,10 +1748,49 @@ warp_soak_one() {
 # Ранжирование: меньше провалов, затем меньше повторов рукопожатия, затем быстрее
 warp_soak_rank() { sort -t$'\t' -k4,4n -k7,7n -k5,5n; }
 
+# warp_soak_run <раундов> <пауза> <простой> <таймаут> <endpoint...> — по очереди проверяет, результат (ранжированный) в WARP_SOAK_RESULT
+WARP_SOAK_RESULT=""
+warp_soak_run() {
+  local rounds=$1 gap=$2 idle=$3 tmo=$4 ep line res=""; shift 4
+  for ep in "$@"; do
+    printf '   %s ... ' "$ep"
+    line=$(warp_soak_one "$ep" "$rounds" "$gap" "$idle" "$tmo")
+    res+="$line"$'\n'
+    echo -e "$(cut -f2,3,4 <<<"$line" | awk -F'\t' '{printf "%s из %s (провалов %s)", $1, $2, $3}')"
+  done
+  WARP_SOAK_RESULT=$(printf '%s' "$res" | warp_soak_rank)
+}
+
+# Выбор из лучших по скорости: сначала скорость (warp_scan), затем стабильность среди первых N (по умолчанию 3) и текущего.
+# Результат в WARP_CHOSEN. Текущий endpoint остаётся, если он не хуже лучшего по провалам и повторам и не медленнее его более чем на 10%.
+WARP_CHOSEN=""
+warp_choose_stable() {
+  WARP_CHOSEN=""
+  [[ $(st '.warp.stable != false') == true ]] || return 1
+  local n cur eps=() ep best e o t bf ba bh cur_row cf ca ch
+  n=$(st '.warp.soak_top // 3'); cur=$(st '.warp.endpoint // empty')
+  while read -r ep; do [[ -n $ep ]] && eps+=("$ep"); done < <(head -n "$n" <<<"$WARP_SCAN_RESULT" | cut -f2)
+  [[ -n $cur && " ${eps[*]} " != *" $cur "* ]] && eps+=("$cur")
+  [[ ${#eps[@]} -gt 0 ]] || return 1
+  echo -e " 🧪 ${DIM}Проверяю стабильность ${#eps[@]} лучших по скорости (по ${AX_SOAK_ROUNDS:-6} запросов, простой ${AX_SOAK_IDLE:-20} с)...${NC}"
+  warp_soak_run "${AX_SOAK_ROUNDS:-6}" "${AX_SOAK_GAP:-2}" "${AX_SOAK_IDLE:-20}" 8 "${eps[@]}"
+  best=$(head -n1 <<<"$WARP_SOAK_RESULT"); [[ -n $best ]] || return 1
+  IFS=$'\t' read -r e o t bf ba _ bh <<<"$best"
+  [[ $o -gt 0 ]] || return 1                                  # не ответил никто: остаётся выбор по скорости
+  WARP_CHOSEN=$e
+  cur_row=$(awk -F'\t' -v c="$cur" '$1 == c' <<<"$WARP_SOAK_RESULT" | head -n1)
+  if [[ -n $cur_row && $e != "$cur" ]]; then
+    IFS=$'\t' read -r _ _ _ cf ca _ ch <<<"$cur_row"
+    [[ $cf -eq $bf && $ch -le $bh && $ca -le $(( ba * 11 / 10 + 5 )) ]] && WARP_CHOSEN=$cur
+  fi
+  echo -e " ✅ ${DIM}Самый стабильный из быстрых:${NC} ${BOLD}$WARP_CHOSEN${NC}"
+  return 0
+}
+
 # warp soak [--rounds 8] [--gap 3] [--idle 30] [--timeout 8] [--top 4] [--apply] [endpoint...]
 # Проверка стабильности: быстрый endpoint с «зависаниями» хуже чуть более медленного, но надёжного.
 warp_soak() {
-  local rounds=8 gap=3 idle=30 tmo=8 top=4 apply=0 eps=() ep res="" line
+  local rounds=8 gap=3 idle=30 tmo=8 top=4 apply=0 eps=() ep res=""
   while (($#)); do
     case $1 in
       --rounds) rounds=${2:-8}; shift ;; --gap) gap=${2:-3}; shift ;; --idle) idle=${2:-30}; shift ;;
@@ -1752,13 +1808,8 @@ warp_soak() {
   [[ ${#eps[@]} -gt 0 ]] || die "Нет endpoint'ов: autoxray warp scan --apply или укажите адреса"
   section "🧪 Стабильность WARP"
   echo -e " ${DIM}По $rounds запросов к российским сайтам на каждый endpoint, посередине простой ${idle} с. Займёт около $(( ${#eps[@]} * (rounds * (gap + 1) + idle) / 60 + 1 )) мин.${NC}"
-  for ep in "${eps[@]}"; do
-    printf '   %s ... ' "$ep"
-    line=$(warp_soak_one "$ep" "$rounds" "$gap" "$idle" "$tmo")
-    res+="$line"$'\n'
-    echo -e "$(cut -f2,3 <<<"$line" | awk -F'\t' '{printf "%s из %s", $1, $2}')"
-  done
-  res=$(printf '%s' "$res" | warp_soak_rank)
+  warp_soak_run "$rounds" "$gap" "$idle" "$tmo" "${eps[@]}"
+  res=$WARP_SOAK_RESULT
   echo
   printf '%b   %s %s %s %s %s %s%b\n' "$DIM" "$(pad "#" 3)" "$(pad ENDPOINT 22)" "$(pad УСПЕШНО 10)" "$(pad ПРОВАЛОВ 10)" "$(pad СРЕДНЯЯ 10)" "ПОВТОРОВ РУКОПОЖАТИЯ" "$NC"
   local i=0 e o t f a m h col
@@ -1849,6 +1900,13 @@ cmd_warp() {
     candidates) warp_scan_candidates "${1:-quick}" ;;
     warm) warp_warm ;;
     soak) need_root; warp_soak "$@" ;;
+    stable) need_root
+         case ${1:-} in
+           on) st_edit '.warp.stable = true'; ok "✅ После замера скорости endpoint выбирается по стабильности среди лучших" ;;
+           off) st_edit '.warp.stable = false'; ok "✅ Endpoint выбирается только по скорости" ;;
+           top) [[ ${2:-} =~ ^[1-9][0-9]*$ ]] || die "warp stable top <сколько лучших проверять на стабильность>"; st_edit --argjson n "$2" '.warp.soak_top = $n'; ok "✅ На стабильность проверяются $2 лучших" ;;
+           *) die "warp stable on|off|top N" ;;
+         esac ;;
     renew) need_root
          warn "Будет зарегистрировано новое устройство Cloudflare (новый ключ). Домены, режимы и endpoint сохранятся."
          locked warp_renew; locked apply_or_die; ok "✅ Новое устройство WARP подключено. Проверьте: autoxray warp coldtest" ;;
@@ -1874,12 +1932,14 @@ cmd_warp() {
          st_edit --argjson h "$(printf '%s\n' "$@" | jq -Rn '[inputs]')" '.warp.probe_hosts = $h'; ok "✅ Сайты для замера: $*" ;;
     rescan) need_root; local rarg=""; [[ ${1:-} == now ]] && rarg=now; warp_rescan "$rarg" ;;
     scan) need_root
-         local apply=0 sargs=()
-         while (($#)); do case $1 in --apply) apply=1 ;; *) sargs+=("$1") ;; esac; shift; done
+         local apply=0 nosoak=0 sargs=()
+         while (($#)); do case $1 in --apply) apply=1 ;; --no-soak) nosoak=1 ;; *) sargs+=("$1") ;; esac; shift; done
          [[ $(st '.warp.registered // false') == true ]] || locked warp_register
          if warp_scan "${sargs[@]}"; then
            warp_scan_table
-           if [[ $apply == 1 ]]; then warp_apply_best; locked apply_or_die; ok "✅ Endpoint сохранён."
+           if [[ $apply == 1 ]]; then
+             [[ $nosoak == 1 ]] || warp_choose_stable || true
+             warp_apply_best; locked apply_or_die; ok "✅ Endpoint сохранён."
            else echo -e "\n ${DIM}Применить лучший: ${NC}${CYAN}autoxray warp scan --apply${NC}${DIM}. Ограничить узлы: --colo FRA,AMS или --exclude-colo DME${NC}"; fi
          else die "Ни один endpoint не ответил: WARP недоступен с этого сервера (autoxray warp debug)."; fi ;;
     endpoint) need_root; [[ -n ${1:-} ]] || die "warp endpoint <ip:порт>"
@@ -1913,6 +1973,7 @@ cmd_warp() {
          kv "🇷🇺" "RU на сервере" "$(tick "$(st '.warp.ru // false')") российские сайты, дошедшие до сервера, идут через WARP"
          local wf; wf=$(cat "$WARP_WARM_FILE" 2>/dev/null)
          if [[ -n $wf ]]; then read -r _t _s _m _k <<<"$wf"; kv "🔥" "Прогрев" "$([[ $_s == ok ]] && echo "${GRN}✔${NC} $_m мс" || echo "${RED}✘ неудач подряд: $_k${NC}") ${DIM}$(( ($(now) - _t) / 60 )) мин назад, keepalive $(st '.warp.keepalive // 25') с${NC}"; fi
+         kv "🧪" "Выбор endpoint" "скорость, затем стабильность среди лучших: $(tick "$(st '.warp.stable != false')") ${DIM}(топ $(st '.warp.soak_top // 3'))${NC}"
          kv "🌙" "Ночная проверка" "$(tick "$(st '.warp.nightly // false')") порог $(st '.warp.threshold_ms // 300') мс, глубина $(st '.warp.depth // "quick"') ${DIM}$(tail -n1 "$AX_ETC/warp-rescan.log" 2>/dev/null)${NC}"
          kv "📍" "Endpoint" "$(st '.warp.endpoint // "не задан"') ${DIM}$([[ -n $(st '.warp.colo // empty') ]] && echo "(узел $(st .warp.colo), $(st .warp.rtt) мс)")${NC}"
          local n; n=$(jq '(.warp.domains // []) | length' "$STATE")
@@ -1940,7 +2001,7 @@ cmd_warp() {
            || die "Нет ответа. Проверьте: autoxray warp status; systemctl status xray"
          echo "$trace" | sed 's/^/   /'
          grep -qE '^warp=(on|plus)' <<<"$trace" && ok "✅ WARP работает" || warn "warp не включён в ответе — трафик идёт мимо WARP" ;;
-    *) die "warp: register | on | off | ru on|off | add | del | list | check | scan | coldtest | soak | renew | warm | warmhosts | keepalive | keepwarm | debug | endpoint" ;;
+    *) die "warp: register | on | off | ru on|off | add | del | list | check | scan | coldtest | soak | stable | renew | warm | warmhosts | keepalive | keepwarm | debug | endpoint" ;;
   esac
 }
 
