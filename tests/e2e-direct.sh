@@ -238,6 +238,37 @@ AX_WARP_FAKE_RESULTS=/tmp/fake2.tsv autoxray warp rescan >/dev/null 2>&1
 [ "$before" = "$(jq -r .warp.endpoint /etc/autoxray/state.json)" ] && pass "при выключенной ночной проверке cron ничего не меняет" || fail "rescan сработал при nightly off"
 autoxray warp off >/dev/null
 
+step "Холодный старт WARP: keepalive, прогрев, coldtest, временный подробный лог"
+check "warp_hs_stats разбирает журнал рукопожатий" bash -c '
+  source <(sed -n "/^warp_hs_stats()/,/^}/p" /opt/autoxray/autoxray)
+  printf "%s\n" "2026/10/16 07:24:57.914107 [Debug] peer(x) - Sending handshake initiation" \
+    "2026/10/16 07:25:02.916630 [Debug] peer(x) - Sending handshake initiation" \
+    "2026/10/16 07:25:03.100000 [Debug] peer(x) - Received handshake response" > /tmp/hs.log
+  [ "$(warp_hs_stats /tmp/hs.log)" = "2 1 5186" ]'
+export AX_WARM_TIMEOUT=3
+autoxray warp on --force >/dev/null 2>&1
+[ "$(jq '.outbounds[] | select(.tag == "warp") | .settings.peers[0].keepAlive' /usr/local/etc/xray/config.json)" = 25 ] && pass "в конфиге WARP включён keepAlive 25 с" || fail "keepAlive не в конфиге"
+autoxray warp keepalive 0 >/dev/null && [ "$(jq '.outbounds[] | select(.tag == "warp") | .settings.peers[0].keepAlive' /usr/local/etc/xray/config.json)" = 0 ] && pass "warp keepalive 0 выключает его" || fail "keepalive 0"
+autoxray warp keepalive 25 >/dev/null
+sleep 9   # дать отработать фоновому прогреву после перезапуска Xray
+rm -f /etc/autoxray/.warp-warm
+for _ in 1 2 3; do autoxray warp warm; done
+read -r _t _s _m _k < /etc/autoxray/.warp-warm
+[ "$_s" = fail ] && [ "$_k" = 3 ] && pass "прогрев считает подряд неудачные проверки (профиль ненастоящий)" || fail "прогрев: $(cat /etc/autoxray/.warp-warm)"
+autoxray warp keepwarm off >/dev/null; rm -f /etc/autoxray/.warp-warm; autoxray warp warm; [ ! -e /etc/autoxray/.warp-warm ] && pass "keepwarm off: прогрев не выполняется" || fail "прогрев при keepwarm off"
+autoxray warp keepwarm on >/dev/null
+autoxray warp coldtest --timeout 4 --site example.com > /tmp/cold.out 2>&1; sed -i 's/\x1b\[[0-9;]*m//g' /tmp/cold.out
+grep -q 'Холодный старт WARP' /tmp/cold.out && grep -q 'отправлено: [1-9]' /tmp/cold.out && pass "coldtest: keepalive запускает рукопожатие сразу, в отчёте счётчики" || { fail "coldtest"; cat /tmp/cold.out; }
+grep -q 'не состоялось вообще' /tmp/cold.out && pass "coldtest: вывод для недоступного endpoint" || { fail "вердикт coldtest"; tail -n 6 /tmp/cold.out; }
+autoxray warp off >/dev/null
+autoxray debug on 5 >/dev/null 2>&1
+[ "$(jq -r .log.loglevel /usr/local/etc/xray/config.json)" = debug ] && [ "$(jq -r .log.dnsLog /usr/local/etc/xray/config.json)" = true ] && pass "debug on: уровень debug и журнал DNS" || fail "debug on"
+autoxray debug status | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'включён' && pass "debug status показывает оставшееся время" || fail "debug status"
+jq '.debug.until = 1' /etc/autoxray/state.json > /tmp/st.json && cp /tmp/st.json /etc/autoxray/state.json && chmod 600 /etc/autoxray/state.json
+autoxray ipwatch >/dev/null 2>&1
+{ [ "$(jq -r .log.loglevel /usr/local/etc/xray/config.json)" = none ] && [ "$(jq '.debug // "нет"' /etc/autoxray/state.json)" = '"нет"' ]; } && pass "подробный лог выключился сам по истечении времени" || fail "debug не выключился сам"
+autoxray debug on 5 >/dev/null 2>&1; autoxray debug off >/dev/null 2>&1; [ "$(jq -r .log.loglevel /usr/local/etc/xray/config.json)" = none ] && pass "debug off возвращает обычный режим" || fail "debug off"
+
 step "Версии: баннер обновления и список версий ядра (поддельный GitHub API)"
 mkdir -p /tmp/api/repos/cergo666/autoXRAY/releases /tmp/api/repos/XTLS/Xray-core
 echo '{"tag_name":"v99.0.0"}' > /tmp/api/repos/cergo666/autoXRAY/releases/latest
