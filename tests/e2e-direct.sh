@@ -257,7 +257,9 @@ read -r _t _s _m _k < /etc/autoxray/.warp-warm
 [ "$_s" = fail ] && [ "$_k" = 3 ] && pass "прогрев считает подряд неудачные проверки (профиль ненастоящий)" || fail "прогрев: $(cat /etc/autoxray/.warp-warm)"
 autoxray warp keepwarm off >/dev/null; rm -f /etc/autoxray/.warp-warm; autoxray warp warm; [ ! -e /etc/autoxray/.warp-warm ] && pass "keepwarm off: прогрев не выполняется" || fail "прогрев при keepwarm off"
 autoxray warp keepwarm on >/dev/null
-autoxray warp coldtest --timeout 4 --site example.com > /tmp/cold.out 2>&1; sed -i 's/\x1b\[[0-9;]*m//g' /tmp/cold.out
+autoxray warp coldtest --timeout 4 --site example.com > /tmp/cold.out 2>&1; cold_rc=$?; sed -i 's/\x1b\[[0-9;]*m//g' /tmp/cold.out
+[ "$cold_rc" = 0 ] && pass "coldtest завершается без ошибок оболочки" || { fail "coldtest rc=$cold_rc"; tail -n 3 /tmp/cold.out; }
+grep -q 'ошибка через [0-9]* мс' /tmp/cold.out && grep -q 'Через рабочий Xray сервера' /tmp/cold.out && grep -q 'Адреса сайта' /tmp/cold.out && pass "coldtest: настоящая ошибка и время, путь через рабочий Xray, адреса сайта" || { fail "разделы coldtest"; cat /tmp/cold.out; }
 grep -q 'Холодный старт WARP' /tmp/cold.out && grep -q 'отправлено: [1-9]' /tmp/cold.out && pass "coldtest: keepalive запускает рукопожатие сразу, в отчёте счётчики" || { fail "coldtest"; cat /tmp/cold.out; }
 grep -q 'не состоялось вообще' /tmp/cold.out && pass "coldtest: вывод для недоступного endpoint" || { fail "вердикт coldtest"; tail -n 6 /tmp/cold.out; }
 autoxray warp off >/dev/null

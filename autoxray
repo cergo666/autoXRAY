@@ -9,7 +9,7 @@ set -uo pipefail
 # bash >= 5.2: '&' в замене ${var//a/b} — спецсимвол; ссылки содержат '&'
 shopt -u patsub_replacement 2>/dev/null || true
 
-AX_VERSION="3.7.0"
+AX_VERSION="3.7.1"
 AX_REPO="cergo666/autoXRAY"
 XRAY_TESTED="v26.9.9"          # версия ядра, с которой этот релиз проверен тестами
 API="${AX_API:-https://api.github.com}"
@@ -1328,15 +1328,16 @@ warp_candidates() {
 }
 
 # Конфиг тестового Xray: socks на порту, весь трафик уходит в WARP через указанный endpoint
-warp_probe_cfg() { # endpoint порт [keepalive]
-  jq -n --slurpfile s "$STATE" --arg ep "$1" --argjson port "$2" --argjson ka "${3:-0}" '
-    $s[0].warp as $W | {
+warp_probe_cfg() { # endpoint порт [keepalive] [1 = DNS как у сервера]
+  jq -n --slurpfile s "$STATE" --arg ep "$1" --argjson port "$2" --argjson ka "${3:-0}" --argjson dns "${4:-0}" '
+    $s[0].warp as $W | ({
       log: {loglevel: "debug"},
       inbounds: [{tag: "in", listen: "127.0.0.1", port: $port, protocol: "socks", settings: {udp: false}}],
       outbounds: [{tag: "warp", protocol: "wireguard", settings: {
         secretKey: $W.secretKey, address: $W.address,
         peers: [{publicKey: $W.peerPublicKey, allowedIPs: ["0.0.0.0/0", "::/0"], endpoint: $ep} + (if $ka > 0 then {keepAlive: $ka} else {} end)],
-        mtu: 1280, reserved: $W.reserved, noKernelTun: true, domainStrategy: "ForceIP"}}]}'
+        mtu: 1280, reserved: $W.reserved, noKernelTun: true, domainStrategy: "ForceIP"}}]}
+      + (if $dns == 1 then {dns: {servers: ["https+local://8.8.4.4/dns-query", "https+local://8.8.8.8/dns-query", "https+local://1.1.1.1/dns-query", "localhost"], queryStrategy: "UseIPv4"}} else {} end))'
 }
 
 # warp_probe <endpoint> — отдельный Xray только с WARP спрашивает one.one.one.one/cdn-cgi/trace.
@@ -1391,10 +1392,12 @@ warp_hs_stats() {
 
 ms_of() { awk -v t="${1:-0}" 'BEGIN {printf "%d", t * 1000}'; }
 
-# warp coldtest [--idle СЕК] [--site домен] [--keepalive СЕК] [--endpoint ip:порт]
-# Поднимает отдельный Xray с WARP (как у сервера) и сравнивает первый запрос, второй и запрос после простоя.
+# warp coldtest [--idle СЕК] [--site домен] [--keepalive СЕК] [--endpoint ip:порт] [--timeout СЕК]
+# Поднимает отдельный Xray с WARP (настройки и DNS как у сервера) и сравнивает первый запрос, второй и запрос после простоя;
+# затем повторяет запросы через рабочий Xray сервера. Показывает реальную ошибку curl, время и фрагмент журнала.
 warp_coldtest() {
-  local idle=0 tmo=25 site=sweb.ru ka ep port=10898 cfg log pid i hs init resp first r c1 c2 c3="" m1 m2 m3=0 d s v=0
+  local idle=0 tmo=25 site=sweb.ru ka ep port=10898 cfg log pid i hs init resp first r d s v=0 k
+  local c1 c2 c3="" m1 m2 m3=0 e1 e2 e3 a4 a6 inlist
   ka=$(st '.warp.keepalive // 25'); ep=$(st '.warp.endpoint // empty'); [[ -n $ep ]] || ep=$WARP_ENDPOINT
   while (($#)); do case $1 in --idle) idle=${2:-0}; shift ;; --timeout) tmo=${2:-25}; shift ;; --site) site=${2:-$site}; shift ;; --keepalive) ka=${2:-0}; shift ;; --endpoint) ep=${2:-$ep}; shift ;; esac; shift; done
   command -v xray >/dev/null 2>&1 || die "xray не найден"
@@ -1404,38 +1407,61 @@ warp_coldtest() {
   kv "📍" "Endpoint" "$ep"
   kv "💓" "Keepalive" "$([[ $ka -gt 0 ]] && echo "$ka с" || echo "выключен")"
   kv "🌐" "Сайт" "$site"
+  a4=$(getent ahostsv4 "$site" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' '); a6=$(getent ahostsv6 "$site" 2>/dev/null | awk '$1 ~ /:/ {print $1}' | sort -u | head -n2 | tr '\n' ' ')
+  kv "🔢" "Адреса сайта" "A: ${a4:-нет}  AAAA: ${a6:-нет}"
   echo -e "\n ${BOLD}DNS${NC} ${DIM}(так Xray сервера узнаёт адрес сайта; нужно до первого пакета в туннель)${NC}"
   for s in 8.8.4.4 8.8.8.8 1.1.1.1; do
     d=$("$CURL" -sS -o /dev/null -w '%{time_total}' --max-time 6 -H 'accept: application/dns-json' "https://$s/dns-query?name=$site&type=A" 2>/dev/null) \
       && { d=$(ms_of "$d"); [[ $d -gt 1000 ]] && v=$((v + 1)); echo -e "   DoH $s: ${d} мс"; } || { v=$((v + 1)); echo -e "   DoH $s: ${RED}нет ответа${NC}"; }
   done
   cfg=$(mktemp --suffix=.json); log=$(mktemp)
-  warp_probe_cfg "$ep" "$port" "$ka" >"$cfg"
+  warp_probe_cfg "$ep" "$port" "$ka" 1 >"$cfg"
   xray run -c "$cfg" >"$log" 2>&1 9>&- &
   pid=$!
   for i in $(seq 1 20); do ss -ltn 2>/dev/null | grep -q "127.0.0.1:$port " && break; sleep 0.2; done
-  treq() { "$CURL" -sS -o /dev/null -w '%{http_code} %{time_total}' --max-time "$tmo" --socks5-hostname "127.0.0.1:$port" "https://$site/" 2>/dev/null || echo "000 $tmo"; }
-  echo -e "\n ${BOLD}Запросы через WARP${NC}"
-  r=$(treq); c1=${r%% *}; m1=$(ms_of "${r##* }"); echo -e "   🧊 холодный (новый туннель):   $([[ $c1 == 000 ]] && echo "${RED}нет ответа за $tmo с${NC}" || echo "$m1 мс  (HTTP $c1)")"
-  r=$(treq); c2=${r%% *}; m2=$(ms_of "${r##* }"); echo -e "   🔥 сразу второй (тёплый):      $([[ $c2 == 000 ]] && echo "${RED}нет ответа${NC}" || echo "$m2 мс  (HTTP $c2)")"
+  # treq <socks-адрес>: «код мс curl-код сообщение»; ошибка и время настоящие, а не подставленные
+  treq() { "$CURL" -sS -o /dev/null -w '%{http_code} %{time_total} %{exitcode} %{errormsg}' --max-time "$tmo" --socks5-hostname "$1" "https://$site/" 2>/dev/null || true; }
+  show_req() { # метка код секунды curl-код сообщение
+    local ms; ms=$(ms_of "$3")
+    if [[ $2 == 000 ]]; then echo -e "   $1 ${RED}ошибка через ${ms} мс${NC}: ${5:-нет ответа} ${DIM}(curl $4)${NC}"; else echo -e "   $1 ${ms} мс ${DIM}(HTTP $2)${NC}"; fi
+  }
+  echo -e "\n ${BOLD}Запросы через новый туннель${NC} ${DIM}(отдельный Xray, DNS как у сервера)${NC}"
+  read -r c1 m1 k e1 <<<"$(treq "127.0.0.1:$port")"; show_req "🧊 холодный:                 " "$c1" "$m1" "$k" "$e1"; m1=$(ms_of "$m1")
+  read -r c2 m2 k e2 <<<"$(treq "127.0.0.1:$port")"; show_req "🔥 сразу второй (тёплый):   " "$c2" "$m2" "$k" "$e2"; m2=$(ms_of "$m2")
   if [[ $idle -gt 0 ]]; then
     echo -e "   ⏳ ${DIM}простой $idle с (дольше 180 с сессия WireGuard устаревает)...${NC}"
     sleep "$idle"
-    r=$(treq); c3=${r%% *}; m3=$(ms_of "${r##* }"); echo -e "   🕐 после простоя:             $([[ $c3 == 000 ]] && echo "${RED}нет ответа${NC}" || echo "$m3 мс  (HTTP $c3)")"
+    read -r c3 m3 k e3 <<<"$(treq "127.0.0.1:$port")"; show_req "🕐 после простоя:           " "$c3" "$m3" "$k" "$e3"; m3=$(ms_of "$m3")
   fi
   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -f "$cfg"
   hs=$(warp_hs_stats "$log"); read -r init resp first <<<"$hs"
   echo -e "\n ${BOLD}Рукопожатие WireGuard${NC}"
   echo -e "   отправлено: $init, получено ответов: $resp$([[ -n $first ]] && echo ", до первого ответа: $first мс")"
+
+  inlist=$(jq -r --arg d "$site" '((.warp.domains // []) | map(select(. == ("domain:" + $d) or . == $d)) | length) > 0' "$STATE")
+  echo -e "\n ${BOLD}Через рабочий Xray сервера${NC} ${DIM}(socks 10443 и маршрутизация, как у клиентов)${NC}"
+  echo -e "   сайт в списке WARP: $([[ $inlist == true ]] && echo "${GRN}да${NC}" || echo "${YEL}нет${NC} ${DIM}(запрос уйдёт напрямую с сервера, WARP не участвует; добавить: autoxray warp add $site)${NC}")"
+  local su sp; su=$(st .socks.user); sp=$(st .socks.pass)
+  for i in 1 2 3; do
+    read -r r m3p k e3p <<<"$(treq "$su:$sp@127.0.0.1:10443")"; show_req "▫️ запрос $i:                  " "$r" "$m3p" "$k" "$e3p"
+  done
+
+  echo -e "\n ${BOLD}Журнал тестового Xray${NC} ${DIM}(фрагмент: рукопожатия, DNS, ошибки соединений)${NC}"
+  grep -aiE "$site|dial|failed|error|timeout|reset|refused|handshake|dns" "$log" | grep -av 'Routine:\|UAPI' | sed -E 's/^[0-9]{4}\/[0-9]{2}\/[0-9]{2} //' | cut -c1-200 | head -n 24 | sed 's/^/   /'
+
   echo -e "\n ${BOLD}Вывод${NC}"
   if [[ $c1 == 000 && $resp -eq 0 ]]; then echo -e "   ${RED}✘${NC} Рукопожатие с Cloudflare не состоялось вообще: endpoint недоступен. ${CYAN}autoxray warp scan --apply${NC}"
-  elif [[ $c1 == 000 ]]; then echo -e "   ${RED}✘${NC} Туннель поднялся, но сайт не открылся: проверьте, принимает ли $site адреса Cloudflare, и DNS выше."
   else
-    [[ $init -gt 1 ]] && echo -e "   ${YEL}⚠${NC} Рукопожатие повторялось ($init попыток): первый пакет потерялся, WireGuard ждал 5 с. Типично для потерь UDP до этого endpoint: смените его (${CYAN}autoxray warp scan --apply${NC})."
-    [[ $m1 -gt $((m2 + 1500)) ]] && echo -e "   ${YEL}⚠${NC} Холодный запрос на $((m1 - m2)) мс медленнее тёплого: время уходит на создание туннеля и рукопожатие. Помогает прогрев (${CYAN}autoxray warp keepwarm on${NC}, включён по умолчанию) и keepalive."
-    [[ $v -gt 0 ]] && echo -e "   ${YEL}⚠${NC} Часть DNS-серверов отвечает медленно или не отвечает: первый запрос к новому домену ждёт их. Поставьте быстрые серверы первыми в dns Xray."
-    [[ -n $c3 && $c3 != 000 && $m3 -gt $((m2 + 1500)) ]] && echo -e "   ${YEL}⚠${NC} После простоя туннель снова холодный (+$((m3 - m2)) мс): keepalive не удерживает его, нужен прогрев раз в минуту."
-    [[ $init -le 1 && $m1 -le $((m2 + 1500)) && $v -eq 0 ]] && echo -e "   ${GRN}✔${NC} Холодный старт быстрый: проблема, скорее всего, не в туннеле. Смотрите путь клиента (роутер, XHTTP) и ${CYAN}autoxray debug on${NC}."
+    if [[ $c1 == 000 && $c2 != 000 ]]; then
+      echo -e "   ${YEL}⚠${NC} Первый запрос не прошёл (${e1:-ошибка}), хотя рукопожатие заняло ${first:-?} мс, а второй сразу открылся. Значит, дело не в рукопожатии: первое соединение через свежий туннель не доходит."
+      echo -e "     Посмотрите журнал выше и пришлите этот вывод целиком."
+    elif [[ $c1 == 000 ]]; then echo -e "   ${RED}✘${NC} Сайт не открылся ни разу: проверьте, принимает ли $site адреса Cloudflare."
+    fi
+    [[ $init -gt 2 ]] && echo -e "   ${YEL}⚠${NC} Рукопожатие повторялось ($init попыток): потери UDP до этого endpoint. Смените его: ${CYAN}autoxray warp scan --apply${NC}"
+    [[ $c1 != 000 && $m1 -gt $((m2 + 1500)) ]] && echo -e "   ${YEL}⚠${NC} Холодный запрос на $((m1 - m2)) мс медленнее тёплого: время уходит на создание туннеля."
+    [[ $v -gt 0 ]] && echo -e "   ${YEL}⚠${NC} Часть DNS-серверов отвечает медленно или не отвечает."
+    [[ -n $c3 && $c3 == 000 ]] && echo -e "   ${YEL}⚠${NC} После простоя запрос не прошёл (${e3:-ошибка}): keepalive не удержал туннель."
+    [[ $c1 != 000 && $init -le 2 && $v -eq 0 ]] && echo -e "   ${GRN}✔${NC} Холодный старт в порядке: проблема не в туннеле. Смотрите путь клиента (роутер, XHTTP) и ${CYAN}autoxray debug on${NC}."
   fi
   rm -f "$log"
 }
