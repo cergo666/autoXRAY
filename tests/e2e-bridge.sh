@@ -42,6 +42,7 @@ check "xray -test принимает конфиг моста" xray run -test -c 
 check "nginx -t" nginx -t
 autoxray node list
 [ "$(jq '.inbounds[0].settings.clients[0].id | .[14:18]' /usr/local/etc/xray/config.json)" = '"0000"' ] && pass "UUID пользователя моста с route 0000" || fail "route-группа UUID"
+[ "$(jq -r '.routing.balancers[0].fallbackTag' /usr/local/etc/xray/config.json)" = proxy-1 ] && pass "балансировщик без замеров уходит на первый EU-узел, а не напрямую" || fail "fallbackTag балансировщика: $(jq -r '.routing.balancers[0].fallbackTag' /usr/local/etc/xray/config.json)"
 
 step "Подписка моста через 443"
 TOKEN=$(jq -r '.users[0].token' /etc/autoxray/state.json)
@@ -55,13 +56,18 @@ for i in 0 1 2 3 4 5 6; do
     step "Цепочка клиент -> RU -> EU -> цель: ${names[$i]}"
     addr=127.0.0.1; [[ ${names[$i]} == "EU direct"* ]] && addr=$EU_IP
     client_cfg "$TOKEN" "$i" "$addr" > "/tmp/cl-$i.json"
-    if client_start "/tmp/cl-$i.json" && out=$(via_proxy ok.txt 2>&1) && [ "$out" = TARGET-OK ]; then
+    # stderr не смешивается с ответом: неудачная первая попытка via_proxy не должна портить удачную вторую
+    if client_start "/tmp/cl-$i.json" && out=$(via_proxy ok.txt 2>/tmp/via.err) && [ "$out" = TARGET-OK ]; then
         pass "${names[$i]}: запрос дошёл до цели, которая доступна только на EU"
     else
-        fail "${names[$i]}: '${out:-}'"; tail -n 6 /tmp/client.out; tail -n 6 /var/log/xray/server.out
+        fail "${names[$i]}: '${out:-}' $(cat /tmp/via.err 2>/dev/null)"; tail -n 6 /tmp/client.out; tail -n 6 /var/log/xray/server.out
     fi
 done
 client_stop
+
+step "QR в режиме моста: ссылки ищутся по названию"
+check "user qr xhttp (мост)" autoxray user qr anna xhttp
+autoxray user qr anna hy2 >/dev/null 2>&1 && fail "qr hy2 в режиме моста выдал чужую ссылку" || pass "qr hy2 в режиме моста честно сообщает, что ссылки нет"
 
 step "Учёт трафика на RU"
 autoxray collect

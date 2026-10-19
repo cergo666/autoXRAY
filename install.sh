@@ -17,7 +17,7 @@ BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
 
-AX_RELEASE="3.9.0"
+AX_RELEASE="3.10.0"
 AX_REF_DEFAULT="main"   # при выпуске релиза заменяется на тег (см. .github/workflows/release.yml)
 AX_REF="${AUTOXRAY_REF:-$AX_REF_DEFAULT}"
 RAW="https://raw.githubusercontent.com/cergo666/autoXRAY/$AX_REF"
@@ -49,6 +49,10 @@ if [ ${#VLESS_URLS[@]} -gt 0 ]; then
     echo -e "${GRN}Режим моста RU -> EU, узлов: ${#VLESS_URLS[@]}${NC}"
 fi
 [[ "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || die "Недопустимое имя домена: $DOMAIN"
+# повторная установка: режим берётся из прежней (в режиме моста вопросы про WARP не нужны)
+if [ -f /etc/autoxray/state.json ] && command -v jq >/dev/null && [ "$(jq -r '.mode // "direct"' /etc/autoxray/state.json 2>/dev/null)" = bridge ]; then
+    INIT_MODE=bridge
+fi
 
 # fetch <путь в репозитории> — печатает файл в stdout (локальная копия или raw.githubusercontent)
 fetch() {
@@ -156,6 +160,7 @@ if [ "$WARP_MODE" != off ]; then
         echo -e "  ${CYAN}1${NC}  быстро: по одному адресу из каждого диапазона, около 15 адресов, несколько секунд"
         echo -e "  ${CYAN}2${NC}  подробно: по 20 адресов из диапазона, около 280, 1-3 минуты"
         echo -e "  ${CYAN}3${NC}  все адреса диапазонов, около 3500, может занять десятки минут"
+        echo "  После замера скорости три самых быстрых проверяются на стабильность (серия запросов с паузой), это ещё 2-3 минуты."
     fi
     ask AX_WARP_SCAN "Ваш выбор [1]:" 1
     case $AX_WARP_SCAN in 2|more) WARP_DEPTH="more" ;; 3|all) WARP_DEPTH="all" ;; esac
@@ -247,8 +252,13 @@ bash <(fetch templates/gen_page.sh) "$WEB_PATH" "$AUTH_PATH" || echo -e "${YEL}�
 # ==========================================
 # Xray
 # ==========================================
-bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version "$XRAY_VERSION" \
-    || die "Не удалось установить Xray $XRAY_VERSION"
+# установщик скачивается в файл (сбой загрузки не должен выглядеть как успех); без TERM он падает на вызове tput
+XRAY_INSTALLER=$(mktemp)
+curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$XRAY_INSTALLER" && [ -s "$XRAY_INSTALLER" ] \
+    || die "Не удалось скачать установщик Xray (GitHub недоступен?)"
+[[ -z "$TERM" || "$TERM" == dumb ]] && export TERM=xterm
+bash "$XRAY_INSTALLER" install --version "$XRAY_VERSION" || die "Не удалось установить Xray $XRAY_VERSION"
+rm -f "$XRAY_INSTALLER"
 command -v xray >/dev/null || die "Xray не найден после установки"
 
 # ==========================================

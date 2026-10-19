@@ -1,8 +1,12 @@
 #!/bin/bash
 # заглушка: внешние установщики (Xray-install, ключ nginx, acme.sh) не нужны — всё уже есть в образе
+out=""; prev=""
+for a in "$@"; do [ "$prev" = -o ] && out=$a; prev=$a; done
 for a in "$@"; do
   case $a in
-    *XTLS/Xray-install*) echo 'echo "[stub] xray уже установлен в образе"'; exit 0 ;;
+    *XTLS/Xray-install*)
+      if [ -n "$out" ]; then echo 'echo "[stub] xray уже установлен в образе"' > "$out"; else echo 'echo "[stub] xray уже установлен в образе"'; fi
+      exit 0 ;;
     *nginx_signing.key*) exit 0 ;;
     *api.ipify.org*) exit 22 ;;
   esac

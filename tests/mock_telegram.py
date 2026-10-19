@@ -26,6 +26,14 @@ class Handler(BaseHTTPRequestHandler):
             payload = {"multipart": True, "raw": body[:400].decode("latin1")}
         with open(SENT, "a") as f:
             f.write(json.dumps({"method": method, "token": token, "payload": payload}, ensure_ascii=False) + "\n")
+        if "BAD" in token:   # «отозванный» токен: Telegram отвечает 401
+            out = json.dumps({"ok": False, "error_code": 401, "description": "Unauthorized"}).encode()
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
         if method == "getMe":
             result = {"id": 1, "is_bot": True, "username": "axtest_bot", "first_name": "AX"}
         elif method == "getUpdates":

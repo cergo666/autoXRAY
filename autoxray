@@ -9,7 +9,7 @@ set -uo pipefail
 # bash >= 5.2: '&' в замене ${var//a/b} — спецсимвол; ссылки содержат '&'
 shopt -u patsub_replacement 2>/dev/null || true
 
-AX_VERSION="3.9.0"
+AX_VERSION="3.10.0"
 AX_REPO="cergo666/autoXRAY"
 XRAY_TESTED="v26.9.9"          # версия ядра, с которой этот релиз проверен тестами
 API="${AX_API:-https://api.github.com}"
@@ -369,7 +369,9 @@ $s[0] as $S
       balancers: [{
         tag: "Super_Balancer", selector: ["proxy"],
         strategy: {type: "leastLoad", settings: {maxRTT: "1s", expected: ($S.nodes | length), baselines: ["1s"], tolerance: 0.01}},
-        fallbackTag: "direct"
+        # пока замеров нет (первые секунды после перезапуска) или все узлы не ответили, трафик идёт на первый EU-узел,
+        # а не напрямую с российского сервера
+        fallbackTag: ("proxy-" + ($S.nodes[0].id | tostring))
       }],
       rules: (
         [{inboundTag: ["api"], outboundTag: "api"}]
@@ -397,8 +399,10 @@ render_xray_json() {
   local prog="$SERVER_COMMON"$'\n'"$XRAY_JQ"
   [[ $(mode) == bridge ]] && prog="$SERVER_COMMON"$'\n'"$BRIDGE_COMMON"$'\n'"$BRIDGE_JQ"
   [[ -f $BANS ]] || echo '[]' >"$BANS"
+  # ключи-заглушки (когда активных пользователей нет) постоянны: иначе каждый render менял бы конфиг и перезапускал Xray
+  local h; h=$(jq -r '"dummy:" + (.socks.pass // "") + (.domain // "")' "$STATE" | sha256sum)
   jq -n --slurpfile s "$STATE" --slurpfile t "$TRAFFIC" --slurpfile b "$BANS" --argjson now "$(now)" \
-    --arg dummy_id "$(new_uuid)" --arg dummy_auth "$(rand 'a-f0-9' 16)" "$prog"
+    --arg dummy_id "${h:0:8}-${h:8:4}-4${h:13:3}-8${h:17:3}-${h:20:12}" --arg dummy_auth "${h:32:16}" "$prog"
 }
 
 xray_group() {
@@ -633,7 +637,13 @@ render_subs() {
   done
 
   if [[ ! -f $NGX_MAP ]] || ! cmp -s "$map_new" "$NGX_MAP"; then
-    mkdir -p "$(dirname "$NGX_MAP")"; cat "$map_new" >"$NGX_MAP"; changed=1
+    # Если изменились только счётчики трафика, nginx перечитывается не чаще раза в час: после каждого reload старые
+    # процессы nginx живут, пока не закроются длинные соединения XHTTP, и частые reload копят их в памяти.
+    # Лимиты, сроки, новые и удалённые пользователи применяются сразу.
+    local strip='s/upload=[0-9]+; download=[0-9]+//'
+    if [[ -f $NGX_MAP ]] && [[ $(sed -E "$strip" "$map_new") == "$(sed -E "$strip" "$NGX_MAP")" ]] \
+       && (( $(now) - $(stat -c %Y "$NGX_MAP") < ${AX_USERINFO_EVERY:-3600} )); then :
+    else mkdir -p "$(dirname "$NGX_MAP")"; cat "$map_new" >"$NGX_MAP"; changed=1; fi
   fi
   rm -f "$map_new"
   [[ $changed == 1 ]] && svc reload nginx 2>/dev/null
@@ -674,7 +684,10 @@ render_nginx() {
   local rb=""
   if [[ -n $(report_users) && -n $(st '.reports.token // empty') ]]; then
     rb="    # отчёты о посещениях (секретный адрес; включаются у пользователей: autoxray user set <имя> --report on)
-    location ^~ /r/$(st .reports.token)/ {
+    location = /r/ {
+        return 404;
+    }
+    location ^~ /r/ {
         alias $REPORT_WEB/;
         index index.html;
         add_header Cache-Control \"no-store\" always;
@@ -747,7 +760,7 @@ cmd_user_add() {
   while (($#)); do
     case $1 in
       --limit) [[ $# -ge 2 ]] && is_num "$2" || die "--limit <ГБ>"; limit=$(awk -v g="$2" 'BEGIN{printf "%d", g*1073741824}'); shift 2 ;;
-      --days)  [[ $# -ge 2 ]] && is_num "$2" || die "--days <N>";   expire=$(awk -v n="$2" -v t="$(now)" 'BEGIN{printf "%d", t+n*86400}'); shift 2 ;;
+      --days)  [[ $# -ge 2 ]] && is_num "$2" || die "--days <N> (0 — бессрочно)"; expire=$(awk -v n="$2" -v t="$(now)" 'BEGIN{printf "%d", (n>0) ? t+n*86400 : 0}'); shift 2 ;;
       --reset) [[ ${2:-} =~ ^(monthly|never)$ ]] || die "--reset monthly|never"; reset=$2; shift 2 ;;
       --ru)    [[ ${2:-} =~ ^(direct|server)$ ]] || die "--ru direct|server"; ru=$2; shift 2 ;;
       --ips)   [[ ${2:-} =~ ^[0-9]+$ ]] || die "--ips <число IP> (0 без лимита)"; ips=$2; shift 2 ;;
@@ -769,9 +782,12 @@ cmd_user_del() {
   need_root; need_state
   local name=${1:-}; user_must "$name" >/dev/null
   [[ $(jq '.users | length' "$STATE") -gt 1 ]] || warn "Это последний пользователь — доступ к серверу будет закрыт."
+  report_remove "$name" purge                                  # до удаления из state: нужен токен страницы
   st_edit --arg n "$name" '.users |= map(select(.name != $n))'
-  report_remove "$name" purge
   jq --arg n "$name" 'del(.[$n])' "$TRAFFIC" >"$TRAFFIC.tmp" && mv "$TRAFFIC.tmp" "$TRAFFIC"
+  # известные IP и блокировки удалённого: иначе их унаследовал бы новый пользователь с тем же именем
+  [[ -f $IPS ]] && jq --arg n "$name" 'del(.[$n])' "$IPS" >"$IPS.tmp" && mv "$IPS.tmp" "$IPS"
+  [[ -f $BANS ]] && jq --arg n "$name" 'map(select(.user != $n))' "$BANS" >"$BANS.tmp" && mv "$BANS.tmp" "$BANS"
   apply_or_die
   ok "✅ Пользователь '$name' удалён (ключи и ссылки подписки больше не работают)."
 }
@@ -854,9 +870,13 @@ cmd_user_qr() {
   case $what in
     sub)    qr_show "https://$domain/$token.json" ;;
     links)  qr_show "https://$domain/$token.txt" ;;
-    xhttp)  qr_show "$(user_links "$name" | sed -n 1p | cut -d'|' -f2)" ;;
-    vision) qr_show "$(user_links "$name" | sed -n 2p | cut -d'|' -f2)" ;;
-    hy2)    qr_show "$(user_links "$name" | sed -n 3p | cut -d'|' -f2)" ;;
+    xhttp|vision|hy2)
+      # ссылка ищется по названию, а не по номеру строки: в режиме моста порядок и набор ссылок другие
+      local pat link
+      case $what in xhttp) pat='XHTTP' ;; vision) pat='VISION|RAW' ;; hy2) pat='HYSTERIA' ;; esac
+      link=$(user_links "$name" | grep -E "^[^|]*($pat)" | head -n1 | cut -d'|' -f2-)
+      [[ -n $link ]] || die "Для «$what» нет ссылки в этом режиме ($(mode))."
+      qr_show "$link" ;;
     *) die "QR: sub | links | xhttp | vision | hy2" ;;
   esac
 }
@@ -1065,18 +1085,29 @@ report_prune() {
   return 0
 }
 
-# Удаляет папку отчёта пользователя (html и, если purge, накопленные данные)
+# У каждого пользователя своя секретная ссылка на отчёт (/r/<токен пользователя>/), у администратора своя на список
+# (/r/<общий токен>/). Ссылку пользователя можно отдать ему самому: по ней не видно ни список, ни чужие отчёты.
+report_user_token() { # имя -> токен страницы отчёта (создаётся при первом обращении)
+  local t; t=$(jq -r --arg n "$1" '.users[] | select(.name == $n) | .report_token // empty' "$STATE")
+  if [[ -z $t ]]; then t=$(rand 'A-Za-z0-9' 32); st_edit --arg n "$1" --arg t "$t" '(.users[] | select(.name == $n) | .report_token) = $t'; fi
+  echo "$t"
+}
+
+# Удаляет страницу отчёта пользователя (и, если purge, накопленные данные)
 report_remove() { # имя [purge]
-  local u=${1:?}
-  rm -rf "${REPORT_WEB:?}/${u:?}"
+  local u=${1:?} t
+  t=$(jq -r --arg n "$u" '.users[] | select(.name == $n) | .report_token // empty' "$STATE" 2>/dev/null)
+  [[ -n $t ]] && rm -rf "${REPORT_WEB:?}/${t:?}"
+  rm -rf "${REPORT_WEB:?}/${u:?}"                     # папка по имени: так страницы лежали до 3.10
   [[ ${2:-} == purge ]] && rm -rf "${REPORT_DATA:?}/${u:?}"
   return 0
 }
 
 # report_build <имя> — собирает html пользователя из суточных файлов
 report_build() {
-  local u=$1 tpl="$TPL_DIR/report.html" dir="$REPORT_WEB/$1" data out files keep
+  local u=$1 tpl="$TPL_DIR/report.html" dir data out files keep
   [[ -f $tpl ]] || { warn "Нет шаблона $tpl, отчёт не собран."; return 1; }
+  dir="$REPORT_WEB/$(report_user_token "$u")"
   keep=$(report_keep_days); mkdir -p "$dir"
   mapfile -t files < <(ls "$REPORT_DATA/$u"/*.json 2>/dev/null | sort | tail -n "$keep")
   if [[ ${#files[@]} -gt 0 ]]; then
@@ -1093,22 +1124,26 @@ report_build() {
   chmod 755 "$REPORT_WEB" "$dir"; chmod 644 "$dir/index.html"
 }
 
+# Список отчётов для администратора: /r/<общий токен>/
 report_build_index() {
-  local u items=""
-  mkdir -p "$REPORT_WEB"
-  while read -r u; do [[ -n $u ]] && items+="<li><a href=\"$u/\">$u</a></li>"; done < <(report_users)
-  printf '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="robots" content="noindex"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Отчёты</title><style>body{font:16px system-ui;max-width:520px;margin:40px auto;padding:0 16px}a{color:#0a84d6}li{margin:8px 0}</style></head><body><h1>Отчёты</h1><ul>%s</ul></body></html>\n' "$items" >"$REPORT_WEB/index.html"
-  chmod 755 "$REPORT_WEB"; chmod 644 "$REPORT_WEB/index.html"
+  local u items="" at dir
+  at=$(st '.reports.token // empty'); [[ -n $at ]] || return 0
+  dir="$REPORT_WEB/$at"; mkdir -p "$dir"
+  rm -f "$REPORT_WEB/index.html"                      # список в корне был до 3.10
+  while read -r u; do [[ -n $u ]] && items+="<li><a href=\"../$(report_user_token "$u")/\">$u</a></li>"; done < <(report_users)
+  printf '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="robots" content="noindex"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Отчёты</title><style>body{font:16px system-ui;max-width:520px;margin:40px auto;padding:0 16px}a{color:#0a84d6}li{margin:8px 0}</style></head><body><h1>Отчёты</h1><ul>%s</ul></body></html>\n' "$items" >"$dir/index.html"
+  chmod 755 "$REPORT_WEB" "$dir"; chmod 644 "$dir/index.html"
 }
 
 report_build_all() {
-  local u d
-  while read -r u; do [[ -n $u ]] && report_build "$u"; done < <(report_users)
+  local u d keep=" "
+  while read -r u; do [[ -n $u ]] && { report_build "$u"; keep+="$(report_user_token "$u") "; }; done < <(report_users)
   report_build_index
-  # папки пользователей с выключенным отчётом не отдаются
+  keep+="$(st '.reports.token // empty') "
+  # страницы пользователей с выключенным отчётом и устаревшие папки не отдаются
   for d in "$REPORT_WEB"/*/; do
     [[ -d $d ]] || continue
-    u=$(basename "$d"); report_users | grep -qx "$u" || report_remove "$u"
+    u=$(basename "$d"); [[ $keep == *" $u "* ]] || rm -rf "${REPORT_WEB:?}/${u:?}"
   done
   return 0
 }
@@ -1118,7 +1153,11 @@ report_ensure_token() {
   st_edit --arg t "$(rand 'A-Za-z0-9' 32)" '.reports = ((.reports // {}) + {token: $t, keep_days: (.reports.keep_days // 30)})'
 }
 
-report_url() { echo "https://$(st .domain)/r/$(st '.reports.token // empty')/${1:+$1/}"; }
+# report_url [имя] — ссылка на отчёт пользователя или, без имени, на список отчётов
+report_url() {
+  if [[ -n ${1:-} ]]; then echo "https://$(st .domain)/r/$(report_user_token "$1")/"
+  else echo "https://$(st .domain)/r/$(st '.reports.token // empty')/"; fi
+}
 
 cmd_report() {
   need_state
@@ -1132,16 +1171,18 @@ cmd_report() {
         else echo -e " ⚫ $(pad "$u" 14) ${DIM}выключен${NC}"; fi
       done < <(jq -r '.users[] | [.name, ((.report // false) | tostring)] | @tsv' "$STATE")
       [[ $any == 1 ]] || echo -e " ${DIM}Пользователей нет.${NC}"
-      echo -e "\n ${DIM}Включить: autoxray user set <имя> --report on. Хранение: $(report_keep_days) дн. (autoxray report keep <дней>)${NC}" ;;
+      [[ -n $(st '.reports.token // empty') ]] && echo -e "\n 🗂  Список отчётов (только для вас): ${CYAN}$(report_url)${NC}"
+      echo -e "\n ${DIM}Ссылку на отчёт можно отдать самому пользователю: другие отчёты по ней не видны.${NC}"
+      echo -e " ${DIM}Включить: autoxray user set <имя> --report on. Хранение: $(report_keep_days) дн. (autoxray report keep <дней>)${NC}" ;;
     build) need_root
       if [[ -n ${1:-} ]]; then user_must "$1" >/dev/null; report_build "$1"; report_build_index; else report_build_all; fi
       ok "✅ Отчёт собран." ;;
-    url) user_must "${1:-}" >/dev/null; report_url "$1" ;;
+    url) if [[ -n ${1:-} ]]; then user_must "$1" >/dev/null; report_url "$1"; else report_url; fi ;;
     purge) need_root; u=${1:-}; user_must "$u" >/dev/null
       report_remove "$u" purge; ok "✅ Все данные отчёта '$u' удалены." ;;
     keep) need_root; [[ ${1:-} =~ ^[0-9]+$ && $1 -ge 1 ]] || die "report keep <дней>"
       st_edit --argjson d "$1" '.reports.keep_days = $d'; report_prune; ok "✅ Отчёты хранятся $1 дн." ;;
-    *) die "report: list | build [имя] | url <имя> | purge <имя> | keep <дней>" ;;
+    *) die "report: list | build [имя] | url [имя] | purge <имя> | keep <дней>" ;;
   esac
 }
 
@@ -1191,8 +1232,7 @@ bot_watch() {
 # отключает пользователей с исчерпанным лимитом или истёкшим сроком, обновляет страницы.
 cmd_collect() {
   need_state
-  local before after raw merged
-  before=$(active_names)
+  local raw merged
   if command -v xray >/dev/null 2>&1; then
     raw=$(xray api statsquery -s "$API_ADDR" -pattern "user>>>" -reset 2>/dev/null) || raw=""
     if [[ -n $raw ]]; then
@@ -1213,8 +1253,9 @@ cmd_collect() {
   trim_logs
   if [[ -n $(report_users) ]]; then report_build_all; fi
   report_prune
-  after=$(active_names)
-  if [[ $before != "$after" ]]; then apply_xray; fi
+  # конфиг пересобирается всегда: так закрывается и доступ по истёкшему сроку (сравнение «до/после» его не замечало).
+  # Xray перезапускается, только если конфиг действительно изменился.
+  apply_xray
   render_subs
   bot_status_changes
   bot_watch
@@ -1727,7 +1768,7 @@ warp_soak_one() {
   read -ra hosts <<<"$(warp_probe_hosts)"
   cfg=$(mktemp --suffix=.json); log=$(mktemp)
   warp_probe_cfg "$ep" "$port" "$ka" 1 >"$cfg"
-  xray run -c "$cfg" >"$log" 2>&1 9>&- &
+  xray run -c "$cfg" >"$log" 2>&1 9>&- 7>&- &
   pid=$!
   for i in $(seq 1 20); do ss -ltn 2>/dev/null | grep -q "127.0.0.1:$port " && break; sleep 0.2; done
   half=$((rounds / 2))
@@ -1752,6 +1793,8 @@ warp_soak_rank() { sort -t$'\t' -k4,4n -k7,7n -k5,5n; }
 WARP_SOAK_RESULT=""
 warp_soak_run() {
   local rounds=$1 gap=$2 idle=$3 tmo=$4 ep line res=""; shift 4
+  # у проверки один локальный порт: две одновременные (ручная и ночная) мерили бы чужой туннель
+  exec 7>"$AX_ETC/.soak.lock"; flock -w 900 7 || { warn "Другая проверка стабильности не закончилась."; WARP_SOAK_RESULT=""; return 1; }
   for ep in "$@"; do
     printf '   %s ... ' "$ep"
     line=$(warp_soak_one "$ep" "$rounds" "$gap" "$idle" "$tmo")
@@ -1759,6 +1802,7 @@ warp_soak_run() {
     echo -e "$(cut -f2,3,4 <<<"$line" | awk -F'\t' '{printf "%s из %s (провалов %s)", $1, $2, $3}')"
   done
   WARP_SOAK_RESULT=$(printf '%s' "$res" | warp_soak_rank)
+  exec 7>&-
 }
 
 # Выбор из лучших по скорости: сначала скорость (warp_scan), затем стабильность среди первых N (по умолчанию 3) и текущего.
@@ -1808,7 +1852,7 @@ warp_soak() {
   [[ ${#eps[@]} -gt 0 ]] || die "Нет endpoint'ов: autoxray warp scan --apply или укажите адреса"
   section "🧪 Стабильность WARP"
   echo -e " ${DIM}По $rounds запросов к российским сайтам на каждый endpoint, посередине простой ${idle} с. Займёт около $(( ${#eps[@]} * (rounds * (gap + 1) + idle) / 60 + 1 )) мин.${NC}"
-  warp_soak_run "$rounds" "$gap" "$idle" "$tmo" "${eps[@]}"
+  warp_soak_run "$rounds" "$gap" "$idle" "$tmo" "${eps[@]}" || die "Проверка стабильности не выполнена."
   res=$WARP_SOAK_RESULT
   echo
   printf '%b   %s %s %s %s %s %s%b\n' "$DIM" "$(pad "#" 3)" "$(pad ENDPOINT 22)" "$(pad УСПЕШНО 10)" "$(pad ПРОВАЛОВ 10)" "$(pad СРЕДНЯЯ 10)" "ПОВТОРОВ РУКОПОЖАТИЯ" "$NC"
@@ -1823,6 +1867,7 @@ warp_soak() {
   if [[ $bf -eq 0 ]]; then echo -e " ${GRN}✔${NC} Самый стабильный: ${BOLD}$best${NC} (без провалов)"
   else echo -e " ${YEL}⚠${NC} Безупречных нет: лучший ${BOLD}$best${NC} ($bf провалов). Если проваливаются все, дело не в endpoint'е: ${CYAN}autoxray warp renew${NC}"; fi
   if [[ $apply == 1 ]]; then
+    [[ $(head -n1 <<<"$res" | cut -f2) -gt 0 ]] || die "Ни один endpoint не ответил ни разу, endpoint не меняется. Попробуйте: autoxray warp renew"
     st_edit --arg ep "$best" '.warp.endpoint = $ep'; locked apply_or_die; ok "✅ Endpoint: $best"
   else echo -e " ${DIM}Применить: autoxray warp soak --apply${NC}"; fi
 }
@@ -2078,6 +2123,20 @@ cmd_restore() {
 
 xray_version() { xray version 2>/dev/null | awk 'NR == 1 {print "v" $2}'; }
 
+# Официальный установщик Xray (XTLS/Xray-install). Скачивается в файл: если загрузка не удалась, это ошибка
+# (раньше `bash -c "$(curl ...)"` с пустым скриптом считался успехом). TERM задаётся явно: установщик вызывает tput
+# и без TERM (cron) или с TERM=dumb завершается с ошибкой.
+xray_installer() {
+  local f rc term=${TERM:-}
+  [[ -z $term || $term == dumb ]] && term=xterm
+  f=$(mktemp --suffix=.sh) || return 1
+  if ! "$CURL" -fsSL --max-time 60 "${AX_XRAY_INSTALLER:-https://github.com/XTLS/Xray-install/raw/main/install-release.sh}" -o "$f" || [[ ! -s $f ]]; then
+    rm -f "$f"; warn "Не удалось скачать установщик Xray (GitHub недоступен?)"; return 1
+  fi
+  TERM=$term bash "$f" "$@"; rc=$?
+  rm -f "$f"; return $rc
+}
+
 # Версии Xray новее текущей: «тег<TAB>true|false» (true — пререлиз), свежие сверху
 core_newer() {
   local cur; cur=$(xray_version)
@@ -2121,11 +2180,12 @@ cmd_core() {
       core_is_pre "$v" && echo -e "\n ${BOLD}${RED}🧪 $v это пререлиз.${NC} ${DIM}Он может содержать ошибки и менять поведение. Для постоянной работы выбирайте стабильные версии.${NC}"
       echo -e "\n Сейчас: ${BOLD}${prev:-?}${NC}  →  будет установлена: ${BOLD}$v${NC}"
       if [[ $yes != 1 ]]; then read -rp "$(echo -e " ${BOLD}Продолжить? Введите yes:${NC} ")" a; [[ $a == yes ]] || die "Отменено."; fi
-      bash -c "$("$CURL" -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version "$v" \
+      xray_installer install --version "$v" \
         || die "Установка ядра $v не удалась."
+      [[ $(xray_version) == "$v" ]] || die "После установки ядро сообщает версию $(xray_version), а не $v. Проверьте вывод установщика выше."
       if ! xray run -test -c "$XRAY_CFG" >/dev/null 2>&1; then
         warn "Текущий конфиг не проходит проверку на $v. Возвращаю $prev."
-        [[ -n $prev ]] && bash -c "$("$CURL" -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version "$prev"
+        [[ -n $prev ]] && xray_installer install --version "$prev"
         svc restart xray; die "Обновление отменено: $v несовместима с вашим конфигом."
       fi
       st_edit --arg v "$v" '.xray_version = $v'
@@ -2251,11 +2311,17 @@ cmd_self_update() {
   [[ ${tag#v} == "$AX_VERSION" ]] && { ok "Уже установлена версия $AX_VERSION."; return 0; }
   raw="${AX_RAW_BASE:-https://raw.githubusercontent.com/$AX_REPO}/$tag"
   tmp=$(mktemp -d)
-  for f in "${RELEASE_FILES[@]}"; do
+  "$CURL" -fsSL --max-time 30 "$raw/autoxray" -o "$tmp/autoxray" || { rm -rf "${tmp:?}"; die "Не удалось скачать autoxray ($tag)"; }
+  bash -n "$tmp/autoxray" || { rm -rf "${tmp:?}"; die "Скачанный autoxray не прошёл проверку синтаксиса."; }
+  # список файлов берётся из НОВОЙ версии: в ней могли появиться шаблоны, о которых текущая не знает
+  local files=()
+  mapfile -t files < <(sed -n '/^RELEASE_FILES=(/,/)/p' "$tmp/autoxray" | tr -d '()' | sed 's/^RELEASE_FILES=//' | tr ' ' '\n' | grep -E '^[A-Za-z0-9_./-]+$' | grep -v '\.\.')
+  [[ ${#files[@]} -gt 0 ]] || files=("${RELEASE_FILES[@]}")
+  for f in "${files[@]}"; do
+    [[ $f == autoxray ]] && continue
     mkdir -p "$tmp/$(dirname "$f")"
     "$CURL" -fsSL --max-time 30 "$raw/$f" -o "$tmp/$f" || { rm -rf "${tmp:?}"; die "Не удалось скачать $f ($tag)"; }
   done
-  bash -n "$tmp/autoxray" || { rm -rf "${tmp:?}"; die "Скачанный autoxray не прошёл проверку синтаксиса."; }
   snap=$(snapshot_create) || { rm -rf "${tmp:?}"; die "Не удалось сделать снимок перед обновлением."; }
   echo -e " 💾 ${DIM}Снимок для отката: $snap${NC}"
   install -m 755 "$tmp/autoxray" "$AX_BIN"
@@ -2279,8 +2345,8 @@ cmd_geo_update() {
   local quiet=0 dir=${XRAY_LOCATION_ASSET:-/usr/local/share/xray} before after
   [[ ${1:-} == --quiet ]] && quiet=1
   before=$(cat "$dir"/geoip.dat "$dir"/geosite.dat 2>/dev/null | md5sum)
-  bash -c "$("$CURL" -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install-geodata >/dev/null 2>&1 \
-    || { [[ $quiet == 1 ]] || die "Не удалось обновить гео-данные (нет доступа к GitHub?)"; return 1; }
+  xray_installer install-geodata >/dev/null 2>&1 \
+    || { [[ $quiet == 1 ]] || die "Не удалось обновить гео-данные (нет доступа к GitHub?)"; bot_notify "🗺 Не удалось обновить гео-данные (geoip, geosite). Проверьте: <code>autoxray geo-update</code>"; return 1; }
   after=$(cat "$dir"/geoip.dat "$dir"/geosite.dat 2>/dev/null | md5sum)
   if [[ $before != "$after" ]]; then svc restart xray; [[ $quiet == 1 ]] || ok "🗺 Гео-данные обновлены, Xray перезапущен."
   else [[ $quiet == 1 ]] || ok "🗺 Гео-данные уже актуальны."; fi
@@ -2549,11 +2615,12 @@ bot_links_text() {
 }
 
 bot_send_qr() { # chat имя
-  local name=$1 domain token f
-  command -v qrencode >/dev/null 2>&1 || { tg_send "$1" "qrencode не установлен: apt install qrencode"; return 0; }
+  local chat=$1 name=$2 domain token f
+  command -v qrencode >/dev/null 2>&1 || { tg_send "$chat" "qrencode не установлен: apt install qrencode"; return 0; }
   domain=$(st .domain); token=$(jq -r --arg n "$name" '.users[] | select(.name == $n) | .token' "$STATE")
+  [[ -n $token ]] || { tg_send "$chat" "Пользователь не найден."; return 0; }
   f=$(mktemp --suffix=.png); qrencode -t PNG -s 8 -m 2 -o "$f" "https://$domain/$token.json"
-  tg_photo "$2" "$f" "📷 $name: подписка"; rm -f "$f"
+  tg_photo "$chat" "$f" "📷 $name: подписка"; rm -f "$f"
 }
 
 bot_show_user() { # chat message_id|"" имя
@@ -2699,8 +2766,11 @@ EOF
 }
 
 bot_setup() { # [--token T] [--admin ID] [--proxy URL]
-  local tok="" adm="" prx="" me uname base resp first fn fid a
+  local tok="" adm="" prx="" me uname base resp first="" fn fid a was_active=0 real=$BOT_TOKEN_FILE
+  # новый токен проверяется в отдельном файле: прежний рабочий бот не ломается, если новый не подошёл
+  local BOT_TOKEN_FILE="$AX_ETC/.bot.token.new"
   while (($#)); do case $1 in --token) tok=${2:-}; shift ;; --admin) adm=${2:-}; shift ;; --proxy) prx=${2:-}; shift ;; esac; shift; done
+  setup_fail() { rm -f "$BOT_TOKEN_FILE"; [[ $was_active == 1 ]] && svc start autoxray-bot; die "$1"; }
   if [[ -z $tok ]]; then
     echo -e " ${BOLD}1.${NC} Создайте бота у @BotFather (команда /newbot) и скопируйте токен."
     read -rsp "$(echo -e " ${BOLD}${CYAN}›${NC} Токен бота: ")" tok; echo
@@ -2709,12 +2779,12 @@ bot_setup() { # [--token T] [--admin ID] [--proxy URL]
   (umask 077; printf '%s\n' "$tok" >"$BOT_TOKEN_FILE")
   [[ -n $prx ]] && st_edit --arg p "$prx" '.bot = ((.bot // {}) + {proxy: $p})'
   me=$(tg_call getMe '{}' 20) || me=""
-  if ! jq -e '.ok == true' <<<"$me" >/dev/null 2>&1; then
-    rm -f "$BOT_TOKEN_FILE"
-    die "Telegram не принял токен или api.telegram.org недоступен с этого сервера. Для доступа через прокси: --proxy socks5h://адрес:порт"
-  fi
+  jq -e '.ok == true' <<<"$me" >/dev/null 2>&1 \
+    || setup_fail "Telegram не принял токен или api.telegram.org недоступен с этого сервера. Для доступа через прокси: --proxy socks5h://адрес:порт"
   uname=$(jq -r '.result.username' <<<"$me")
   if [[ -z $adm ]]; then
+    # запущенная служба бота забирала бы сообщения себе (getUpdates у одного бота не делится)
+    if [[ $DRY != 1 ]] && systemctl is-active --quiet autoxray-bot 2>/dev/null; then was_active=1; svc stop autoxray-bot; fi
     echo -e " ${BOLD}2.${NC} Откройте ${CYAN}https://t.me/$uname${NC} и отправьте боту любое сообщение. Жду до двух минут..."
     base=$(tg_call getUpdates '{"offset": -1, "timeout": 0}' 20 | jq -r '(.result[-1].update_id // 0)')
     for _ in $(seq 1 24); do
@@ -2722,15 +2792,16 @@ bot_setup() { # [--token T] [--admin ID] [--proxy URL]
       first=$(jq -c '[.result[]? | select(.message.chat.type == "private")] | .[0] // empty' <<<"$resp")
       [[ -n $first ]] && break
     done
-    [[ -n $first ]] || die "Сообщение не получено. Повторите: autoxray bot setup"
+    [[ -n $first ]] || setup_fail "Сообщение не получено. Повторите: autoxray bot setup"
     fid=$(jq -r '.message.from.id' <<<"$first"); fn=$(jq -r '.message.from | (.first_name // "") + " " + ("@" + (.username // "-"))' <<<"$first")
     echo -e " Сообщение от ${BOLD}$fn${NC}, ID ${BOLD}$fid${NC}."
-    confirm "Сделать этого пользователя администратором" || die "Отменено."
+    confirm "Сделать этого пользователя администратором" || setup_fail "Отменено."
     adm=$fid
   fi
-  [[ $adm =~ ^[0-9]+$ ]] || die "ID администратора: число"
+  [[ $adm =~ ^[0-9]+$ ]] || setup_fail "ID администратора: число"
+  mv -f "$BOT_TOKEN_FILE" "$real"; BOT_TOKEN_FILE=$real
   st_edit --argjson a "$adm" '.bot = ((.bot // {}) + {enabled: true, admins: (((.bot.admins // []) + [$a]) | unique)})'
-  bot_write_unit; svc daemon-reload; svc enable --now autoxray-bot
+  bot_write_unit; svc daemon-reload; svc enable autoxray-bot; svc restart autoxray-bot
   tg_send "$adm" "✅ <b>autoXRAY</b>: бот подключён. Нажмите /help." "$BOT_MAIN_KB" 10 || true
   ok "✅ Бот @$uname настроен, администратор: $adm"
 }
@@ -2770,10 +2841,11 @@ cmd_uninstall() {
   read -rp "Для подтверждения введите yes: " a; [[ $a == yes ]] || die "Отменено."
   svc disable --now autoxray-bot 2>/dev/null; rm -f "$BOT_UNIT"
   [[ -f $TPL_DIR/telegram/uninstall.sh ]] && bash "$TPL_DIR/telegram/uninstall.sh" || true
-  bash -c "$("$CURL" -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge
+  xray_installer remove --purge
   svc disable --now nginx 2>/dev/null; apt-get remove -y nginx >/dev/null 2>&1
   [[ -x $HOME/.acme.sh/acme.sh ]] && "$HOME/.acme.sh/acme.sh" --uninstall >/dev/null 2>&1
-  rm -rf "$web" /var/lib/xray /usr/local/share/autoxray "$AX_ETC" "$NGX_MAP" /etc/cron.d/autoxray \
+  # /var/lib/autoxray: снимки обновлений (в них ключи и пароли) и html-отчёты о посещениях
+  rm -rf "$web" /var/lib/xray /var/lib/autoxray "${SNAP_DIR:?}" "${REPORT_WEB:?}" /usr/local/share/autoxray "$AX_ETC" "$NGX_MAP" /etc/cron.d/autoxray \
          /etc/sysctl.d/999-autoXRAY.conf /etc/security/limits.d/99-autoXRAY.conf /usr/local/bin/autoxray
   ok "✅ autoXRAY удалён."
 }
@@ -2784,6 +2856,7 @@ cmd_init() {
   need_root
   local domain="" fp=firefox xp="" ap=/api/v1/authenticate web="" user=main xv="" mode=direct nodes='[]' nj
   while (($#)); do
+    [[ $# -ge 2 ]] || die "init: у параметра $1 нет значения"   # все параметры init с аргументом
     case $1 in
       --mode) [[ ${2:-} =~ ^(direct|bridge)$ ]] || die "--mode direct|bridge"; mode=$2; shift 2 ;;
       --node) nj=$(parse_vless "${2:-}") || die "Неверная vless-ссылка узла: ${2:-}"

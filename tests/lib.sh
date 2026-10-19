@@ -14,6 +14,10 @@ finish() {
     [ "$FAIL" -eq 0 ]
 }
 
+# wait_for <команда...> — до 10 с ждёт, пока команда не выполнится успешно (вместо фиксированных sleep)
+wait_for() { local _; for _ in $(seq 1 40); do "$@" >/dev/null 2>&1 && return 0; sleep 0.25; done; return 1; }
+not_user() { ! jq -e --arg n "$1" '.users[] | select(.name == $n)' /etc/autoxray/state.json >/dev/null; }
+
 # Статус пользователя (active|limit|expired|disabled) из машиночитаемого списка
 ustatus() { autoxray user list --plain | awk -F'\t' -v n="$1" '$1 == n {print $2}'; }
 

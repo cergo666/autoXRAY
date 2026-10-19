@@ -58,6 +58,9 @@ autoxray collect
 up=$(jq '.alice.up // 0' /etc/autoxray/traffic.json); down=$(jq '.alice.down // 0' /etc/autoxray/traffic.json)
 [ "$((up + down))" -gt 0 ] && pass "alice: ↑$up ↓$down байт учтено" || { fail "трафик alice не учтён"; cat /etc/autoxray/traffic.json; }
 autoxray stats
+grep -q "\"/$TOKEN_A.json\" \"upload=0; download=0" /etc/nginx/autoxray-userinfo.map && pass "только трафик изменился: nginx не перечитывается чаще раза в час" || fail "map переписан из-за счётчиков"
+AX_USERINFO_EVERY=0 autoxray collect >/dev/null
+grep -q "\"/$TOKEN_A.json\" \"upload=0; download=0" /etc/nginx/autoxray-userinfo.map && fail "map не обновился по истечении интервала" || pass "по истечении интервала трафик в заголовке обновляется"
 
 step "Лимит: bob с лимитом ~1 КБ"
 client_cfg "$TOKEN_B" 1 127.0.0.1 > /tmp/client-b.json
@@ -82,6 +85,22 @@ new_uuid=$(jq -r '.users[] | select(.name=="alice").uuid' /etc/autoxray/state.js
 code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/$TOKEN_A.json"); [ "$code" = 404 ] && pass "старая ссылка alice мертва" || fail "старая ссылка жива: $code"
 autoxray user del bob >/dev/null && pass "bob удалён" || fail "del bob"
 code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/$TOKEN_B.json"); [ "$code" = 404 ] && pass "ссылка bob мертва" || fail "ссылка bob жива: $code"
+
+step "Сроки: --days 0 и истечение срока закрывает доступ без ручных команд"
+autoxray user add zed --days 0 >/dev/null && [ "$(ustatus zed)" = active ] && [ "$(jq '.users[] | select(.name=="zed") | .expire' /etc/autoxray/state.json)" = 0 ] \
+  && pass "user add --days 0: бессрочный, а не истёкший" || fail "user add --days 0: $(ustatus zed)"
+autoxray user add exp1 --days 1 >/dev/null
+jq '(.users[] | select(.name == "exp1") | .expire) = (now | floor) - 5' /etc/autoxray/state.json > /tmp/st.json && cp /tmp/st.json /etc/autoxray/state.json && chmod 600 /etc/autoxray/state.json
+autoxray collect >/dev/null 2>&1
+[ "$(jq '[.inbounds[0].settings.clients[].email] | index("exp1")' /usr/local/etc/xray/config.json)" = null ] && pass "collect убирает из Xray пользователя с истёкшим сроком" || fail "истёкший exp1 остался в конфиге Xray"
+xpid=$(cat /run/xray-server.pid); autoxray collect >/dev/null 2>&1
+[ "$xpid" = "$(cat /run/xray-server.pid)" ] && pass "collect без изменений не перезапускает Xray" || fail "collect перезапустил Xray без причины"
+autoxray user del zed >/dev/null; autoxray user del exp1 >/dev/null
+check "без активных пользователей конфиг не меняется от render к render (постоянные заглушки)" bash -c '
+  d=/tmp/axdummy; rm -rf $d; mkdir -p $d
+  export AX_ETC=$d/etc AX_DRY=1 AX_XRAY_CFG=$d/x.json AX_NGINX_MAP=$d/map AX_NGINX_CONF=$d/n.conf AX_WEB=$d/web AX_REPORT_WEB=$d/rep
+  autoxray init --domain d.test --user u1 >/dev/null && autoxray user set u1 --disable >/dev/null 2>&1
+  a=$(md5sum < $d/x.json); autoxray render >/dev/null 2>&1; [ "$a" = "$(md5sum < $d/x.json)" ] && jq -e ".inbounds[0].settings.clients | length == 1" $d/x.json'
 
 step "Режим российских сайтов у каждого пользователя"
 autoxray user add carl --ru server >/dev/null && pass "carl создан с --ru server" || fail "user add carl"
@@ -122,7 +141,9 @@ autoxray ips dan | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'заблокирован
 autoxray unban dan >/dev/null && client_start /tmp/d2.json && via_proxy ok.txt >/dev/null && pass "после unban второй IP снова проходит" || fail "unban"
 client_stop
 autoxray user set dan --ips 0 >/dev/null; [ "$(jq -r .log.loglevel /usr/local/etc/xray/config.json)" = none ] && pass "без лимитов лог доступа снова выключен" || fail "лог доступа остался включён"
+jq --argjson t "$(( $(date +%s) + 600 ))" '. + [{user: "dan", ip: "10.9.9.9", until: $t}]' /etc/autoxray/bans.json > /tmp/b.json && cp /tmp/b.json /etc/autoxray/bans.json
 autoxray user del dan >/dev/null
+jq -e 'map(select(.user == "dan")) | length == 0' /etc/autoxray/bans.json >/dev/null && pass "user del снимает блокировки удалённого" || fail "блокировки dan остались после удаления"
 
 step "Отчёты о посещениях: сбор, агрегация, html, доступ по секретному адресу"
 check "report_parse чистит имена хостов (защита от внедрения html)" bash -c '
@@ -131,15 +152,20 @@ check "report_parse чистит имена хостов (защита от вн
   case "$out" in *"<"*|*">"*|*"("*) exit 1 ;; esac; [ -n "$out" ]'
 autoxray user add erin --report on >/tmp/erin.out 2>&1 && pass "erin создан с отчётом" || { fail "user add erin --report on"; cat /tmp/erin.out; }
 RT=$(jq -r '.reports.token' /etc/autoxray/state.json); [ ${#RT} = 32 ] && pass "выдан секретный токен отчётов" || fail "токен отчётов: '$RT'"
-grep -q "location ^~ /r/$RT/" /etc/nginx/conf.d/default.conf && pass "nginx: блок отчётов добавлен" || fail "в nginx нет блока отчётов"
+grep -q "location ^~ /r/" /etc/nginx/conf.d/default.conf && pass "nginx: блок отчётов добавлен" || fail "в nginx нет блока отчётов"
+EURL=$(autoxray report url erin); ET=$(jq -r '.users[] | select(.name=="erin") | .report_token' /etc/autoxray/state.json)
+[ ${#ET} = 32 ] && [ "$EURL" = "https://$DOMAIN/r/$ET/" ] && [ "$ET" != "$RT" ] && pass "у erin своя ссылка на отчёт, отдельная от списка" || fail "ссылка erin: $EURL"
 check "nginx -t с блоком отчётов" nginx -t
 [ "$(jq -r .log.loglevel /usr/local/etc/xray/config.json)" = warning ] && pass "лог доступа включён ради отчёта" || fail "лог доступа не включён"
 TOKEN_E=$(jq -r '.users[] | select(.name=="erin").token' /etc/autoxray/state.json)
 for _ in 1 2 3 4 5 6 7 8 9 10; do   # nginx -s reload асинхронный: воркеры подхватывают конфиг не мгновенно
-  code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/r/$RT/erin/"); [ "$code" = 200 ] && break; sleep 0.5
+  code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/r/$ET/"); [ "$code" = 200 ] && break; sleep 0.5
 done
 [ "$code" = 200 ] && pass "страница отчёта открывается по секретному адресу" || fail "страница отчёта: $code"
-code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/r/ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ/erin/"); [ "$code" = 404 ] && pass "чужой токен отчётов даёт 404" || fail "чужой токен отчётов: $code"
+curl -fsS --max-time 8 "https://$DOMAIN/r/$RT/" | grep -q "\.\./$ET/" && pass "список отчётов администратора ведёт на страницу erin" || fail "список отчётов"
+code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/r/"); [ "$code" = 404 ] && pass "без токена /r/ даёт 404" || fail "/r/: $code"
+code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/r/$RT/erin/"); [ "$code" = 404 ] && pass "по токену списка нельзя открыть отчёт по имени" || fail "/r/<список>/erin/: $code"
+code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/r/ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ/"); [ "$code" = 404 ] && pass "чужой токен отчётов даёт 404" || fail "чужой токен отчётов: $code"
 client_cfg "$TOKEN_E" 1 127.0.0.1 > /tmp/e1.json
 : > /var/log/xray/access.log
 client_start /tmp/e1.json
@@ -152,15 +178,15 @@ EDAY=$(ls /etc/autoxray/reports/erin/*.json 2>/dev/null | head -n1)
 jq -e '.total >= 2 and (.hosts | has("93.184.216.34")) and (.src | has("127.0.0.1")) and (.out.direct >= 2) and (.hours | length == 24)' "$EDAY" >/dev/null && pass "агрегаты: адрес назначения, IP клиента, выход, часы" || { fail "агрегаты не сошлись"; jq -c . "$EDAY"; }
 jq -e '.hosts | has("example.com")' "$EDAY" >/dev/null && pass "в отчёте виден домен, который запросил клиент" || { fail "домен example.com не попал в отчёт"; jq -c '.hosts' "$EDAY"; }
 autoxray report build erin >/dev/null
-curl -fsS --max-time 8 "https://$DOMAIN/r/$RT/erin/" -o /tmp/report.html
+curl -fsS --max-time 8 "https://$DOMAIN/r/$ET/" -o /tmp/report.html
 grep -q '93.184.216.34' /tmp/report.html && ! grep -q '</script>.evil' /tmp/report.html && pass "html отчёта содержит данные и безопасен" || fail "html отчёта"
 [ "$(stat -c %a /etc/autoxray/reports)" = 700 ] && pass "данные отчётов закрыты (700)" || fail "права данных отчётов"
 echo '{"date":"2000-01-01","total":1,"hosts":{"old.test":1},"hours":[]}' > /etc/autoxray/reports/erin/2000-01-01.json
 autoxray report keep 7 >/dev/null; [ ! -e /etc/autoxray/reports/erin/2000-01-01.json ] && pass "старые дни удаляются по сроку хранения" || fail "retention не сработал"
 autoxray user set erin --report off >/dev/null 2>&1
-[ ! -d /var/lib/autoxray/reports/erin ] && pass "после выключения папка отчёта удалена" || fail "папка отчёта осталась"
+[ ! -d "/var/lib/autoxray/reports/$ET" ] && pass "после выключения папка отчёта удалена" || fail "папка отчёта осталась"
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-  code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/r/$RT/erin/"); [ "$code" = 404 ] && break; sleep 0.5
+  code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/r/$ET/"); [ "$code" = 404 ] && break; sleep 0.5
 done
 [ "$code" = 404 ] && pass "после выключения адрес отчёта не отдаётся" || fail "адрес отчёта: $code"
 [ "$(jq -r .log.loglevel /usr/local/etc/xray/config.json)" = none ] && pass "лог доступа снова выключен" || fail "лог доступа остался"
@@ -275,14 +301,14 @@ autoxray warp on --force >/dev/null 2>&1
 [ "$(jq '.outbounds[] | select(.tag == "warp") | .settings.peers[0].keepAlive' /usr/local/etc/xray/config.json)" = 25 ] && pass "в конфиге WARP включён keepAlive 25 с" || fail "keepAlive не в конфиге"
 autoxray warp keepalive 0 >/dev/null && [ "$(jq '.outbounds[] | select(.tag == "warp") | .settings.peers[0].keepAlive' /usr/local/etc/xray/config.json)" = 0 ] && pass "warp keepalive 0 выключает его" || fail "keepalive 0"
 autoxray warp keepalive 25 >/dev/null
-sleep 9   # дать отработать фоновому прогреву после перезапуска Xray
+for _ in $(seq 1 60); do pgrep -f '[a]utoxray warp keepalive' >/dev/null || break; sleep 0.25; done   # фоновый прогрев после перезапуска Xray
 rm -f /etc/autoxray/.warp-warm
 for _ in 1 2 3; do autoxray warp warm; done
 read -r _t _s _m _k < /etc/autoxray/.warp-warm
 [ "$_s" = fail ] && [ "$_k" = 3 ] && pass "прогрев считает подряд неудачные проверки (профиль ненастоящий)" || fail "прогрев: $(cat /etc/autoxray/.warp-warm)"
 autoxray warp keepwarm off >/dev/null; rm -f /etc/autoxray/.warp-warm; autoxray warp warm; [ ! -e /etc/autoxray/.warp-warm ] && pass "keepwarm off: прогрев не выполняется" || fail "прогрев при keepwarm off"
 autoxray warp keepwarm on >/dev/null
-autoxray warp coldtest --timeout 4 --site example.com > /tmp/cold.out 2>&1; cold_rc=$?; sed -i 's/\x1b\[[0-9;]*m//g' /tmp/cold.out
+autoxray warp coldtest --timeout 2 --site example.com > /tmp/cold.out 2>&1; cold_rc=$?; sed -i 's/\x1b\[[0-9;]*m//g' /tmp/cold.out
 [ "$cold_rc" = 0 ] && pass "coldtest завершается без ошибок оболочки" || { fail "coldtest rc=$cold_rc"; tail -n 3 /tmp/cold.out; }
 grep -q 'ошибка через [0-9]* мс' /tmp/cold.out && grep -q 'Через рабочий Xray сервера' /tmp/cold.out && grep -q 'Адреса сайта' /tmp/cold.out && grep -q 'Маршрут на сервере' /tmp/cold.out && pass "coldtest: настоящая ошибка и время, путь через рабочий Xray, адреса сайта" || { fail "разделы coldtest"; cat /tmp/cold.out; }
 grep -q 'Холодный старт WARP' /tmp/cold.out && grep -q 'отправлено: [1-9]' /tmp/cold.out && pass "coldtest: keepalive запускает рукопожатие сразу, в отчёте счётчики" || { fail "coldtest"; cat /tmp/cold.out; }
@@ -293,6 +319,9 @@ check "warp_soak_rank: меньше провалов, потом повторо�
   [ "$(printf "%s\n" "$t" | warp_soak_rank | cut -f1 | tr "\n" " ")" = "c:1 b:1 d:1 a:1 " ]'
 autoxray warp soak --rounds 2 --gap 1 --idle 0 --timeout 2 162.159.192.1:2408 > /tmp/soak.out 2>&1; soak_rc=$?; sed -i 's/\x1b\[[0-9;]*m//g' /tmp/soak.out
 [ "$soak_rc" = 0 ] && grep -q 'Стабильность WARP' /tmp/soak.out && grep -q '0 из 2' /tmp/soak.out && grep -q 'Безупречных нет' /tmp/soak.out && pass "warp soak: таблица стабильности и вывод для недоступного endpoint" || { fail "warp soak (rc=$soak_rc)"; cat /tmp/soak.out; }
+ep_before=$(jq -r .warp.endpoint /etc/autoxray/state.json)
+autoxray warp soak --apply --rounds 1 --gap 0 --idle 0 --timeout 1 162.159.192.1:2408 >/dev/null 2>&1 && fail "soak --apply применил endpoint, который не ответил ни разу" \
+  || { [ "$ep_before" = "$(jq -r .warp.endpoint /etc/autoxray/state.json)" ] && pass "soak --apply не меняет endpoint, если никто не ответил" || fail "soak --apply сменил endpoint"; }
 old_key=$(jq -r .warp.secretKey /etc/autoxray/state.json); old_ep=$(jq -r .warp.endpoint /etc/autoxray/state.json); old_dom=$(jq -c .warp.domains /etc/autoxray/state.json)
 AX_CURL=/tmp/fakecurl autoxray warp renew >/tmp/renew.out 2>&1
 [ "$old_key" != "$(jq -r .warp.secretKey /etc/autoxray/state.json)" ] && [ "$old_ep" = "$(jq -r .warp.endpoint /etc/autoxray/state.json)" ] && [ "$old_dom" = "$(jq -c .warp.domains /etc/autoxray/state.json)" ] && pass "warp renew: новый ключ, endpoint и домены сохранены" || { fail "warp renew"; cat /tmp/renew.out; }
@@ -325,7 +354,10 @@ echo "$out" | grep -q 'rc=0 CHOICE=1' && pass "choose: пункт 2 -> инде�
 step "Диагностика, гео-данные, файрвол (dry-run), интерфейс"
 autoxray doctor > /tmp/doctor.out 2>&1 && pass "doctor: критичных проблем нет" || { fail "doctor нашёл проблемы"; sed "s/\x1b\[[0-9;]*m//g" /tmp/doctor.out; }
 check "firewall --dry-run" autoxray firewall --dry-run
-check "geo-update (настоящий install-geodata)" autoxray geo-update
+printf '%s\n' '[ -n "$TERM" ] && [ "$TERM" != dumb ] || { echo "нет TERM" >&2; exit 2; }' '[ "$1" = install-geodata ] && touch /tmp/geo.called' > /tmp/fake-installer.sh
+rm -f /tmp/geo.called
+env -u TERM AX_XRAY_INSTALLER=file:///tmp/fake-installer.sh autoxray geo-update --quiet && [ -e /tmp/geo.called ] && pass "geo-update из cron (без TERM) вызывает установщик" || fail "geo-update без TERM"
+AX_XRAY_INSTALLER=file:///nonexistent/install.sh autoxray geo-update >/dev/null 2>&1 && fail "geo-update «успешен» без скачанного установщика" || pass "geo-update сообщает об ошибке, если установщик не скачался"
 check "status/stats/user list печатаются" bash -c 'autoxray status && autoxray stats && autoxray user list'
 [ "$(autoxray user list | sed "s/\x1b\[[0-9;]*m//g" | grep -c "активен")" -ge 1 ] && pass "список пользователей с русскими статусами" || fail "список пользователей"
 check "help" bash -c 'autoxray help | grep -q doctor'
@@ -371,7 +403,7 @@ install_cli
 step "Telegram-бот: команды администратора, подтверждения, уведомления (поддельный Telegram API)"
 TG=/tmp/tg; rm -rf "$TG"; mkdir -p "$TG"
 python3 /opt/autoxray/tests/mock_telegram.py 8081 "$TG" & MOCK=$!
-sleep 1
+wait_for bash -c 'exec 3<>/dev/tcp/127.0.0.1/8081' 
 export AX_TG_API=http://127.0.0.1:8081 AX_TG_POLL=1 AX_TG_TIMEOUT=10
 TOK=123456:TESTTOKENTESTTOKENTESTTOKEN12
 autoxray bot setup --token "$TOK" --admin 111 >/tmp/bot-setup.out 2>&1 && pass "bot setup: токен принят, администратор добавлен" || { fail "bot setup"; sed 's/\x1b\[[0-9;]*m//g' /tmp/bot-setup.out; }
@@ -379,33 +411,40 @@ autoxray bot setup --token "$TOK" --admin 111 >/tmp/bot-setup.out 2>&1 && pass "
 jq -e '.bot.enabled == true and .bot.admins == [111]' /etc/autoxray/state.json >/dev/null && pass "в настройках только admin 111" || fail "настройки бота"
 grep -q 'ExecStart=.*autoxray bot run' /etc/systemd/system/autoxray-bot.service && pass "создан unit autoxray-bot.service" || fail "unit не создан"
 autoxray bot run >/tmp/bot-run.out 2>&1 & BOT=$!
-sleep 2
 qn=0
 tgmsg() { qn=$((qn + 1)); jq -nc --argjson i $qn --argjson f "$1" --arg t "$2" '{update_id: $i, message: {message_id: $i, from: {id: $f, first_name: "T"}, chat: {id: $f, type: "private"}, text: $t}}' >> "$TG/queue.jsonl"; }
 tgcb() { qn=$((qn + 1)); jq -nc --argjson i $qn --argjson f "$1" --arg d "$2" '{update_id: $i, callback_query: {id: ("cb" + ($i | tostring)), from: {id: $f}, message: {message_id: 7, chat: {id: $f, type: "private"}}, data: $d}}' >> "$TG/queue.jsonl"; }
 sent_has() { for _ in $(seq 1 30); do jq -e --arg p "$1" 'select((.payload.text // "") | test($p))' "$TG/sent.jsonl" >/dev/null 2>&1 && return 0; sleep 0.5; done; return 1; }
+# tg_sync — дождаться, пока бот обработает всё отправленное: обновления идут по очереди, поэтому ответ на /id
+# от постороннего 333 (его бот показывает всем) означает, что предыдущие уже обработаны
+tg_sync() {
+  local n; n=$(jq -s '[.[] | select(.payload.chat_id == 333)] | length' "$TG/sent.jsonl" 2>/dev/null || echo 0)
+  tgmsg 333 /id; wait_for bash -c "[ \$(jq -s '[.[] | select(.payload.chat_id == 333)] | length' $TG/sent.jsonl) -gt $n ]"
+}
 sent_method() { for _ in $(seq 1 30); do jq -e --arg m "$1" 'select(.method == $m)' "$TG/sent.jsonl" >/dev/null 2>&1 && return 0; sleep 0.5; done; return 1; }
 
 tgmsg 111 /status;  sent_has "autoXRAY" && pass "/status отвечает администратору" || fail "/status"
-tgmsg 222 /status;  tgmsg 222 /users; sleep 3
+tgmsg 222 /status;  tgmsg 222 /users; tg_sync
 [ "$(jq -s '[.[] | select(.method == "sendMessage" and .payload.chat_id == 222)] | length' "$TG/sent.jsonl")" = 0 ] && pass "постороннему бот не отвечает" || fail "бот ответил постороннему"
 tgmsg 222 /id;      sent_has "222" && pass "/id работает у всех и показывает ID" || fail "/id"
 sent_kb() { for _ in $(seq 1 30); do jq -e --arg d "$1" 'select(.method == "sendMessage") | .payload.reply_markup.inline_keyboard[][] | select(.callback_data == $d)' "$TG/sent.jsonl" >/dev/null 2>&1 && return 0; sleep 0.5; done; return 1; }
 tgmsg 111 /users;   sent_kb "u:alice" && pass "/users: кнопка пользователя alice" || fail "/users"
 tgmsg 111 "/add frank 5 7"; sent_has "создан" && jq -e '.users[] | select(.name == "frank" and .limit == 5368709120 and .expire > 0)' /etc/autoxray/state.json >/dev/null && pass "/add создал frank с лимитом и сроком" || fail "/add frank"
 tgmsg 111 "/add bad!name"; sent_has "Имя:" && ! jq -e '.users[] | select(.name == "bad!name")' /etc/autoxray/state.json >/dev/null && pass "неверное имя отклонено" || fail "проверка имени"
-tgmsg 111 '/add x;touch /tmp/pwned 1'; sleep 2; [ ! -e /tmp/pwned ] && pass "внедрение команд через аргументы невозможно" || fail "ВНЕДРЕНИЕ КОМАНДЫ"
-tgmsg 111 "/limit frank 10"; sleep 2; [ "$(jq '.users[] | select(.name == "frank") | .limit' /etc/autoxray/state.json)" = 10737418240 ] && pass "/limit меняет лимит" || fail "/limit"
-tgcb 111 "u:frank:lim:50"; sleep 2; [ "$(jq '.users[] | select(.name == "frank") | .limit' /etc/autoxray/state.json)" = 53687091200 ] && pass "кнопка лимита 50 ГБ" || fail "кнопка лимита"
-tgcb 111 "u:frank:tog"; sleep 2; [ "$(jq '.users[] | select(.name == "frank") | .enabled' /etc/autoxray/state.json)" = false ] && pass "кнопка отключения" || fail "кнопка отключения"
+tgmsg 111 '/add x;touch /tmp/pwned 1'; tg_sync; [ ! -e /tmp/pwned ] && pass "внедрение команд через аргументы невозможно" || fail "ВНЕДРЕНИЕ КОМАНДЫ"
+frank_is() { local _; for _ in $(seq 1 40); do [ "$(jq --arg f "$1" '.users[] | select(.name == "frank") | .[$f]' /etc/autoxray/state.json)" = "$2" ] && return 0; sleep 0.25; done; return 1; }
+tgmsg 111 "/limit frank 10"; frank_is limit 10737418240 && pass "/limit меняет лимит" || fail "/limit"
+tgcb 111 "u:frank:lim:50"; frank_is limit 53687091200 && pass "кнопка лимита 50 ГБ" || fail "кнопка лимита"
+tgcb 111 "u:frank:tog"; frank_is enabled false && pass "кнопка отключения" || fail "кнопка отключения"
 tgcb 111 "u:alice:qr"; sent_method sendPhoto && pass "QR отправляется картинкой" || fail "sendPhoto"
+jq -r 'select(.method == "sendPhoto") | .payload.raw' "$TG/sent.jsonl" | tr -d '\r' | grep -a -A2 'name="chat_id"' | grep -aqx 111 && pass "QR уходит в чат администратора" || fail "QR отправлен не в тот чат"
 tgcb 111 "u:alice:links"; sent_has "vless://" && pass "кнопка «Ссылки» присылает ссылки" || fail "ссылки"
-tgcb 111 "u:frank:del"; sent_method editMessageText; sleep 2
+tgcb 111 "u:frank:del"; tg_sync
 jq -e '.users[] | select(.name == "frank")' /etc/autoxray/state.json >/dev/null && pass "удаление требует подтверждения (пользователь ещё есть)" || fail "удалился без подтверждения"
-tgcb 222 "u:frank:delok"; sleep 2
+tgcb 222 "u:frank:delok"; tg_sync
 jq -e '.users[] | select(.name == "frank")' /etc/autoxray/state.json >/dev/null && pass "callback постороннего игнорируется" || fail "посторонний удалил пользователя"
-tgcb 111 "u:frank:delok"; sleep 3
-jq -e '.users[] | select(.name == "frank")' /etc/autoxray/state.json >/dev/null && fail "подтверждённое удаление не сработало" || pass "подтверждённое удаление работает"
+tgcb 111 "u:frank:delok"
+wait_for not_user frank && pass "подтверждённое удаление работает" || fail "подтверждённое удаление не сработало"
 ! pgrep -af "TESTTOKEN" >/dev/null && pass "токен не виден в списке процессов" || fail "токен в аргументах процесса"
 ! grep -q TESTTOKEN /tmp/bot-run.out && pass "токен не попадает в журнал бота" || fail "токен в журнале"
 
@@ -418,6 +457,8 @@ sent_has "hank.*лимит" && pass "уведомление: исчерпан л
 autoxray bot test >/dev/null 2>&1; sent_has "Проверка уведомлений" && pass "bot test присылает уведомление администратору" || fail "bot test"
 autoxray user del hank >/dev/null
 kill "$BOT" 2>/dev/null; wait "$BOT" 2>/dev/null
+autoxray bot setup --token 123456:BADTOKENBADTOKENBADTOKEN99 --admin 111 >/dev/null 2>&1 && fail "bot setup принял отозванный токен" \
+  || { grep -q TESTTOKEN /etc/autoxray/bot.token && pass "неудачный bot setup не трогает рабочий токен" || fail "рабочий токен потерян"; }
 autoxray bot remove >/dev/null 2>&1; [ ! -e /etc/autoxray/bot.token ] && pass "bot remove удаляет токен" || fail "токен остался"
 kill "$MOCK" 2>/dev/null; unset AX_TG_API AX_TG_POLL AX_TG_TIMEOUT
 
