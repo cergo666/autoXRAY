@@ -24,6 +24,16 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(body or b"{}")
         else:
             payload = {"multipart": True, "raw": body[:400].decode("latin1")}
+            ctype = self.headers.get("Content-Type", "")
+            bm = re.search(r"boundary=(\S+)", ctype)
+            if bm:   # присланный файл сохраняется целиком: тесты проверяют его содержимое
+                for part in body.split(b"--" + bm.group(1).encode()):
+                    head, _, data = part.partition(b"\r\n\r\n")
+                    fm = re.search(rb'filename="([^"]*)"', head)
+                    if fm:
+                        payload["filename"] = fm.group(1).decode()
+                        with open(f"{DIR}/last-doc.bin", "wb") as df:
+                            df.write(data.rsplit(b"\r\n", 1)[0])
         with open(SENT, "a") as f:
             f.write(json.dumps({"method": method, "token": token, "payload": payload}, ensure_ascii=False) + "\n")
         if "BAD" in token:   # «отозванный» токен: Telegram отвечает 401

@@ -139,6 +139,18 @@ client_start /tmp/d2.json; curl -fsS --max-time 8 --socks5-hostname 127.0.0.1:10
 client_start /tmp/d1.json && via_proxy ok.txt >/dev/null && pass "dan: первый IP продолжает работать" || fail "dan: первый IP сломался"
 autoxray ips dan | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'заблокирован' && pass "autoxray ips показывает блокировку" || fail "ips без блокировки"
 autoxray unban dan >/dev/null && client_start /tmp/d2.json && via_proxy ok.txt >/dev/null && pass "после unban второй IP снова проходит" || fail "unban"
+check "ip_in и valid_trust: адрес, сеть IPv4, IPv6, мусор" bash -c '
+  source <(sed -n "/^ip2int()/,/^}/p; /^valid_trust()/,/^}/p; /^ip_in()/,/^}/p" /opt/autoxray/autoxray)
+  ip_in 10.1.2.3 "1.1.1.1 10.1.2.0/24" && ! ip_in 10.1.3.3 "1.1.1.1 10.1.2.0/24" && ip_in 1.1.1.1 "1.1.1.1" && ip_in 2001:db8::1 "2001:db8::1" \
+  && valid_trust 1.2.3.4 && valid_trust 10.0.0.0/8 && valid_trust 2001:db8::1 && ! valid_trust 1.2.3.999 && ! valid_trust abc && ! valid_trust 1.2.3.4/4'
+autoxray user set dan --trust 999.1.1.1 >/dev/null 2>&1 && fail "--trust принял неверный адрес" || pass "--trust отклоняет неверный адрес"
+autoxray user set dan --trust 127.0.0.2 >/dev/null && autoxray unban dan >/dev/null
+: > /var/log/xray/access.log
+client_start /tmp/d1.json && via_proxy ok.txt >/dev/null; autoxray ipwatch >/dev/null     # слот занят адресом 127.0.0.1
+client_start /tmp/d2.json && via_proxy ok.txt >/dev/null
+autoxray ipwatch | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'лишний IP' && fail "доверенный адрес заблокирован как лишний" || pass "доверенный адрес не блокируется и не считается в лимите"
+autoxray ips dan | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'доверенные.*127.0.0.2' && pass "ips показывает доверенные адреса" || fail "ips без доверенных"
+autoxray user set dan --untrust all >/dev/null; [ "$(jq -c '.users[] | select(.name=="dan") | .ip_trust' /etc/autoxray/state.json)" = "[]" ] && pass "--untrust all очищает список" || fail "--untrust"
 client_stop
 autoxray user set dan --ips 0 >/dev/null; [ "$(jq -r .log.loglevel /usr/local/etc/xray/config.json)" = none ] && pass "без лимитов лог доступа снова выключен" || fail "лог доступа остался включён"
 jq --argjson t "$(( $(date +%s) + 600 ))" '. + [{user: "dan", ip: "10.9.9.9", until: $t}]' /etc/autoxray/bans.json > /tmp/b.json && cp /tmp/b.json /etc/autoxray/bans.json
@@ -371,6 +383,19 @@ grep -qi '^subscription-userinfo:' /tmp/h2.txt && pass "у .txt есть subscri
 curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.html" | grep -q "$TOKEN_A.txt" && pass "на личной странице есть универсальная подписка" || fail "страница без .txt"
 autoxray user qr alice links >/dev/null 2>&1 && pass "user qr links" || fail "user qr links"
 
+step "Подписки Clash/Mihomo и sing-box"
+curl -sS --max-time 8 -D /tmp/h3.txt -o /tmp/sub.yaml "https://$DOMAIN/$TOKEN_A.yaml"; curl -sS --max-time 8 -o /tmp/sub.sing "https://$DOMAIN/$TOKEN_A.sing"
+jq -e '(.proxies | length) == 3 and ([.proxies[].type] | sort) == ["hysteria2","vless","vless"] and (.proxies[] | select(.network == "xhttp") | ."xhttp-opts".mode) == "stream-up"' /tmp/sub.yaml >/dev/null && pass "Clash: XHTTP, Vision и Hysteria2" || { fail "Clash-подписка"; head -c 400 /tmp/sub.yaml; }
+# у alice режим RU мог быть переключён выше: правила Clash обязаны совпадать с JSON-подпиской
+jq -e '.rules | .[0] == "GEOIP,private,DIRECT,no-resolve" and .[-1] == "MATCH,autoXRAY"' /tmp/sub.yaml >/dev/null \
+  && { has_ru_direct "$TOKEN_A" && jq -e '.rules | index("GEOIP,RU,DIRECT") != null' /tmp/sub.yaml >/dev/null || { ! has_ru_direct "$TOKEN_A" && jq -e '.rules | index("GEOIP,RU,DIRECT") == null' /tmp/sub.yaml >/dev/null; }; } \
+  && pass "Clash: правила маршрутизации RU совпадают с основной подпиской" || fail "Clash: правила"
+jq -e '([.outbounds[].type] | index("vless") != null) and ([.outbounds[].type] | index("hysteria2") != null) and (.outbounds | map(select(.type == "vless" and has("transport"))) | length == 0)' /tmp/sub.sing >/dev/null && pass "sing-box: Vision и Hysteria2, без XHTTP" || { fail "sing-box-подписка"; head -c 400 /tmp/sub.sing; }
+grep -qi '^subscription-userinfo:' /tmp/h3.txt && grep -qi 'text/yaml' /tmp/h3.txt && pass "заголовки подписки Clash (userinfo, тип)" || fail "заголовки Clash"
+python3 -c "import yaml" 2>/dev/null && { python3 -c "import yaml,sys; yaml.safe_load(open('/tmp/sub.yaml'))" && pass "Clash-подписка разбирается как YAML" || fail "Clash: не YAML"; } || true
+curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.html" | grep -q "$TOKEN_A.yaml" && pass "на личной странице есть ссылки Clash и sing-box" || fail "страница без Clash"
+autoxray user qr alice clash >/dev/null 2>&1 && autoxray user qr alice sing >/dev/null 2>&1 && pass "user qr clash и sing" || fail "user qr clash/sing"
+
 step "Сайт-маскировка: пересоздание и свой сайт"
 md5_a=$(md5sum "$WEB/index.html" | cut -d' ' -f1)
 autoxray site regenerate >/dev/null && [ "$md5_a" != "$(md5sum "$WEB/index.html" | cut -d' ' -f1)" ] && pass "site regenerate даёт новый сайт" || fail "site regenerate"
@@ -448,12 +473,53 @@ wait_for not_user frank && pass "подтверждённое удаление �
 ! pgrep -af "TESTTOKEN" >/dev/null && pass "токен не виден в списке процессов" || fail "токен в аргументах процесса"
 ! grep -q TESTTOKEN /tmp/bot-run.out && pass "токен не попадает в журнал бота" || fail "токен в журнале"
 
+# отчёт файлом и ссылкой, доверенные адреса, копия настроек
+autoxray user add gina --report on >/dev/null 2>&1
+tgmsg 111 "/report gina"; sent_method sendDocument && jq -e 'select(.method == "sendDocument") | select(.payload.filename | test("^report-gina-.*\\.html$"))' "$TG/sent.jsonl" >/dev/null && pass "/report имя присылает html-файл" || fail "/report: файл"
+sent_has "/r/" && pass "вместе с файлом приходит ссылка на отчёт" || fail "/report: ссылка"
+grep -aq 'gina' /tmp/tg/last-doc.bin && grep -aq '<html' /tmp/tg/last-doc.bin && pass "присланный отчёт самодостаточный html" || fail "содержимое отчёта"
+tgcb 111 "u:gina:rep"; wait_for bash -c "jq -e 'select(.method == \"editMessageText\") | .payload.reply_markup.inline_keyboard[][] | select(.callback_data == \"u:gina:repsend\")' $TG/sent.jsonl" && pass "кнопка отчёта у включённого: файл, ссылка, выключить" || fail "меню отчёта"
+tgcb 111 "u:gina:repsend"; tg_sync
+[ "$(jq -s '[.[] | select(.method == "sendDocument")] | length' "$TG/sent.jsonl")" -ge 2 ] && pass "кнопка «Файл HTML» присылает отчёт" || fail "кнопка файла"
+autoxray user set gina --report off >/dev/null 2>&1; tgmsg 111 "/report gina"; sent_has "выключен" && pass "для выключенного отчёта бот предлагает включить" || fail "/report выключенного"
+autoxray user del gina >/dev/null
+tgmsg 111 "/trust alice 203.0.113.0/24"; tg_sync
+jq -e '.users[] | select(.name == "alice") | .ip_trust == ["203.0.113.0/24"]' /etc/autoxray/state.json >/dev/null && pass "/trust добавляет доверенную сеть" || fail "/trust"
+tgmsg 111 "/trust alice nonsense"; sent_has "Пример: .*trust" && pass "/trust проверяет адрес" || fail "/trust мусор"
+tgmsg 111 "/untrust alice all"; tg_sync
+tgmsg 111 "/backup"; sent_has "bot backup pass" && pass "/backup без пароля бэкапов ничего не отправляет" || fail "/backup без пароля"
+printf 'secret-pass-1\nsecret-pass-1\n' | autoxray bot backup pass >/dev/null 2>&1; [ "$(stat -c %a /etc/autoxray/backup.pass)" = 600 ] && pass "пароль бэкапов задан (права 600)" || fail "backup pass"
+rm -f /tmp/tg/last-doc.bin; tgmsg 111 "/backup"
+for _ in $(seq 1 40); do [ -s /tmp/tg/last-doc.bin ] && break; sleep 0.5; done
+jq -e 'select(.method == "sendDocument") | select(.payload.filename | test("\\.tar\\.gz\\.enc$"))' "$TG/sent.jsonl" >/dev/null 2>&1 && pass "копия приходит файлом .tar.gz.enc" || fail "имя файла копии"
+openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass pass:secret-pass-1 -in /tmp/tg/last-doc.bin 2>/dev/null | tar -tz 2>/dev/null | grep -q 'etc/autoxray/state.json' && pass "/backup присылает архив, он расшифровывается паролем и содержит state.json" || fail "копия в Telegram"
+openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass pass:wrong -in /tmp/tg/last-doc.bin 2>/dev/null | tar -tz >/dev/null 2>&1 && fail "копия открылась неверным паролем" || pass "с неверным паролем копия не открывается"
+openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass pass:secret-pass-1 -in /tmp/tg/last-doc.bin 2>/dev/null | tar -tz 2>/dev/null | grep -q 'backup.pass' && fail "пароль бэкапов попал в архив" || pass "пароль бэкапов в архив не попадает"
+autoxray bot backup on >/dev/null; rm -f /etc/autoxray/.backup-sent
+n_docs=$(jq -s '[.[] | select(.method == "sendDocument")] | length' "$TG/sent.jsonl"); autoxray collect >/dev/null 2>&1
+for _ in $(seq 1 40); do [ "$(jq -s '[.[] | select(.method == "sendDocument")] | length' "$TG/sent.jsonl")" -gt "$n_docs" ] && break; sleep 0.5; done
+[ "$(jq -s '[.[] | select(.method == "sendDocument")] | length' "$TG/sent.jsonl")" -gt "$n_docs" ] && pass "еженедельная копия уходит из collect" || fail "еженедельная копия"
+autoxray collect >/dev/null 2>&1; sleep 1
+[ "$(jq -s '[.[] | select(.method == "sendDocument")] | length' "$TG/sent.jsonl")" -le "$((n_docs + 1))" ] && pass "повторно в ту же неделю копия не отправляется" || fail "копия отправлена дважды"
+autoxray bot backup off >/dev/null
+
 # уведомления: у пользователя заканчивается лимит
 autoxray user add hank --limit 1 >/dev/null
 autoxray collect >/dev/null 2>&1          # первая проверка запоминает статусы (hank активен)
 jq '.hank = {up: 2000000000, down: 2000000000}' /etc/autoxray/traffic.json > /tmp/tr.json && cp /tmp/tr.json /etc/autoxray/traffic.json
 autoxray collect >/dev/null 2>&1          # лимит превышен: приходит уведомление
 sent_has "hank.*лимит" && pass "уведомление: исчерпан лимит трафика" || fail "уведомление о лимите"
+# первое подключение, 80% лимита, срок заканчивается
+autoxray user add kim >/dev/null; autoxray user add ivy --limit 10 >/dev/null; autoxray user add jay --days 2 >/dev/null
+jq '.kim = {up: 1000, down: 0} | .ivy = {up: 9000000000, down: 0}' /etc/autoxray/traffic.json > /tmp/tr.json && cp /tmp/tr.json /etc/autoxray/traffic.json
+autoxray collect >/dev/null 2>&1
+sent_has "kim.*первое подключение" && [ "$(jq '.users[] | select(.name == "kim") | .first_seen > 0' /etc/autoxray/state.json)" = true ] && pass "уведомление о первом подключении" || fail "первое подключение"
+jq -e 'select((.payload.text // "") | test("alice.*первое подключение"))' "$TG/sent.jsonl" >/dev/null 2>&1 && fail "alice (давно подключалась) получила уведомление о первом подключении" || pass "о давних пользователях «первое подключение» не приходит"
+sent_has "ivy.*израсходовано 8[0-9]% лимита" && pass "предупреждение: израсходовано 80% лимита" || fail "предупреждение о 80%"
+sent_has "jay.*срок заканчивается" && pass "предупреждение: срок заканчивается" || fail "предупреждение о сроке"
+autoxray collect >/dev/null 2>&1; sleep 1
+[ "$(jq -s '[.[] | select(.method == "sendMessage" and ((.payload.text // "") | test("ivy.*израсходовано")))] | length' "$TG/sent.jsonl")" = 1 ] && pass "предупреждение приходит один раз" || fail "предупреждение продублировано"
+autoxray user del kim >/dev/null; autoxray user del ivy >/dev/null; autoxray user del jay >/dev/null
 autoxray bot test >/dev/null 2>&1; sent_has "Проверка уведомлений" && pass "bot test присылает уведомление администратору" || fail "bot test"
 autoxray user del hank >/dev/null
 kill "$BOT" 2>/dev/null; wait "$BOT" 2>/dev/null
