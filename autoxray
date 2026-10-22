@@ -9,7 +9,7 @@ set -uo pipefail
 # bash >= 5.2: '&' в замене ${var//a/b} — спецсимвол; ссылки содержат '&'
 shopt -u patsub_replacement 2>/dev/null || true
 
-AX_VERSION="3.11.2"
+AX_VERSION="3.12.0"
 AX_REPO="cergo666/autoXRAY"
 XRAY_TESTED="v26.9.9"          # версия ядра, с которой этот релиз проверен тестами
 API="${AX_API:-https://api.github.com}"
@@ -1232,28 +1232,168 @@ report_remove() { # имя [purge]
   return 0
 }
 
+# ---- сведения об адресах: страна, AS, обратный DNS (кэш в /etc/autoxray/ipinfo.json)
+IPINFO="$AX_ETC/ipinfo.json"
+priv_ip() { [[ $1 =~ ^(10\.|127\.|192\.168\.|169\.254\.|0\.|172\.(1[6-9]|2[0-9]|3[01])\.) || $1 == ::1 || $1 == [fF][eE]80:* || $1 == [fF][cCdD]* ]]; }
+
+# ipinfo_fetch <ip> -> «страна<TAB>asn<TAB>имя AS<TAB>обратная запись». Страна и AS: DNS-сервис Team Cymru (только IPv4),
+# обратная запись: PTR. Запросы идут с сервера обычным DNS.
+ipinfo_fetch() {
+  local ip=$1 rev r asn="" cc="" asname="" ptr=""
+  if [[ -n ${AX_IPINFO_FAKE:-} ]]; then   # подмена для тестов: файл «ip<TAB>страна<TAB>asn<TAB>имя<TAB>ptr»
+    awk -F'\t' -v i="$ip" '$1 == i {print $2 "\t" $3 "\t" $4 "\t" $5; f = 1} END {if (!f) print "\t\t\t"}' "$AX_IPINFO_FAKE"; return 0
+  fi
+  command -v dig >/dev/null 2>&1 || { printf '\t\t\t\n'; return 0; }
+  if [[ $ip =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    rev="${BASH_REMATCH[4]}.${BASH_REMATCH[3]}.${BASH_REMATCH[2]}.${BASH_REMATCH[1]}"
+    r=$(dig +short +time=2 +tries=1 TXT "$rev.origin.asn.cymru.com" 2>/dev/null | head -n1 | tr -d '"')
+    asn=$(awk -F'|' '{split($1, a, " "); print a[1]}' <<<"$r")
+    cc=$(awk -F'|' '{gsub(/ /, "", $3); print $3}' <<<"$r")
+    if [[ $asn =~ ^[0-9]+$ ]]; then
+      asname=$(dig +short +time=2 +tries=1 TXT "AS$asn.asn.cymru.com" 2>/dev/null | head -n1 | tr -d '"' | awk -F'|' '{sub(/^ +/, "", $5); sub(/ +$/, "", $5); sub(/, [A-Z][A-Z]$/, "", $5); print $5}')
+    fi
+  fi
+  ptr=$(dig +short +time=2 +tries=1 -x "$ip" 2>/dev/null | head -n1); ptr=${ptr%.}
+  [[ $asn =~ ^[0-9]+$ ]] || asn=""; [[ $cc =~ ^[A-Z][A-Z]$ ]] || cc=""
+  printf '%s\t%s\t%s\t%s\n' "$cc" "$asn" "$(tr -cd 'A-Za-z0-9 ._&-' <<<"$asname" | head -c 40)" "$(tr -cd 'A-Za-z0-9.-' <<<"$ptr" | tr 'A-Z' 'a-z' | head -c 80)"
+}
+
+# Список IP из stdin -> JSON {ip: {cc, asn, as, ptr}}. Новые адреса узнаются пачками по 10 параллельно (не больше AX_IPINFO_MAX
+# за вызов, остальные при следующей сборке), результат хранится 30 дней.
+report_ipinfo() {
+  local ips=() ip need=() d i n=0 lim=${AX_IPINFO_MAX:-40} listj cutoff
+  mapfile -t ips; [[ ${#ips[@]} -gt 0 ]] || { echo '{}'; return 0; }
+  [[ -f $IPINFO ]] || { (umask 077; echo '{}' >"$IPINFO"); }
+  cutoff=$(( $(now) - 2592000 ))
+  listj=$(printf '%s\n' "${ips[@]}" | jq -Rn '[inputs]')
+  mapfile -t need < <(jq -r --argjson l "$listj" --argjson t "$cutoff" '. as $c | $l[] | select(($c[.].at // 0) <= $t)' "$IPINFO")
+  d=$(mktemp -d)
+  for ip in "${need[@]}"; do
+    priv_ip "$ip" && continue
+    [[ $n -lt $lim ]] || break
+    ( ipinfo_fetch "$ip" >"$d/$n.row" 9>&- 8>&- 7>&-; echo "$ip" >"$d/$n.ip" ) &
+    n=$((n + 1)); (( n % 10 == 0 )) && wait
+  done
+  wait
+  for ((i = 0; i < n; i++)); do
+    [[ -s $d/$i.ip ]] || continue
+    printf '%s\t%s\n' "$(<"$d/$i.ip")" "$(<"$d/$i.row")"
+  done >"$d/all.tsv"
+  if [[ -s $d/all.tsv ]]; then
+    jq -Rn --slurpfile c "$IPINFO" --argjson now "$(now)" --argjson keep "$(( $(now) - 7776000 ))" '
+      reduce (inputs | split("\t")) as $r ($c[0]; .[$r[0]] = {cc: $r[1], asn: $r[2], as: $r[3], ptr: $r[4], at: $now})
+      | with_entries(select(.value.at > $keep))' <"$d/all.tsv" >"$d/new.json" && (umask 077; cat "$d/new.json" >"$IPINFO")
+  fi
+  rm -rf "$d"
+  jq --argjson l "$listj" '. as $c | [$l[] | select($c[.] != null and ($c[.].cc != "" or $c[.].asn != "" or $c[.].ptr != "")) | {key: ., value: ($c[.] | del(.at))}] | from_entries' "$IPINFO"
+}
+
+# IP-адреса, чаще всего встречающиеся в данных (JSON-массив дней в stdin)
+report_ip_list() {
+  jq -r 'reduce .[] as $d ({}; reduce ((($d.hosts // {}) | to_entries[]), (($d.src // {}) | to_entries | map({key, value: .value.n})[])) as $e (.; .[$e.key] += $e.value))
+         | to_entries | sort_by(-.value) | map(.key | select(test("^[0-9.]+$") or contains(":"))) | .[:120][]'
+}
+
+# Статическая версия отчёта: те же блоки, что рисует JavaScript, но готовыми (за последние 7 дней). Страница остаётся полной там,
+# где скрипты не запускаются (встроенный просмотр файлов в Telegram и т. п.). Плюс готовый текст для Telegram (поле text).
+REPORT_STATIC_JQ=$(cat <<'JQ'
+def esc: gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;") | gsub("\""; "&quot;");
+def isip: test("^[0-9.]+$") or contains(":");
+def flag: if (. // "") | test("^[A-Z]{2}$") then ([explode[] | . + 127397] | implode) else "" end;
+def infotxt($i): ($i // {}) as $x
+  | [(if ($x.cc // "") != "" then ($x.cc | flag) + " " + $x.cc else empty end),
+     (if ($x.asn // "") != "" then "AS" + $x.asn + (if ($x.as // "") != "" then " " + $x.as else "" end) else empty end),
+     (if ($x.ptr // "") != "" then $x.ptr else empty end)] | join(" · ");
+def small($info): infotxt($info[.]) | if . != "" then "<small class=\"info\">" + esc + "</small>" else "" end;
+def namehtml($info): . as $h | if isip then "🔢 " + esc + ($h | small($info)) else "🌐 " + esc end;
+def sum($k): reduce .[] as $d ({}; reduce (($d[$k] // {}) | to_entries[]) as $e (.; .[$e.key] = ((.[$e.key] // 0) + $e.value)));
+def topn($m; $n): $m | to_entries | sort_by(-.value) | .[:$n];
+def pct($v; $t): if $t > 0 then ((($v * 1000 / $t) | round) / 10) else 0 end;
+def rows($list; $total; f): if ($list | length) == 0 then "<div class=\"empty\">Нет данных</div>"
+  else $list[0].value as $max
+    | ($list | map("<div class=\"row\"><div class=\"name\">\(.key | f)</div><div class=\"val\">\(.value) · \(pct(.value; $total))%</div><div class=\"track\"><i style=\"width:\(.value * 100 / $max)%\"></i></div></div>") | join("")) end;
+def col: ({"direct": "var(--accent)", "warp": "var(--accent2)", "block": "var(--bad)"})[.] // "var(--warn)";
+def oname: ({"direct": "напрямую с сервера", "warp": "через WARP", "block": "заблокировано"})[.] // (. | esc);
+
+sort_by(.date) as $ALL
+| ($ALL | .[-7:]) as $D
+| ($D | map(.total // 0) | add // 0) as $total
+| ($D | map(.blocked // 0) | add // 0) as $blocked
+| ($D | sum("hosts")) as $hosts | ($D | sum("ports")) as $ports | ($D | sum("out")) as $out
+| ($D | reduce .[] as $d ([range(24) | 0]; reduce range(24) as $h (.; .[$h] += (($d.hours // [])[$h] // 0)))) as $hours
+| ($D | reduce .[] as $d ({}; reduce (($d.src // {}) | to_entries[]) as $e (.;
+    .[$e.key] |= ((. // {n: 0, first: $e.value.first, last: $e.value.last, hosts: {}})
+      | .n += ($e.value.n // 0) | .first = ([.first, $e.value.first] | min) | .last = ([.last, $e.value.last] | max)
+      | .hosts = (reduce (($e.value.hosts // {}) | to_entries[]) as $x (.hosts; .[$x.key] = ((.[$x.key] // 0) + $x.value))))))) as $src
+| ([($hours | max), 1] | max) as $mx
+| ($out | to_entries | map(.value) | add // 0) as $tot
+| ([($ALL | map(.total // 0) | max), 1] | max) as $dm
+| {
+    kpi: ([["Подключений", $total], ["Адресов назначения", ($hosts | length)], ["IP клиента", ($src | length)], ["Заблокировано", $blocked]]
+          | map("<div class=\"kpi\"><b>\(.[1])</b><span>\(.[0])</span></div>") | join("")),
+    hours: ($hours | to_entries | map("<i title=\"\(.key):00, \(.value)\" style=\"height:\([2, (.value * 100 / $mx)] | max)%\"></i>") | join("")),
+    axis: ($hours | to_entries | map("<span>\(if .key % 3 == 0 then .key else "" end)</span>") | join("")),
+    hosts: rows(topn($hosts; 20); $total; namehtml($info)),
+    srcs: ($src | to_entries | sort_by(-.value.n) | .[:12]
+           | map("<details><summary><span>📱 \(.key | esc)" + (.key | small($info)) + "</span><span class=\"muted\">\(.value.n) · \(pct(.value.n; $total))%</span></summary><div class=\"sub\"><div><span>Активность</span><span>\(.value.first // "" | tostring | esc) – \(.value.last // "" | tostring | esc)</span></div>"
+                 + (topn(.value.hosts; 8) | map("<div><span>\(.key | esc)</span><span>\(.value)</span></div>") | join("")) + "</div></details>")
+           | join("") | if . == "" then "<div class=\"empty\">Нет данных</div>" else . end),
+    ports: rows(topn($ports; 8); $total; esc),
+    stack: ($out | to_entries | map("<i style=\"width:\(if $tot > 0 then .value * 100 / $tot else 0 end)%;background:\(.key | col)\"></i>") | join("")),
+    legend: ($out | to_entries | map("<span><b style=\"background:\(.key | col)\"></b>\(.key | oname): \(.value)</span>") | join("") | if . == "" then "<span>Нет данных</span>" else . end),
+    days: ($ALL | map("<i data-d=\"\(.date)\" title=\"\(.date): \(.total // 0)\" style=\"height:\([3, ((.total // 0) * 100 / $dm)] | max)%\"></i>") | join("")),
+    rank: ($ALL | sort_by(-(.total // 0)) | map("<tr class=\"dayrow\" data-d=\"\(.date)\"><td>\(.date)</td><td>\(.total // 0)</td><td>\((.hosts // {}) | length)</td><td>\((.src // {}) | length)</td></tr>") | join("")
+           | if . == "" then "<tr><td colspan=\"4\" class=\"empty\">Данных пока нет: отчёт наполняется по мере использования</td></tr>" else . end),
+    text: ("📈 <b>" + ($user | esc) + "</b>, последние дни: \($D | length)\nПодключений: \($total), адресов: \($hosts | length), IP клиента: \($src | length)\n\n🌐 Куда ходил:\n"
+           + (topn($hosts; 10) | map("• " + (.key | esc) + " — \(.value)" + (infotxt($info[.key]) | if . != "" then "\n   <i>" + esc + "</i>" else "" end)) | join("\n"))
+           + "\n\n📱 С каких IP:\n"
+           + ($src | to_entries | sort_by(-.value.n) | .[:5] | map("• " + (.key | esc) + " — \(.value.n)" + (infotxt($info[.key]) | if . != "" then "\n   <i>" + esc + "</i>" else "" end)) | join("\n")))
+  }
+JQ
+)
+
+report_data() { # имя -> JSON-массив суточных данных
+  local u=$1 files
+  mapfile -t files < <(ls "$REPORT_DATA/$u"/*.json 2>/dev/null | sort | tail -n "$(report_keep_days)")
+  if [[ ${#files[@]} -gt 0 ]]; then
+    cat "${files[@]}" | jq -s 'map(.hosts |= (to_entries | sort_by(-.value) | .[:150] | from_entries)
+        | .src |= with_entries(.value.hosts |= (to_entries | sort_by(-.value) | .[:25] | from_entries)))'
+  else echo '[]'; fi
+}
+
+# report_parts <данные> <сведения об адресах> <имя> — JSON с готовыми блоками страницы и текстом для Telegram (поле text)
+report_parts() { jq -c --argjson info "$2" --arg user "$3" "$REPORT_STATIC_JQ" <<<"$1"; }
+
 # report_build <имя> — собирает html пользователя из суточных файлов
 report_build() {
-  local u=$1 tpl="$TPL_DIR/report.html" dir data out files keep
+  local u=$1 tpl="$TPL_DIR/report.html" dir data info parts out icons
   [[ -f $tpl ]] || { warn "Нет шаблона $tpl, отчёт не собран."; return 1; }
-  dir="$REPORT_WEB/$(report_user_token "$u")"
-  keep=$(report_keep_days); mkdir -p "$dir"
-  mapfile -t files < <(ls "$REPORT_DATA/$u"/*.json 2>/dev/null | sort | tail -n "$keep")
-  if [[ ${#files[@]} -gt 0 ]]; then
-    data=$(cat "${files[@]}" | jq -s 'map(.hosts |= (to_entries | sort_by(-.value) | .[:150] | from_entries)
-        | .src |= with_entries(.value.hosts |= (to_entries | sort_by(-.value) | .[:25] | from_entries)))')
-  else data='[]'; fi
+  dir="$REPORT_WEB/$(report_user_token "$u")"; mkdir -p "$dir"
+  data=$(report_data "$u")
+  info=$(report_ip_list <<<"$data" | report_ipinfo)
+  parts=$(report_parts "$data" "$info" "$u")
   data=${data//<\//<\\/}
+  icons=$(st '.reports.icons != false')
   out=$(<"$tpl")
   out=${out//'{{USER}}'/$u}
   out=${out//'{{DOMAIN}}'/$(st .domain)}
   out=${out//'{{GENERATED}}'/$(date '+%F %H:%M')}
+  out=${out//'{{ICONS}}'/$icons}
+  out=${out//'{{INFO}}'/${info//<\//<\\/}}
+  local k; for k in kpi hours axis hosts srcs ports stack legend days rank; do
+    out=${out//"{{S_${k^^}}}"/$(jq -r --arg k "$k" '.[$k]' <<<"$parts")}
+  done
   out=${out//'{{DATA}}'/$data}
   printf '%s\n' "$out" >"$dir/index.html"
   chmod 755 "$REPORT_WEB" "$dir"; chmod 644 "$dir/index.html"
 }
 
-# Список отчётов для администратора: /r/<общий токен>/
+# Короткая сводка текстом (для Telegram): топ адресов с описанием и IP клиента
+report_summary() {
+  local data info; data=$(report_data "$1"); info=$(report_ip_list <<<"$data" | report_ipinfo)
+  report_parts "$data" "$info" "$1" | jq -r '.text'
+}
+
 report_build_index() {
   local u items="" at dir
   at=$(st '.reports.token // empty'); [[ -n $at ]] || return 0
@@ -1306,12 +1446,18 @@ cmd_report() {
     build) need_root
       if [[ -n ${1:-} ]]; then user_must "$1" >/dev/null; report_build "$1"; report_build_index; else report_build_all; fi
       ok "✅ Отчёт собран." ;;
+    summary) user_must "${1:-}" >/dev/null; report_summary "$1" | sed 's/<[^>]*>//g; s/&amp;/\&/g; s/&lt;/</g; s/&gt;/>/g; s/&quot;/"/g' ;;
+    icons) need_root; case ${1:-} in
+             on) st_edit '.reports.icons = true'; ok "✅ Иконки сайтов в отчёте включены (их грузит браузер с icons.duckduckgo.com при открытии отчёта)" ;;
+             off) st_edit '.reports.icons = false'; ok "✅ Иконки выключены: страница отчёта не обращается к сторонним сайтам" ;;
+             *) die "report icons on|off" ;;
+           esac ;;
     url) if [[ -n ${1:-} ]]; then user_must "$1" >/dev/null; report_url "$1"; else report_url; fi ;;
     purge) need_root; u=${1:-}; user_must "$u" >/dev/null
       report_remove "$u" purge; ok "✅ Все данные отчёта '$u' удалены." ;;
     keep) need_root; [[ ${1:-} =~ ^[0-9]+$ && $1 -ge 1 ]] || die "report keep <дней>"
       st_edit --argjson d "$1" '.reports.keep_days = $d'; report_prune; ok "✅ Отчёты хранятся $1 дн." ;;
-    *) die "report: list | build [имя] | url [имя] | purge <имя> | keep <дней>" ;;
+    *) die "report: list | build [имя] | summary <имя> | url [имя] | purge <имя> | keep <дней> | icons on|off" ;;
   esac
 }
 
@@ -2746,8 +2892,8 @@ bot_notify() {
 BOT_MAIN_KB='{"inline_keyboard":[[{"text":"📊 Статус","callback_data":"status"},{"text":"👥 Пользователи","callback_data":"list"}],[{"text":"🩺 Диагностика","callback_data":"doctor"},{"text":"🌍 WARP","callback_data":"warp"}]]}'
 
 bot_help() {
+  echo "<b>autoXRAY $AX_VERSION: управление сервером</b>"
   cat <<'EOF'
-<b>autoXRAY: управление сервером</b>
 
 /status — состояние
 /users — пользователи (кнопки)
@@ -2860,7 +3006,9 @@ bot_send_report() { # chat имя
   report_build "$name" >/dev/null 2>&1
   f="$REPORT_WEB/$(report_user_token "$name")/index.html"
   [[ -s $f ]] || { tg_send "$chat" "❌ Не удалось собрать отчёт"; return 0; }
-  tg_document "$chat" "$f" "📈 Отчёт о посещениях <b>$name</b> на $(date '+%F %H:%M')" "report-$name-$(date +%F).html"
+  # сводка текстом: читается в самом чате, не зависит от того, чем телефон открывает html
+  tg_send "$chat" "$(report_summary "$name" | head -c 3800)"
+  tg_document "$chat" "$f" "📎 Полный отчёт <b>$name</b> на $(date '+%F %H:%M'). Лучше открывать в браузере (Chrome, Firefox, Safari)" "report-$name-$(date +%F).html"
   tg_send "$chat" "🔗 Тот же отчёт по ссылке: $(report_url "$name")"
 }
 
@@ -2986,8 +3134,12 @@ cmd_bot_run() {
   local off resp upd poll=${AX_TG_POLL:-50}
   off=$(cat "$AX_ETC/bot.offset" 2>/dev/null || echo 0)
   trap 'exit 0' TERM INT
+  # Если файл autoxray заменили (self-update, ручная установка), бот выходит и systemd (Restart=always) запускает его заново:
+  # так служба никогда не остаётся на старом коде.
+  local me started; me=$(readlink -f "$0" 2>/dev/null || echo "$AX_BIN"); started=$(stat -c %Y "$me" 2>/dev/null || echo 0)
   echo "autoxray bot: запущен (long polling, администраторов: $(bot_admins | wc -l))"
   while true; do
+    if [[ $(stat -c %Y "$me" 2>/dev/null || echo 0) != "$started" ]]; then echo "autoxray bot: скрипт обновлён, перезапуск"; exit 0; fi
     resp=$(tg_call getUpdates "$(jq -nc --argjson o "$off" --argjson t "$poll" '{offset: $o, timeout: $t, allowed_updates: ["message", "callback_query"]}')") || { sleep 5; continue; }
     jq -e '.ok == true' <<<"$resp" >/dev/null 2>&1 || { sleep 5; continue; }
     while IFS= read -r upd; do

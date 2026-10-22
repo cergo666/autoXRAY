@@ -53,16 +53,21 @@ table{width:100%;border-collapse:collapse;font-size:13px}
 th{color:var(--muted);font-weight:500;text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
 td{padding:6px 8px;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}
 tr.dayrow{cursor:pointer}tr.dayrow:hover td{background:var(--card2)}tr.dayrow.sel td{color:var(--accent)}
+.info{display:block;font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+summary .info{display:inline;margin-left:8px}
+.fav{width:16px;height:16px;border-radius:4px;vertical-align:-3px;margin-right:6px;background:var(--card2)}
 .empty{color:var(--muted);padding:20px 0;text-align:center;font-size:14px}
 label.sw{font-size:12px;color:var(--muted);display:flex;gap:6px;align-items:center;cursor:pointer}
 footer{color:var(--muted);font-size:12px;text-align:center;margin-top:8px}
 </style>
 </head>
 <body>
+<noscript><style>.bar-top{display:none}</style></noscript>
 <div class="wrap">
   <section class="hero">
     <h1>📈 {{USER}}</h1>
     <div class="sub">Сервер {{DOMAIN}} · обновлено {{GENERATED}} (время сервера)</div>
+    <div class="sub" id="snote">Сводка за последние 7 дней. Выбор дня и интерактивные графики работают, если открыть файл в браузере (Chrome, Firefox, Safari).</div>
     <div class="bar-top">
       <select id="day"></select>
       <button class="chip" data-range="1">День</button>
@@ -71,22 +76,22 @@ footer{color:var(--muted);font-size:12px;text-align:center;margin-top:8px}
     </div>
   </section>
 
-  <div class="cards" id="kpi"></div>
+  <div class="cards" id="kpi">{{S_KPI}}</div>
 
-  <section class="card"><h2>По часам <span class="muted" id="hoursNote"></span></h2><div class="hours" id="hours"></div><div class="axis" id="axis"></div></section>
+  <section class="card"><h2>По часам <span class="muted" id="hoursNote"></span></h2><div class="hours" id="hours">{{S_HOURS}}</div><div class="axis" id="axis">{{S_AXIS}}</div></section>
 
   <div class="two">
-    <section class="card"><h2>Куда ходил <label class="sw"><input type="checkbox" id="group"> по доменам</label></h2><div id="hosts"></div></section>
-    <section class="card"><h2>С каких IP <span class="muted">нажмите, чтобы раскрыть</span></h2><div id="srcs"></div></section>
+    <section class="card"><h2>Куда ходил <label class="sw"><input type="checkbox" id="group"> по доменам</label></h2><div id="hosts">{{S_HOSTS}}</div></section>
+    <section class="card"><h2>С каких IP <span class="muted">нажмите, чтобы раскрыть</span></h2><div id="srcs">{{S_SRCS}}</div></section>
   </div>
 
   <div class="two">
-    <section class="card"><h2>Порты</h2><div id="ports"></div></section>
-    <section class="card"><h2>Куда ушёл трафик</h2><div class="stack" id="stack"></div><div class="legend" id="legend"></div></section>
+    <section class="card"><h2>Порты</h2><div id="ports">{{S_PORTS}}</div></section>
+    <section class="card"><h2>Куда ушёл трафик</h2><div class="stack" id="stack">{{S_STACK}}</div><div class="legend" id="legend">{{S_LEGEND}}</div></section>
   </div>
 
-  <section class="card"><h2>По дням <span class="muted">нажмите на день</span></h2><div class="days" id="days"></div>
-    <table><thead><tr><th>День</th><th>Подключений</th><th>Адресов</th><th>IP клиента</th></tr></thead><tbody id="rank"></tbody></table>
+  <section class="card"><h2>По дням <span class="muted">нажмите на день</span></h2><div class="days" id="days">{{S_DAYS}}</div>
+    <table><thead><tr><th>День</th><th>Подключений</th><th>Адресов</th><th>IP клиента</th></tr></thead><tbody id="rank">{{S_RANK}}</tbody></table>
   </section>
 
   <footer>Подключение это одно TCP-соединение или UDP-поток через сервер. Адреса и домены показаны так, как их запросил клиент.</footer>
@@ -94,6 +99,8 @@ footer{color:var(--muted);font-size:12px;text-align:center;margin-top:8px}
 
 <script>
 var DATA = {{DATA}};
+var INFO = {{INFO}};      // страна, AS и обратная запись адресов (собирает сервер)
+var ICONS = {{ICONS}};    // иконки сайтов подгружает браузер с icons.duckduckgo.com, выключается: autoxray report icons off
 (function(){
   var $=function(i){return document.getElementById(i)};
   var days=DATA.slice().sort(function(a,b){return a.date<b.date?-1:1});
@@ -103,6 +110,12 @@ var DATA = {{DATA}};
   function isIP(h){return /^[0-9.]+$/.test(h)||h.indexOf(":")>=0}
   function root(h){if(isIP(h))return h;var p=h.split(".");if(p.length<=2)return h;
     var sl=/^(co|com|org|net|gov|edu|ac)$/.test(p[p.length-2])&&p[p.length-1].length===2;return p.slice(sl?-3:-2).join(".")}
+  function flag(cc){return /^[A-Z]{2}$/.test(cc||"")?String.fromCodePoint.apply(null,cc.split("").map(function(c){return c.charCodeAt(0)+127397})):""}
+  function infoTxt(h){var x=INFO[h];if(!x)return "";var p=[];if(x.cc)p.push(flag(x.cc)+" "+x.cc);if(x.asn)p.push("AS"+x.asn+(x.as?" "+x.as:""));if(x.ptr)p.push(x.ptr);return p.join(" · ")}
+  function small(h){var t=infoTxt(h);return t?'<small class="info">'+esc(t)+'</small>':""}
+  function icon(h){if(!ICONS)return "🌐 ";
+    return '<img class="fav" alt="" loading="lazy" referrerpolicy="no-referrer" src="https://icons.duckduckgo.com/ip3/'+encodeURIComponent(root(h))+'.ico" onerror="this.outerHTML=\'🌐 \'">'}
+  function nameHtml(h){return isIP(h)?"🔢 "+esc(h)+small(h):icon(h)+esc(h)}
   function add(m,k,v){m[k]=(m[k]||0)+v}
   function pick(){
     var i=days.findIndex(function(d){return d.date===sel});if(i<0)i=days.length-1;
@@ -144,12 +157,12 @@ var DATA = {{DATA}};
     $("hoursNote").textContent=range===1?sel:list[0].date+" … "+list[list.length-1].date;
     var hm=r.hosts;
     if($("group").checked){hm={};Object.keys(r.hosts).forEach(function(h){add(hm,root(h),r.hosts[h])})}
-    rows($("hosts"),top(hm,20),r.total,function(h){return (isIP(h)?"🔢 ":"🌐 ")+esc(h)});
+    rows($("hosts"),top(hm,20),r.total,nameHtml);
     var s=top(Object.keys(r.src).reduce(function(m,k){m[k]=r.src[k].n;return m},{}),12);
     $("srcs").innerHTML=s.length?s.map(function(x){
       var d=r.src[x[0]],p=r.total?Math.round(x[1]*1000/r.total)/10:0;
       var sub=top(d.hosts,8).map(function(h){return '<div><span>'+esc(h[0])+'</span><span>'+fmt(h[1])+'</span></div>'}).join("");
-      return '<details><summary><span>📱 '+esc(x[0])+'</span><span class="muted">'+fmt(x[1])+' · '+p+'%</span></summary><div class="sub"><div><span>Активность</span><span>'+esc(d.first)+' – '+esc(d.last)+'</span></div>'+sub+'</div></details>'}).join(""):'<div class="empty">Нет данных</div>';
+      return '<details><summary><span>📱 '+esc(x[0])+small(x[0])+'</span><span class="muted">'+fmt(x[1])+' · '+p+'%</span></summary><div class="sub"><div><span>Активность</span><span>'+esc(d.first)+' – '+esc(d.last)+'</span></div>'+sub+'</div></details>'}).join(""):'<div class="empty">Нет данных</div>';
     rows($("ports"),top(r.ports,8),r.total);
     var cols={direct:"var(--accent)",warp:"var(--accent2)",block:"var(--bad)"},tot=0;Object.keys(r.out).forEach(function(k){tot+=r.out[k]});
     $("stack").innerHTML=Object.keys(r.out).map(function(k){return '<i style="width:'+(tot?r.out[k]*100/tot:0)+'%;background:'+(cols[k]||"var(--warn)")+'"></i>'}).join("");
@@ -169,6 +182,7 @@ var DATA = {{DATA}};
     if(d){sel=d.dataset.d;render();window.scrollTo({top:0,behavior:"smooth"})}
   });
   render();
+  var sn=$("snote");if(sn)sn.parentNode.removeChild(sn);
 })();
 </script>
 </body>

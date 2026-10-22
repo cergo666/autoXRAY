@@ -189,8 +189,16 @@ EDAY=$(ls /etc/autoxray/reports/erin/*.json 2>/dev/null | head -n1)
 [ -n "$EDAY" ] && pass "суточный файл данных создан" || fail "нет суточного файла"
 jq -e '.total >= 2 and (.hosts | has("93.184.216.34")) and (.src | has("127.0.0.1")) and (.out.direct >= 2) and (.hours | length == 24)' "$EDAY" >/dev/null && pass "агрегаты: адрес назначения, IP клиента, выход, часы" || { fail "агрегаты не сошлись"; jq -c . "$EDAY"; }
 jq -e '.hosts | has("example.com")' "$EDAY" >/dev/null && pass "в отчёте виден домен, который запросил клиент" || { fail "домен example.com не попал в отчёт"; jq -c '.hosts' "$EDAY"; }
-autoxray report build erin >/dev/null
+printf '93.184.216.34\tUS\t15133\tEDGECAST NETWORKS\tptr.example.net\n127.0.0.1\tZZ\t1\tNEVER\tnever.example\n' > /tmp/ipf.tsv
+AX_IPINFO_FAKE=/tmp/ipf.tsv autoxray report build erin >/dev/null
 curl -fsS --max-time 8 "https://$DOMAIN/r/$ET/" -o /tmp/report.html
+grep -o 'id="hosts">.\{0,600\}' /tmp/report.html | grep -q '93.184.216.34' && pass "отчёт показывает данные и без JavaScript (сводка собрана на сервере)" || fail "статическая сводка пуста"
+grep -o 'id="hosts">.\{0,900\}' /tmp/report.html | grep -q 'EDGECAST NETWORKS' && pass "у IP-адреса в отчёте страна, AS и обратная запись" || fail "нет сведений об адресе"
+jq -e 'has("93.184.216.34") and (has("127.0.0.1") | not)' /etc/autoxray/ipinfo.json >/dev/null && [ "$(stat -c %a /etc/autoxray/ipinfo.json)" = 600 ] && pass "кэш сведений об адресах (600), частные адреса не опрашиваются" || fail "кэш ipinfo"
+grep -q 'var ICONS = true' /tmp/report.html && pass "иконки сайтов включены по умолчанию" || fail "ICONS"
+autoxray report icons off >/dev/null; autoxray report build erin >/dev/null; curl -fsS --max-time 8 "https://$DOMAIN/r/$ET/" | grep -q 'var ICONS = false' && pass "report icons off: страница без обращений к сторонним сайтам" || fail "icons off"
+autoxray report icons on >/dev/null
+autoxray report summary erin | grep -q 'EDGECAST NETWORKS' && autoxray report summary erin | grep -q 'Куда ходил' && pass "report summary: текстовая сводка с описанием адресов" || fail "report summary"
 grep -q '93.184.216.34' /tmp/report.html && ! grep -q '</script>.evil' /tmp/report.html && pass "html отчёта содержит данные и безопасен" || fail "html отчёта"
 [ "$(stat -c %a /etc/autoxray/reports)" = 700 ] && pass "данные отчётов закрыты (700)" || fail "права данных отчётов"
 echo '{"date":"2000-01-01","total":1,"hosts":{"old.test":1},"hours":[]}' > /etc/autoxray/reports/erin/2000-01-01.json
@@ -452,6 +460,7 @@ tg_sync() {
 sent_method() { for _ in $(seq 1 30); do jq -e --arg m "$1" 'select(.method == $m)' "$TG/sent.jsonl" >/dev/null 2>&1 && return 0; sleep 0.5; done; return 1; }
 
 tgmsg 111 /status;  sent_has "autoXRAY" && pass "/status отвечает администратору" || fail "/status"
+tgmsg 111 /help; sent_has "autoXRAY $(autoxray version | awk '{print $2}'):" && pass "справка бота показывает версию" || fail "версия в справке"
 tgmsg 222 /status;  tgmsg 222 /users; tg_sync
 [ "$(jq -s '[.[] | select(.method == "sendMessage" and .payload.chat_id == 222)] | length' "$TG/sent.jsonl")" = 0 ] && pass "постороннему бот не отвечает" || fail "бот ответил постороннему"
 tgmsg 222 /id;      sent_has "222" && pass "/id работает у всех и показывает ID" || fail "/id"
@@ -478,7 +487,8 @@ wait_for not_user frank && pass "подтверждённое удаление �
 
 # отчёт файлом и ссылкой, доверенные адреса, копия настроек
 autoxray user add gina --report on >/dev/null 2>&1
-tgmsg 111 "/report gina"; sent_method sendDocument && jq -e 'select(.method == "sendDocument") | select(.payload.filename | test("^report-gina-.*\\.html$"))' "$TG/sent.jsonl" >/dev/null && pass "/report имя присылает html-файл" || fail "/report: файл"
+tgmsg 111 "/report gina"; sent_has "Куда ходил" && pass "/report присылает текстовую сводку, читаемую прямо в чате" || fail "нет текстовой сводки"
+sent_method sendDocument && jq -e 'select(.method == "sendDocument") | select(.payload.filename | test("^report-gina-.*\\.html$"))' "$TG/sent.jsonl" >/dev/null && pass "/report имя присылает html-файл" || fail "/report: файл"
 sent_has "/r/" && pass "вместе с файлом приходит ссылка на отчёт" || fail "/report: ссылка"
 grep -aq 'gina' /tmp/tg/last-doc.bin && grep -aq '<html' /tmp/tg/last-doc.bin && pass "присланный отчёт самодостаточный html" || fail "содержимое отчёта"
 tgmsg 111 "/user gina"; sent_kb "u:gina:repsend" && sent_kb "u:gina:replink" && pass "в карточке пользователя с отчётом сразу кнопки «файлом» и «ссылка»" || fail "кнопки отчёта в карточке"
@@ -527,6 +537,10 @@ autoxray collect >/dev/null 2>&1; sleep 1
 autoxray user del kim >/dev/null; autoxray user del ivy >/dev/null; autoxray user del jay >/dev/null
 autoxray bot test >/dev/null 2>&1; sent_has "Проверка уведомлений" && pass "bot test присылает уведомление администратору" || fail "bot test"
 autoxray user del hank >/dev/null
+touch /usr/local/bin/autoxray      # скрипт «обновили»: бот обязан сам выйти, чтобы systemd поднял его на новом коде
+for _ in $(seq 1 40); do kill -0 "$BOT" 2>/dev/null || break; sleep 0.5; done
+kill -0 "$BOT" 2>/dev/null && fail "бот не перезапустился после замены скрипта" || pass "бот сам выходит на перезапуск, если скрипт обновили"
+grep -q 'скрипт обновлён' /tmp/bot-run.out || fail "в журнале бота нет сообщения об обновлении"
 kill "$BOT" 2>/dev/null; wait "$BOT" 2>/dev/null
 autoxray bot setup --token 123456:BADTOKENBADTOKENBADTOKEN99 --admin 111 >/dev/null 2>&1 && fail "bot setup принял отозванный токен" \
   || { grep -q TESTTOKEN /etc/autoxray/bot.token && pass "неудачный bot setup не трогает рабочий токен" || fail "рабочий токен потерян"; }
