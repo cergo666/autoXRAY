@@ -9,7 +9,7 @@ set -uo pipefail
 # bash >= 5.2: '&' в замене ${var//a/b} — спецсимвол; ссылки содержат '&'
 shopt -u patsub_replacement 2>/dev/null || true
 
-AX_VERSION="3.11.1"
+AX_VERSION="3.11.2"
 AX_REPO="cergo666/autoXRAY"
 XRAY_TESTED="v26.9.9"          # версия ядра, с которой этот релиз проверен тестами
 API="${AX_API:-https://api.github.com}"
@@ -2442,9 +2442,17 @@ snapshot_create() {
   ls -1t "$SNAP_DIR"/*.tar.gz 2>/dev/null | tail -n +4 | while read -r old; do rm -f "$old"; done
 }
 
+# Бот работает отдельной службой и держит скрипт в памяти: без перезапуска он остаётся на старой версии после обновления или отката
+restart_bot_if_active() {
+  [[ $DRY == 1 ]] && return 0
+  systemctl is-active --quiet autoxray-bot 2>/dev/null && svc restart autoxray-bot
+  return 0
+}
+
 snapshot_restore() { # файл
   tar -C / -xzf "$1" || return 1
   svc daemon-reload; svc restart xray; svc reload nginx 2>/dev/null
+  restart_bot_if_active
   return 0
 }
 
@@ -2527,6 +2535,7 @@ cmd_self_update() {
     snapshot_restore "$snap" || die "Откат не удался, снимок: $snap"
     die "Обновление до ${tag#v} отменено, восстановлено состояние $AX_VERSION."
   fi
+  restart_bot_if_active
   ok "✅ autoxray $AX_VERSION → ${tag#v}. Заметки: https://github.com/$AX_REPO/releases/tag/$tag"
   echo -e " ${DIM}Откат при необходимости: autoxray rollback${NC}"
 }

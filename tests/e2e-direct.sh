@@ -414,7 +414,10 @@ mk_release() { # версия [постфикс-код]
   return 0
 }
 mk_release 9.9.9
+touch /run/bot.active; : > /run/systemctl.log
 AX_RAW_BASE=file:///tmp/rel autoxray self-update v9.9.9 >/tmp/upd1.out 2>&1 && [ "$(autoxray version | awk '{print $2}')" = 9.9.9 ] && pass "self-update до 9.9.9 прошёл проверки" || { fail "self-update"; sed 's/\x1b\[[0-9;]*m//g' /tmp/upd1.out | tail -n 8; }
+grep -q 'restart autoxray-bot' /run/systemctl.log && pass "self-update перезапускает службу бота (иначе он остаётся на старом коде)" || fail "бот не перезапущен после self-update"
+rm -f /run/bot.active
 ls /var/lib/autoxray/snapshots/*-v$ORIG_VER.tar.gz >/dev/null 2>&1 && pass "перед обновлением создан снимок" || fail "снимка нет"
 mk_release 9.9.8 'post_update_check() { return 1; }'
 state_md5=$(md5sum /etc/autoxray/state.json | cut -d' ' -f1)

@@ -12,9 +12,10 @@ xray_start() {
 nginx_running() { [ -f /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; }
 
 cmd=$1; shift
+echo "$cmd $*" >> /run/systemctl.log      # журнал вызовов: тесты проверяют, что нужные службы перезапускаются
 case $cmd in
     show) echo root ;;
-    is-active) svc=${*: -1}; case $svc in xray) [ -f $XRAY_PID ] && kill -0 "$(cat $XRAY_PID)" 2>/dev/null ;; nginx) nginx_running ;; *) false ;; esac ;;
+    is-active) svc=${*: -1}; case $svc in xray) [ -f $XRAY_PID ] && kill -0 "$(cat $XRAY_PID)" 2>/dev/null ;; nginx) nginx_running ;; autoxray-bot) [ -f /run/bot.active ] ;; *) false ;; esac ;;
     restart|start|reload|stop)
         for svc in "$@"; do
             case $svc in
