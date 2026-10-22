@@ -478,6 +478,8 @@ autoxray user add gina --report on >/dev/null 2>&1
 tgmsg 111 "/report gina"; sent_method sendDocument && jq -e 'select(.method == "sendDocument") | select(.payload.filename | test("^report-gina-.*\\.html$"))' "$TG/sent.jsonl" >/dev/null && pass "/report имя присылает html-файл" || fail "/report: файл"
 sent_has "/r/" && pass "вместе с файлом приходит ссылка на отчёт" || fail "/report: ссылка"
 grep -aq 'gina' /tmp/tg/last-doc.bin && grep -aq '<html' /tmp/tg/last-doc.bin && pass "присланный отчёт самодостаточный html" || fail "содержимое отчёта"
+tgmsg 111 "/user gina"; sent_kb "u:gina:repsend" && sent_kb "u:gina:replink" && pass "в карточке пользователя с отчётом сразу кнопки «файлом» и «ссылка»" || fail "кнопки отчёта в карточке"
+tgmsg 111 "/user alice"; sent_kb "u:alice:rep" && pass "у выключенного отчёта в карточке кнопка «включить»" || fail "кнопка включения"
 tgcb 111 "u:gina:rep"; wait_for bash -c "jq -e 'select(.method == \"editMessageText\") | .payload.reply_markup.inline_keyboard[][] | select(.callback_data == \"u:gina:repsend\")' $TG/sent.jsonl" && pass "кнопка отчёта у включённого: файл, ссылка, выключить" || fail "меню отчёта"
 tgcb 111 "u:gina:repsend"; tg_sync
 [ "$(jq -s '[.[] | select(.method == "sendDocument")] | length' "$TG/sent.jsonl")" -ge 2 ] && pass "кнопка «Файл HTML» присылает отчёт" || fail "кнопка файла"

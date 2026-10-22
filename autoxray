@@ -9,7 +9,7 @@ set -uo pipefail
 # bash >= 5.2: '&' в замене ${var//a/b} — спецсимвол; ссылки содержат '&'
 shopt -u patsub_replacement 2>/dev/null || true
 
-AX_VERSION="3.11.0"
+AX_VERSION="3.11.1"
 AX_REPO="cergo666/autoXRAY"
 XRAY_TESTED="v26.9.9"          # версия ядра, с которой этот релиз проверен тестами
 API="${AX_API:-https://api.github.com}"
@@ -2778,14 +2778,18 @@ bot_user_card() {
     "$name" "$icon" "$label" "$(hbytes "$used")" "$([[ $limit -gt 0 ]] && echo " / $(hbytes "$limit")")" "$pct" "$left" "$ipt" "$rul" "$rptt"
 }
 bot_user_kb() {
-  local n=$1 enabled
+  local n=$1 enabled rep
   enabled=$(jq -r --arg n "$n" '.users[] | select(.name == $n) | .enabled' "$STATE")
-  jq -nc --arg n "$n" --arg tog "$([[ $enabled == true ]] && echo "⏸ Отключить" || echo "▶️ Включить")" '
+  rep=$(jq -r --arg n "$n" '.users[] | select(.name == $n) | (.report // false)' "$STATE")
+  jq -nc --argjson rep "$rep" --arg n "$n" --arg tog "$([[ $enabled == true ]] && echo "⏸ Отключить" || echo "▶️ Включить")" '
     {inline_keyboard: [
       [{text: "🔗 Ссылки", callback_data: "u:\($n):links"}, {text: "📷 QR", callback_data: "u:\($n):qr"}],
       [{text: "∞", callback_data: "u:\($n):lim:0"}, {text: "10 ГБ", callback_data: "u:\($n):lim:10"}, {text: "50 ГБ", callback_data: "u:\($n):lim:50"}, {text: "100 ГБ", callback_data: "u:\($n):lim:100"}],
       [{text: $tog, callback_data: "u:\($n):tog"}, {text: "🔁 Новые ключи", callback_data: "u:\($n):rot"}],
-      [{text: "📈 Отчёт", callback_data: "u:\($n):rep"}, {text: "🗑 Удалить", callback_data: "u:\($n):del"}],
+      (if $rep then [{text: "📎 Отчёт файлом", callback_data: "u:\($n):repsend"}, {text: "🔗 Ссылка на отчёт", callback_data: "u:\($n):replink"}]
+       else empty end),
+      [(if $rep then {text: "⏸ Выключить отчёт", callback_data: "u:\($n):repoffq"} else {text: "📈 Включить отчёт", callback_data: "u:\($n):rep"} end),
+       {text: "🗑 Удалить", callback_data: "u:\($n):del"}],
       [{text: "⬅️ К списку", callback_data: "list"}]]}'
 }
 bot_confirm_kb() { jq -nc --arg y "$1" --arg n "$2" '{inline_keyboard: [[{text: "✅ Да", callback_data: $y}, {text: "↩️ Отмена", callback_data: $n}]]}'; }
@@ -2896,7 +2900,9 @@ bot_callback() { # chat message_id callback_id data
         repsend) bot_send_report "$chat" "$name" ;;
         replink) tg_send "$chat" "📈 $name: $(report_url "$name")" ;;
         repoffq) tg_edit "$chat" "$mid" "📈 Выключить отчёт о посещениях <b>$name</b> и удалить страницу?" "$(bot_confirm_kb "u:$name:repoff" "u:$name:rep")" ;;
-        repon) bot_do locked cmd_user_set "$name" --report on; tg_send "$chat" "$(bot_report_text)"; bot_show_user "$chat" "$mid" "$name" ;;
+        repon) bot_do locked cmd_user_set "$name" --report on; tg_send "$chat" "$(bot_report_text)"
+               [[ $BOT_RC -eq 0 ]] && tg_send "$chat" "📈 Отчёт включён. Данные накапливаются со следующей минуты, страница: $(report_url "$name")"
+               bot_show_user "$chat" "$mid" "$name" ;;
         repoff) bot_do locked cmd_user_set "$name" --report off; bot_show_user "$chat" "$mid" "$name" ;;
       esac ;;
   esac
