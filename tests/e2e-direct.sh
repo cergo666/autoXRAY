@@ -18,7 +18,7 @@ mkdir -p "$WEB"
 AX_AUTH=/auth/session
 bash /opt/autoxray/templates/gen_page.sh "$WEB" "$AX_AUTH" >/dev/null
 check "gen_page создал index.html" test -s "$WEB/index.html"
-autoxray init --domain "$DOMAIN" --fp chrome --xhttp-path xh7k2m --auth-path "$AX_AUTH" --web "$WEB" --user alice --xray-version v26.9.9 \
+autoxray init --domain "$DOMAIN" --fp chrome --xhttp-path xh7k2m --auth-path "$AX_AUTH" --web "$WEB" --user alice --xray-version v26.10.21 \
     || fail "init"
 autoxray user add bob --limit 0.000001 || fail "user add bob"
 check "render без ошибок" autoxray render
@@ -35,7 +35,7 @@ TOKEN_B=$(jq -r '.users[] | select(.name=="bob").token' /etc/autoxray/state.json
 check "главная страница сайта-маскировки" curl -fsS --max-time 8 "https://$DOMAIN/" -o /dev/null
 code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' -X POST "https://$DOMAIN$AX_AUTH"); [ "$code" = 401 ] && pass "форма входа отвечает 401" || fail "форма входа: $code"
 curl -sS --max-time 8 -D /tmp/h.txt -o /tmp/sub.json "https://$DOMAIN/$TOKEN_A.json"
-check "подписка alice — валидный JSON с 3 профилями" jq -e 'length == 3' /tmp/sub.json
+check "подписка alice — валидный JSON: 3 протокола и «Авто»" jq -e 'length == 4 and (.[3].remarks | test("Авто"))' /tmp/sub.json
 grep -qi '^subscription-userinfo: upload=0; download=0' /tmp/h.txt && pass "заголовок subscription-userinfo" || { fail "нет subscription-userinfo"; cat /tmp/h.txt; }
 check "страница alice (html)" curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.html" -o /dev/null
 code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/ZZZZZZZZZZZZZZZZZZZZZZZZ.json"); [ "$code" = 404 ] && pass "чужой токен -> 404" || fail "чужой токен: $code"
@@ -309,6 +309,27 @@ AX_WARP_FAKE_RESULTS=/tmp/sc1.tsv AX_WARP_FAKE_SOAK=/tmp/sk1.tsv autoxray warp s
 [ "$(jq -r .warp.endpoint /etc/autoxray/state.json)" = "1.1.1.1:2408" ] && pass "warp stable off: выбор только по скорости" || fail "stable off"
 autoxray warp stable on >/dev/null; autoxray warp nightly off >/dev/null; autoxray warp off >/dev/null
 
+step "WARP через MASQUE: регистрация (подмена API Cloudflare), конфиг Xray, откат при неработающем туннеле"
+EPUB=$(openssl ecparam -genkey -name prime256v1 2>/dev/null | openssl pkey -pubout -outform DER 2>/dev/null | base64 -w0)
+jq -n --arg k "$EPUB" '{id: "dev-m1", token: "tok-m1", config: {interface: {addresses: {v4: "172.16.0.2", v6: "2606:4700:110:8a36::2"}}, peers: [{public_key: $k, endpoint: {v4: "162.159.198.2:443", v6: "[2606:4700:103::2]:443"}}]}}' > /tmp/masque-enrolled.json
+cat > /tmp/fakemasque <<'FM'
+#!/bin/bash
+if [[ "$*" == *"-X PATCH"* ]]; then cat /tmp/masque-enrolled.json
+elif [[ "$*" == *"-X POST"* ]]; then echo '{"id":"dev-m1","token":"tok-m1"}'
+else echo '{}'; fi
+FM
+chmod +x /tmp/fakemasque
+[ "$(jq -r '.warp.registered // false' /etc/autoxray/state.json)" = true ] || AX_CURL=/tmp/fakecurl autoxray warp register >/dev/null 2>&1
+AX_CURL=/tmp/fakemasque AX_WARP_TRACE_TIMEOUT=2 AX_WARP_TRACE_GAP=1 autoxray warp transport masque >/tmp/masque1.out 2>&1 && fail "MASQUE включился без работающего туннеля" || pass "MASQUE без работающего туннеля не остаётся включённым"
+[ "$(jq -r '.warp.transport // "wireguard"' /etc/autoxray/state.json)" = wireguard ] && grep -q 'возвращён' <(sed 's/\x1b\[[0-9;]*m//g' /tmp/masque1.out) && pass "после неудачной проверки транспорт возвращён на WireGuard" || { fail "откат MASQUE"; sed 's/\x1b\[[0-9;]*m//g' /tmp/masque1.out | tail -n 4; }
+jq -e '.warp.masque.endpoint == "162.159.198.2" and .warp.masque.address == ["172.16.0.2","2606:4700:110:8a36::2"] and (.warp.masque.privateKey | startswith("-----BEGIN PRIVATE KEY-----")) and (.warp.masque.deviceId == "dev-m1")' /etc/autoxray/state.json >/dev/null && pass "регистрация MASQUE: ключ ECDSA, адреса и точка сохранены отдельно от WireGuard" || fail "данные MASQUE: $(jq -c '.warp.masque | del(.privateKey, .deviceToken)' /etc/autoxray/state.json)"
+AX_CURL=/tmp/fakemasque autoxray warp transport masque --force >/tmp/masque2.out 2>&1 && pass "warp transport masque --force включает режим без проверки" || { fail "transport masque --force"; tail -n 5 /tmp/masque2.out; }
+jq -e '.outbounds[] | select(.tag == "warp") | .protocol == "masque" and .settings.address == "162.159.198.2" and .settings.port == 443 and .streamSettings.network == "masque" and .streamSettings.tlsSettings.serverName == "consumer-masque.cloudflareclient.com" and (.streamSettings.masqueSettings.warp.address | length) == 2' /usr/local/etc/xray/config.json >/dev/null && pass "исходящее warp в конфиге Xray: masque, SNI Cloudflare, ключ и адреса" || fail "outbound masque: $(jq -c '.outbounds[] | select(.tag == "warp")' /usr/local/etc/xray/config.json | cut -c1-200)"
+check "xray -test принимает конфиг с MASQUE" xray run -test -c /usr/local/etc/xray/config.json
+autoxray warp scan >/dev/null 2>&1 && fail "scan в режиме MASQUE выполнился" || pass "в режиме MASQUE перебор адресов WireGuard отключён"
+autoxray warp status | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'masque' && pass "warp status показывает транспорт" || fail "status транспорта"
+autoxray warp transport wireguard >/dev/null 2>&1; jq -e '.outbounds[] | select(.tag == "warp") | .protocol == "wireguard"' /usr/local/etc/xray/config.json >/dev/null && pass "возврат на WireGuard" || fail "возврат на WireGuard"
+
 step "Холодный старт WARP: keepalive, прогрев, coldtest, временный подробный лог"
 check "warp_hs_stats разбирает журнал рукопожатий" bash -c '
   source <(sed -n "/^warp_hs_stats()/,/^}/p" /opt/autoxray/autoxray)
@@ -366,13 +387,19 @@ AX_API=file:///tmp/api autoxray status 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -
 AX_API=file:///tmp/api autoxray core list 2>&1 | sed 's/\x1b\[[0-9;]*m//g' > /tmp/core.out
 grep -q 'v99.1.0' /tmp/core.out && grep -q 'v100.0.0.*пререлиз' /tmp/core.out && ! grep -q 'v99.1.0.*пререлиз' /tmp/core.out && pass "core list: новее текущей, пререлиз помечен" || { fail "core list"; cat /tmp/core.out; }
 grep -q 'лучше не обновлять без необходимости' /tmp/core.out && pass "предупреждение об обновлении ядра" || fail "нет предупреждения"
-printf 'no\n' | autoxray core update v26.9.9 >/tmp/core-up.out 2>&1; grep -q 'Отменено' /tmp/core-up.out && pass "core update без подтверждения отменяется" || { fail "core update не спросил"; cat /tmp/core-up.out; }
+printf 'no\n' | autoxray core update v26.10.21 >/tmp/core-up.out 2>&1; grep -q 'Отменено' /tmp/core-up.out && pass "core update без подтверждения отменяется" || { fail "core update не спросил"; cat /tmp/core-up.out; }
 step "Выбор пользователя без терминала (нумерованный список)"
 out=$(bash -c 'source <(sed -n "/^choose()/,/^}/p; /^CHOICE=/p" /opt/autoxray/autoxray); choose "T" "a" "b" "c" <<<2; echo "rc=$? CHOICE=$CHOICE"')
 echo "$out" | grep -q 'rc=0 CHOICE=1' && pass "choose: пункт 2 -> индекс 1" || fail "choose: $out"
 
 step "Диагностика, гео-данные, файрвол (dry-run), интерфейс"
 autoxray doctor > /tmp/doctor.out 2>&1 && pass "doctor: критичных проблем нет" || { fail "doctor нашёл проблемы"; sed "s/\x1b\[[0-9;]*m//g" /tmp/doctor.out; }
+check "конфиг без списка geosite, которого нет в гео-данных (win-spy), собирается и остальные правила на месте" bash -c '
+  d=/tmp/axgeo; rm -rf $d; mkdir -p $d/bin $d/geo; printf "CATEGORY-ADS PRIVATE CATEGORY-RU YANDEX VK CATEGORY-IP-GEO-DETECT" > $d/geo/geosite.dat
+  printf "#!/bin/sh\nexit 0\n" > $d/bin/xray; chmod +x $d/bin/xray
+  export PATH=$d/bin:$PATH XRAY_LOCATION_ASSET=$d/geo AX_ETC=$d/etc AX_DRY=1 AX_XRAY_CFG=$d/x.json AX_NGINX_MAP=$d/map AX_NGINX_CONF=$d/n.conf AX_WEB=$d/web AX_REPORT_WEB=$d/rep
+  autoxray init --domain g.test --user u1 >/dev/null && autoxray render >/dev/null 2>&1
+  jq -e "[.routing.rules[] | .domain? // empty] | flatten | (index(\"geosite:win-spy\") == null) and (index(\"geosite:category-ads\") != null)" $d/x.json'
 check "firewall --dry-run" autoxray firewall --dry-run
 printf '%s\n' '[ -n "$TERM" ] && [ "$TERM" != dumb ] || { echo "нет TERM" >&2; exit 2; }' '[ "$1" = install-geodata ] && touch /tmp/geo.called' > /tmp/fake-installer.sh
 rm -f /tmp/geo.called
@@ -393,16 +420,73 @@ autoxray user qr alice links >/dev/null 2>&1 && pass "user qr links" || fail "us
 
 step "Подписки Clash/Mihomo и sing-box"
 curl -sS --max-time 8 -D /tmp/h3.txt -o /tmp/sub.yaml "https://$DOMAIN/$TOKEN_A.yaml"; curl -sS --max-time 8 -o /tmp/sub.sing "https://$DOMAIN/$TOKEN_A.sing"
-jq -e '(.proxies | length) == 3 and ([.proxies[].type] | sort) == ["hysteria2","vless","vless"] and (.proxies[] | select(.network == "xhttp") | ."xhttp-opts".mode) == "stream-up"' /tmp/sub.yaml >/dev/null && pass "Clash: XHTTP, Vision и Hysteria2" || { fail "Clash-подписка"; head -c 400 /tmp/sub.yaml; }
+jq -e '(.proxies | length) == 3 and ([.proxies[].type] | sort) == ["hysteria2","vless","vless"] and (.proxies[] | select(.network == "xhttp") | ."xhttp-opts".mode) == "stream-up" and ([."proxy-groups"[].name] | index("🧭 Авто") != null)' /tmp/sub.yaml >/dev/null && pass "Clash: XHTTP, Vision и Hysteria2" || { fail "Clash-подписка"; head -c 400 /tmp/sub.yaml; }
 # у alice режим RU мог быть переключён выше: правила Clash обязаны совпадать с JSON-подпиской
 jq -e '.rules | .[0] == "GEOIP,private,DIRECT,no-resolve" and .[-1] == "MATCH,autoXRAY"' /tmp/sub.yaml >/dev/null \
   && { has_ru_direct "$TOKEN_A" && jq -e '.rules | index("GEOIP,RU,DIRECT") != null' /tmp/sub.yaml >/dev/null || { ! has_ru_direct "$TOKEN_A" && jq -e '.rules | index("GEOIP,RU,DIRECT") == null' /tmp/sub.yaml >/dev/null; }; } \
   && pass "Clash: правила маршрутизации RU совпадают с основной подпиской" || fail "Clash: правила"
-jq -e '([.outbounds[].type] | index("vless") != null) and ([.outbounds[].type] | index("hysteria2") != null) and (.outbounds | map(select(.type == "vless" and has("transport"))) | length == 0)' /tmp/sub.sing >/dev/null && pass "sing-box: Vision и Hysteria2, без XHTTP" || { fail "sing-box-подписка"; head -c 400 /tmp/sub.sing; }
+jq -e '([.outbounds[].type] | index("vless") != null) and ([.outbounds[].type] | index("hysteria2") != null) and ([.outbounds[].type] | index("urltest") != null) and (.outbounds | map(select(.type == "vless" and has("transport"))) | length == 0)' /tmp/sub.sing >/dev/null && pass "sing-box: Vision и Hysteria2, без XHTTP" || { fail "sing-box-подписка"; head -c 400 /tmp/sub.sing; }
 grep -qi '^subscription-userinfo:' /tmp/h3.txt && grep -qi 'text/yaml' /tmp/h3.txt && pass "заголовки подписки Clash (userinfo, тип)" || fail "заголовки Clash"
 python3 -c "import yaml" 2>/dev/null && { python3 -c "import yaml,sys; yaml.safe_load(open('/tmp/sub.yaml'))" && pass "Clash-подписка разбирается как YAML" || fail "Clash: не YAML"; } || true
 curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.html" | grep -q "$TOKEN_A.yaml" && pass "на личной странице есть ссылки Clash и sing-box" || fail "страница без Clash"
 autoxray user qr alice clash >/dev/null 2>&1 && autoxray user qr alice sing >/dev/null 2>&1 && pass "user qr clash и sing" || fail "user qr clash/sing"
+
+step "Профиль «Авто»: клиент сам выбирает рабочий протокол"
+client_cfg "$TOKEN_A" 3 127.0.0.1 > /tmp/client-auto.json
+check "клиентский Xray принимает конфиг «Авто» (xray -test)" xray run -test -c /tmp/client-auto.json
+jq -e '.routing.balancers[0].strategy.type == "leastPing" and (.burstObservatory.subjectSelector == ["proxy-"]) and ([.outbounds[].tag] | index("proxy-hy2") != null)' /tmp/client-auto.json >/dev/null && pass "в «Авто» балансировщик leastPing и замеры burstObservatory" || fail "структура «Авто»"
+client_start /tmp/client-auto.json && via_proxy ok.txt >/dev/null && pass "«Авто»: трафик идёт" || fail "«Авто»: трафик не идёт"
+client_stop
+# первый (запасной) профиль сломан: после первых замеров трафик должен уйти на рабочие
+jq '(.outbounds[] | select(.tag == "proxy-xhttp") | .settings.vnext[0].address) = "127.0.0.9" | (.outbounds[] | select(.tag == "proxy-xhttp") | .settings.vnext[0].port) = 9' /tmp/client-auto.json > /tmp/client-auto-bad.json
+client_start /tmp/client-auto-bad.json
+ok_auto=0; for _ in $(seq 1 12); do curl -fsS --max-time 6 --socks5-hostname 127.0.0.1:10808 http://93.184.216.34:8080/ok.txt 2>/dev/null | grep -q TARGET-OK && { ok_auto=1; break; }; sleep 2; done
+[ $ok_auto = 1 ] && pass "«Авто»: первый профиль не отвечает, клиент перешёл на рабочий" || fail "«Авто» не ушёл с неработающего профиля"
+client_stop
+
+step "Свои маршруты, скрытие профилей, строка статуса, метки"
+autoxray route add direct Example.ORG https://site.test/page 203.0.113.0/24 >/dev/null && autoxray route add proxy habr.test >/dev/null && autoxray route add block ads.test >/dev/null && pass "route add принимает домены, адреса страниц и сети" || fail "route add"
+autoxray route add direct 'bad domain' >/dev/null 2>&1 && fail "route add принял мусор" || pass "route add отклоняет неверный ввод"
+autoxray route add direct 999.1.1.1/8 >/dev/null 2>&1 && fail "route add принял неверный IP" || pass "route add отклоняет неверный IP"
+curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.json" -o /tmp/sub2.json
+jq -e '[.[0].routing.rules[] | select(.outboundTag == "direct") | (.domain // []) + (.ip // [])] | flatten | (index("domain:example.org") != null) and (index("domain:site.test") != null) and (index("203.0.113.0/24") != null)' /tmp/sub2.json >/dev/null && pass "своё direct в Xray-подписке" || fail "route direct в JSON"
+jq -e '[.[0].routing.rules[] | select(.outboundTag == "proxy") | .domain[]] | index("domain:habr.test") != null' /tmp/sub2.json >/dev/null && jq -e '[.[0].routing.rules[] | select(.outboundTag == "block") | .domain[]] | index("domain:ads.test") != null' /tmp/sub2.json >/dev/null && pass "свои proxy и block в Xray-подписке" || fail "route proxy/block в JSON"
+curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.yaml" | jq -e '.rules | (index("DOMAIN-SUFFIX,example.org,DIRECT") != null) and (index("IP-CIDR,203.0.113.0/24,DIRECT,no-resolve") != null) and (index("DOMAIN-SUFFIX,ads.test,REJECT") != null)' >/dev/null && pass "те же правила в Clash" || fail "route в Clash"
+curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.sing" | jq -e '(.route.rules | map(select(.action == "reject") | .domain_suffix[]) | index("ads.test") != null) and (.route.rules | map(select(.outbound == "direct" and .ip_cidr != null) | .ip_cidr[]) | index("203.0.113.0/24") != null)' >/dev/null && pass "те же правила в sing-box" || fail "route в sing-box"
+autoxray route preset push on >/dev/null; curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.yaml" | jq -e '.rules | index("DOMAIN-SUFFIX,push.apple.com,DIRECT") != null' >/dev/null && pass "preset push: пуш-уведомления напрямую" || fail "preset push"
+autoxray route list | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'example.org' && pass "route list показывает правила" || fail "route list"
+autoxray route del example.org 203.0.113.0/24 habr.test ads.test >/dev/null; autoxray route preset push off >/dev/null
+jq -e '(.routes.direct | length) == 1 and (.routes.proxy | length) == 0 and (.routes.block | length) == 0' /etc/autoxray/state.json >/dev/null && pass "route del убирает правила" || fail "route del: $(jq -c .routes /etc/autoxray/state.json)"
+autoxray route del site.test >/dev/null
+
+autoxray user set alice --hide hy2 >/dev/null && curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.json" | jq -e 'length == 3 and ([.[].remarks] | map(select(test("HYSTERIA"))) | length == 0)' >/dev/null && pass "--hide hy2: профиль убран из JSON-подписки (остались XHTTP, Vision и «Авто»)" || fail "--hide hy2 в JSON"
+autoxray user link alice --plain | grep -q HYSTERIA && fail "--hide hy2: ссылка осталась" || pass "--hide hy2: нет ссылки hy2 (txt, страница, QR)"
+curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.yaml" | jq -e '(.proxies | length) == 2' >/dev/null && pass "--hide hy2: нет в Clash" || fail "--hide hy2 в Clash"
+autoxray user set alice --hide xhttp >/dev/null; autoxray user set alice --hide vision >/dev/null 2>&1 && fail "скрыты все протоколы" || pass "нельзя скрыть все протоколы"
+curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.json" | jq -e 'length == 1' >/dev/null && pass "один оставшийся профиль без «Авто»" || fail "один профиль"
+autoxray user set alice --show all >/dev/null; curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.json" | jq -e 'length == 4' >/dev/null && pass "--show all возвращает все профили" || fail "--show all"
+grep -q 'hide' <(jq -c '.users[] | select(.name == "alice")' /etc/autoxray/state.json) && ! jq -e '.users[] | select(.name == "alice") | .hide | length > 0' /etc/autoxray/state.json >/dev/null && pass "скрытое очищено" || true
+
+autoxray sub statusnode on >/dev/null
+curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.txt" | base64 -d | tail -n1 | grep -q '%E2%84%B9' && pass "строка статуса в универсальной подписке" || fail "статус в txt"
+curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.json" | jq -e '.[-1].remarks | test("ℹ️.*(Без лимита|Осталось)")' >/dev/null && pass "строка статуса в Xray-подписке" || fail "статус в json"
+curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.yaml" | jq -e '[.proxies[].name] | map(select(test("ℹ️"))) | length == 1' >/dev/null && pass "строка статуса в Clash" || fail "статус в Clash"
+autoxray user link alice --plain | grep -q 'ℹ' && fail "строка статуса попала в список ссылок" || pass "в списке ссылок строки статуса нет"
+autoxray sub statusnode off >/dev/null; curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.json" | jq -e 'length == 4' >/dev/null && pass "sub statusnode off убирает строку" || fail "statusnode off"
+
+autoxray user add wk --reset weekly >/dev/null && [ "$(date -d "@$(jq '.users[] | select(.name == "wk") | .next_reset' /etc/autoxray/state.json)" +%u)" = 1 ] && pass "--reset weekly: сброс в ближайший понедельник" || fail "weekly next_reset"
+jq '.wk = {up: 500, down: 500}' /etc/autoxray/traffic.json > /tmp/tr.json && cp /tmp/tr.json /etc/autoxray/traffic.json
+jq '(.users[] | select(.name == "wk") | .next_reset) = 1' /etc/autoxray/state.json > /tmp/st.json && cp /tmp/st.json /etc/autoxray/state.json && chmod 600 /etc/autoxray/state.json
+autoxray collect >/dev/null 2>&1
+[ "$(jq '.wk // "нет"' /etc/autoxray/traffic.json)" = '"нет"' ] && [ "$(jq '.users[] | select(.name == "wk") | .next_reset > 1000000000' /etc/autoxray/state.json)" = true ] && pass "weekly: по наступлении срока трафик сброшен и назначен следующий" || fail "weekly сброс"
+autoxray user del wk >/dev/null
+
+autoxray user set alice --note "Это <b>мама</b>, оплачено до 1.12" --tags "семья, VIP, vip" >/dev/null
+jq -e '.users[] | select(.name == "alice") | (.tags == ["VIP","семья","vip"] or .tags == ["vip","VIP","семья"] or (.tags | length) >= 2) and (.note | startswith("Это"))' /etc/autoxray/state.json >/dev/null && pass "заметка и метки сохранены" || fail "note/tags: $(jq -c '.users[] | select(.name=="alice") | {note,tags}' /etc/autoxray/state.json)"
+autoxray user find МАМА | sed 's/\x1b\[[0-9;]*m//g' | grep -q alice && autoxray user list --tag vip | sed 's/\x1b\[[0-9;]*m//g' | grep -q alice && pass "поиск по заметке и метке (без учёта регистра, кириллица)" || fail "поиск"
+autoxray user find несуществующее | grep -q 'Никого' && pass "поиск без результата" || fail "поиск пустой"
+autoxray user set alice --tags 'bad|tag' >/dev/null 2>&1 && fail "метки с запрещёнными символами приняты" || pass "метки с | отклоняются"
+autoxray user set alice --note "" --tags "" >/dev/null
 
 step "Сайт-маскировка: пересоздание и свой сайт"
 md5_a=$(md5sum "$WEB/index.html" | cut -d' ' -f1)
@@ -421,13 +505,20 @@ mk_release() { # версия [постфикс-код]
   [ -n "${2:-}" ] && sed -i "s|^main \"\$@\"\$|$2\nmain \"\$@\"|" "/tmp/rel/v$1/autoxray"
   return 0
 }
-mk_release 9.9.9
+export AX_SUMS_BASE=file:///tmp/rel
+sums_for() { (cd "/tmp/rel/v$1" && files=$(sed -n '/^RELEASE_FILES=(/,/)/p' autoxray | tr -d '()' | sed 's/^RELEASE_FILES=//' | tr ' ' '\n' | grep -E '^[A-Za-z0-9_./-]+$') && sha256sum $files > FILES.sha256); }
+mk_release 9.9.9; sums_for 9.9.9
 touch /run/bot.active; : > /run/systemctl.log
 AX_RAW_BASE=file:///tmp/rel autoxray self-update v9.9.9 >/tmp/upd1.out 2>&1 && [ "$(autoxray version | awk '{print $2}')" = 9.9.9 ] && pass "self-update до 9.9.9 прошёл проверки" || { fail "self-update"; sed 's/\x1b\[[0-9;]*m//g' /tmp/upd1.out | tail -n 8; }
 grep -q 'restart autoxray-bot' /run/systemctl.log && pass "self-update перезапускает службу бота (иначе он остаётся на старом коде)" || fail "бот не перезапущен после self-update"
 rm -f /run/bot.active
 ls /var/lib/autoxray/snapshots/*-v$ORIG_VER.tar.gz >/dev/null 2>&1 && pass "перед обновлением создан снимок" || fail "снимка нет"
-mk_release 9.9.8 'post_update_check() { return 1; }'
+# подмена файла в релизе: суммы не сходятся, обновление отклоняется до любых изменений
+mk_release 9.9.7; sums_for 9.9.7; echo '<!-- подмена -->' >> /tmp/rel/v9.9.7/templates/sub.html
+AX_RAW_BASE=file:///tmp/rel autoxray self-update v9.9.7 >/tmp/upd-tamper.out 2>&1 && fail "обновление с подменённым файлом прошло" || { grep -q 'не совпали' /tmp/upd-tamper.out && [ "$(autoxray version | awk '{print $2}')" = 9.9.9 ] && pass "подменённый файл релиза: обновление отклонено, версия не изменилась" || fail "подмена: $(tail -n 3 /tmp/upd-tamper.out)"; }
+mk_release 9.9.6; rm -f /tmp/rel/v9.9.6/FILES.sha256
+AX_RAW_BASE=file:///tmp/rel autoxray self-update v9.9.6 >/tmp/upd-nosum.out 2>&1 && fail "обновление без контрольных сумм прошло" || { grep -q 'контрольные суммы' /tmp/upd-nosum.out && pass "релиз новее 3.13 без контрольных сумм не ставится" || fail "без сумм: $(tail -n 3 /tmp/upd-nosum.out)"; }
+mk_release 9.9.8 'post_update_check() { return 1; }'; sums_for 9.9.8
 state_md5=$(md5sum /etc/autoxray/state.json | cut -d' ' -f1)
 AX_RAW_BASE=file:///tmp/rel autoxray self-update v9.9.8 >/tmp/upd2.out 2>&1 && fail "сломанное обновление не должно проходить" || pass "сломанное обновление отклонено"
 [ "$(autoxray version | awk '{print $2}')" = 9.9.9 ] && pass "после неудачи версия вернулась (9.9.9)" || fail "версия после отката: $(autoxray version)"
@@ -518,6 +609,31 @@ autoxray collect >/dev/null 2>&1; sleep 1
 [ "$(jq -s '[.[] | select(.method == "sendDocument")] | length' "$TG/sent.jsonl")" -le "$((n_docs + 1))" ] && pass "повторно в ту же неделю копия не отправляется" || fail "копия отправлена дважды"
 autoxray bot backup off >/dev/null
 
+# режим клиента: приглашение, привязка Telegram, свои данные, чужое недоступно
+sent_to() { local i; for i in $(seq 1 40); do jq -e --argjson c "$1" --arg p "$2" 'select(.payload.chat_id == $c and ((.payload.text // "") | test($p)))' "$TG/sent.jsonl" >/dev/null 2>&1 && return 0; sleep 0.25; done; return 1; }
+tgmsg 111 "/invite alice"; sent_has "t.me/axtest_bot\\?start=" && pass "/invite присылает ссылку-приглашение" || fail "/invite"
+CODE=$(jq -r '.users[] | select(.name == "alice") | .invite.code' /etc/autoxray/state.json); [ ${#CODE} = 16 ] && pass "код приглашения 16 символов, срок 7 дней" || fail "код: $CODE"
+tgmsg 555 "/start $CODE"; sent_to 555 "подключены как.*alice" && jq -e '.users[] | select(.name == "alice") | .tg == 555 and (.invite == null)' /etc/autoxray/state.json >/dev/null && pass "клиент привязал Telegram по приглашению, код израсходован" || fail "привязка по приглашению"
+sent_to 111 "alice.*привязал" && pass "администратор уведомлён о привязке" || fail "уведомление о привязке"
+tgmsg 666 "/start $CODE"; sent_to 666 "недействительно" && pass "повторное использование приглашения отклоняется" || fail "повторный код"
+tgmsg 555 "/me"; sent_to 555 "Использовано" && pass "клиент видит свой трафик и срок" || fail "/me клиента"
+tgmsg 555 "/link"; sent_to 555 "vless://" && pass "клиент получает свои ссылки" || fail "/link клиента"
+tgcb 555 "c:qr"; sent_method sendPhoto && pass "кнопка QR у клиента" || fail "QR клиента"
+tgmsg 555 "/users"; tgmsg 555 "/del alice"; tgmsg 555 "/add hacker"; tg_sync
+[ "$(jq -s '[.[] | select(.method == "sendMessage" and .payload.chat_id == 555 and ((.payload.text // "") | test("Пользователи|создан")))] | length' "$TG/sent.jsonl")" = 0 ] && jq -e '.users[] | select(.name == "alice")' /etc/autoxray/state.json >/dev/null && ! jq -e '.users[] | select(.name == "hacker")' /etc/autoxray/state.json >/dev/null && pass "клиент не может управлять сервером (/users, /del, /add игнорируются)" || fail "клиент получил админские права"
+tgcb 555 "u:alice:del"; tgcb 555 "u:alice:delok"; tg_sync; jq -e '.users[] | select(.name == "alice")' /etc/autoxray/state.json >/dev/null && pass "админские кнопки клиентом не работают" || fail "клиент удалил пользователя кнопкой"
+for i in 1 2 3 4 5 6 7; do tgmsg 777 "/start AAAAAAAAAAAAAAA$i"; done; tg_sync
+[ "$(jq -s '[.[] | select(.method == "sendMessage" and .payload.chat_id == 777)] | length' "$TG/sent.jsonl")" = 5 ] && pass "после пяти неверных кодов за час бот молчит" || fail "ограничение неверных кодов: $(jq -s '[.[] | select(.payload.chat_id == 777)] | length' "$TG/sent.jsonl")"
+tgmsg 111 "/broadcast Завтра с 02:00 до 03:00 возможны <перебои>"; sent_has "Отправить 1 клиент" && pass "рассылка: сначала подтверждение с числом получателей" || fail "рассылка: подтверждение"
+tgcb 111 "bc:ok"; sent_to 555 "Сообщение от администратора[\\s\\S]*&lt;перебои&gt;" && pass "рассылка дошла клиенту, текст экранирован" || fail "рассылка"
+tgmsg 111 "/note alice Это мама, оплачено до 1.12"; tgmsg 111 "/tags alice семья,vip"; tgmsg 111 "/hide alice hy2"; tg_sync
+jq -e '.users[] | select(.name == "alice") | .note == "Это мама, оплачено до 1.12" and (.tags | length) == 2 and .hide == ["hy2"]' /etc/autoxray/state.json >/dev/null && pass "/note, /tags, /hide из бота" || fail "заметки из бота: $(jq -c '.users[] | select(.name=="alice") | {note,tags,hide}' /etc/autoxray/state.json)"
+tgmsg 111 "/user alice"; sent_has "Telegram привязан" && sent_has "семья" && sent_has "скрыто: hy2" && pass "карточка показывает привязку, метки, скрытое и заметку" || fail "карточка пользователя"
+tgmsg 111 "/find мама"; sent_has "alice" && pass "/find по заметке" || fail "/find"
+tgmsg 111 "/show alice all"; tgmsg 111 "/unlink alice"; tg_sync
+jq -e '.users[] | select(.name == "alice") | (.tg == null) and ((.hide // []) | length == 0)' /etc/autoxray/state.json >/dev/null && pass "/show all и /unlink" || fail "unlink"
+autoxray user set alice --note "" --tags "" >/dev/null
+
 # уведомления: у пользователя заканчивается лимит
 autoxray user add hank --limit 1 >/dev/null
 autoxray collect >/dev/null 2>&1          # первая проверка запоминает статусы (hank активен)
@@ -526,15 +642,38 @@ autoxray collect >/dev/null 2>&1          # лимит превышен: при�
 sent_has "hank.*лимит" && pass "уведомление: исчерпан лимит трафика" || fail "уведомление о лимите"
 # первое подключение, 80% лимита, срок заканчивается
 autoxray user add kim >/dev/null; autoxray user add ivy --limit 10 >/dev/null; autoxray user add jay --days 2 >/dev/null
+jq '(.users[] | select(.name == "ivy") | .tg) = 556 | (.users[] | select(.name == "jay") | .tg) = 557' /etc/autoxray/state.json > /tmp/st.json && cp /tmp/st.json /etc/autoxray/state.json && chmod 600 /etc/autoxray/state.json
 jq '.kim = {up: 1000, down: 0} | .ivy = {up: 9000000000, down: 0}' /etc/autoxray/traffic.json > /tmp/tr.json && cp /tmp/tr.json /etc/autoxray/traffic.json
 autoxray collect >/dev/null 2>&1
 sent_has "kim.*первое подключение" && [ "$(jq '.users[] | select(.name == "kim") | .first_seen > 0' /etc/autoxray/state.json)" = true ] && pass "уведомление о первом подключении" || fail "первое подключение"
 jq -e 'select((.payload.text // "") | test("alice.*первое подключение"))' "$TG/sent.jsonl" >/dev/null 2>&1 && fail "alice (давно подключалась) получила уведомление о первом подключении" || pass "о давних пользователях «первое подключение» не приходит"
 sent_has "ivy.*израсходовано 8[0-9]% лимита" && pass "предупреждение: израсходовано 80% лимита" || fail "предупреждение о 80%"
 sent_has "jay.*срок заканчивается" && pass "предупреждение: срок заканчивается" || fail "предупреждение о сроке"
+sent_to 556 "Израсходовано 8[0-9]% трафика" && sent_to 557 "Срок доступа заканчивается" && pass "те же предупреждения получает сам клиент" || fail "предупреждения клиенту"
 autoxray collect >/dev/null 2>&1; sleep 1
 [ "$(jq -s '[.[] | select(.method == "sendMessage" and ((.payload.text // "") | test("ivy.*израсходовано")))] | length' "$TG/sent.jsonl")" = 1 ] && pass "предупреждение приходит один раз" || fail "предупреждение продублировано"
 autoxray user del kim >/dev/null; autoxray user del ivy >/dev/null; autoxray user del jay >/dev/null
+
+# попытки торрента через сервер (клиент без правила «торрент напрямую», как у сырой ссылки в роутере)
+autoxray torrent alert on >/dev/null
+TOKEN_A=$(jq -r '.users[] | select(.name=="alice").token' /etc/autoxray/state.json)
+client_cfg "$TOKEN_A" 1 127.0.0.1 | jq 'del(.routing.rules[] | select(.protocol == ["bittorrent"]))' > /tmp/c-bt.json
+client_start /tmp/c-bt.json
+: > /var/log/xray/access.log
+python3 - <<'PY'
+import socket, struct
+s = socket.create_connection(("127.0.0.1", 10808), timeout=8)
+s.sendall(b"\x05\x01\x00"); s.recv(2)
+s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("93.184.216.34") + struct.pack(">H", 8080)); s.recv(10)
+s.sendall(b"\x13BitTorrent protocol" + b"\x00" * 8 + b"A" * 40)
+s.settimeout(5)
+try: s.recv(100)
+except Exception: pass
+PY
+client_stop
+autoxray ipwatch >/tmp/ipw.out 2>&1
+sent_has "alice.*торрент" && pass "попытка торрента заблокирована, администратор уведомлён" || { fail "уведомление о торренте"; cat /tmp/ipw.out; }
+autoxray torrent alert off >/dev/null; [ "$(jq -r .log.loglevel /usr/local/etc/xray/config.json)" = none ] && pass "torrent alert off: журнал доступа снова выключен" || fail "лог после torrent alert off"
 autoxray bot test >/dev/null 2>&1; sent_has "Проверка уведомлений" && pass "bot test присылает уведомление администратору" || fail "bot test"
 autoxray user del hank >/dev/null
 touch /usr/local/bin/autoxray      # скрипт «обновили»: бот обязан сам выйти, чтобы systemd поднял его на новом коде

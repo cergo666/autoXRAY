@@ -17,14 +17,15 @@ suite() { # имя -> запуск набора
     bridge)  tests/e2e-bridge-host.sh ;;
     fresh)   run "e2e-install.sh fresh" ;;
     migrate) run "e2e-install.sh migrate" ;;
+    verify)  run "e2e-install.sh verify" ;;
   esac
 }
 
 case "${1:-all}" in
   direct)  suites=(direct) ;;
   bridge)  suites=(bridge) ;;
-  install) suites=(fresh migrate) ;;
-  all)     suites=(direct bridge fresh migrate) ;;
+  install) suites=(fresh migrate verify) ;;
+  all)     suites=(direct bridge fresh migrate verify) ;;
   *) echo "usage: $0 [direct|bridge|install|all]"; exit 2 ;;
 esac
 

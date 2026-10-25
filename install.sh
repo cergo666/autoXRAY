@@ -17,11 +17,12 @@ BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
 
-AX_RELEASE="3.12.0"
+AX_RELEASE="3.13.0"
 AX_REF_DEFAULT="main"   # при выпуске релиза заменяется на тег (см. .github/workflows/release.yml)
 AX_REF="${AUTOXRAY_REF:-$AX_REF_DEFAULT}"
-RAW="https://raw.githubusercontent.com/cergo666/autoXRAY/$AX_REF"
-XRAY_VERSION="${AX_XRAY_VERSION:-v26.9.9}"
+RAW="${AUTOXRAY_RAW:-https://raw.githubusercontent.com/cergo666/autoXRAY}/$AX_REF"
+SUMS_URL="${AX_SUMS_BASE:-https://github.com/cergo666/autoXRAY/releases/download}/$AX_REF/FILES.sha256"
+XRAY_VERSION="${AX_XRAY_VERSION:-v26.10.21}"
 
 echo -e "${GRN}autoXRAY $AX_RELEASE (источник: $AX_REF) ${NC}"
 sleep 1
@@ -200,16 +201,28 @@ echo -e "${GRN}Лимиты применены. Текущий ulimit -n: $(ulim
 # CLI autoxray, шаблоны, сайт-маскировка
 # ==========================================
 echo -e "${YEL}Устанавливаем autoxray...${NC}"
-fetch autoxray > /usr/local/bin/autoxray || die "Не удалось получить autoxray"
-chmod 755 /usr/local/bin/autoxray
-mkdir -p /usr/local/share/autoxray
-for t in sub.html nginx.conf report.html gen_page.sh; do
-    fetch "templates/$t" > "/usr/local/share/autoxray/$t" || die "Не удалось получить templates/$t"
+RELEASE_FILES=(autoxray templates/sub.html templates/nginx.conf templates/report.html templates/gen_page.sh
+               components/telegram/install.sh components/telegram/update.sh components/telegram/uninstall.sh)
+STAGE=$(mktemp -d)
+for t in "${RELEASE_FILES[@]}"; do
+    mkdir -p "$STAGE/$(dirname "$t")"
+    fetch "$t" > "$STAGE/$t" || die "Не удалось получить $t"
 done
+
+# Релиз с тегом (vX.Y.Z) сверяется с контрольными суммами, опубликованными вместе с ним. Источник main и локальная копия не проверяются.
+if [[ -z "$AUTOXRAY_SRC" && "$AX_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    SUMS=$(curl -fsSL --retry 2 "$SUMS_URL") || die "Не удалось получить контрольные суммы релиза ($SUMS_URL). Файлы не установлены."
+    (cd "$STAGE" && printf '%s\n' "$SUMS" | sha256sum -c --quiet) \
+        || die "Контрольные суммы файлов релиза $AX_REF не совпали: установка остановлена."
+    echo -e "${GRN}Контрольные суммы релиза $AX_REF совпали${NC}"
+else
+    echo -e "${YEL}Контрольные суммы не проверяются (источник: ${AUTOXRAY_SRC:-$AX_REF}).${NC}"
+fi
+
+install -m 755 "$STAGE/autoxray" /usr/local/bin/autoxray
 mkdir -p /usr/local/share/autoxray/telegram
-for t in install update uninstall; do
-    fetch "components/telegram/$t.sh" > "/usr/local/share/autoxray/telegram/$t.sh" || die "Не удалось получить components/telegram/$t.sh"
-done
+install -m 644 "$STAGE"/templates/* /usr/local/share/autoxray/
+install -m 755 "$STAGE"/components/telegram/*.sh /usr/local/share/autoxray/telegram/
 
 WEB_PATH="/var/www/$DOMAIN"
 mkdir -p "$WEB_PATH"
@@ -246,7 +259,7 @@ if [ "$REUSE" != true ]; then
 fi
 [ "$(jq -r '.mode // "direct"' "$AX_STATE" 2>/dev/null)" = bridge ] && INIT_MODE=bridge
 
-bash <(fetch templates/gen_page.sh) "$WEB_PATH" "$AUTH_PATH" || echo -e "${YEL}Сайт-маскировка не сгенерирована, используется заглушка.${NC}"
+bash "$STAGE/templates/gen_page.sh" "$WEB_PATH" "$AUTH_PATH" || echo -e "${YEL}Сайт-маскировка не сгенерирована, используется заглушка.${NC}"
 [ -f "$WEB_PATH/index.html" ] || echo "<!DOCTYPE html><html><head><meta charset='utf-8'><title>$DOMAIN</title></head><body><h1>Server Ready</h1></body></html>" > "$WEB_PATH/index.html"
 
 # ==========================================
@@ -352,7 +365,7 @@ export socksUser socksPasw
 if [ "$INSTALL_MTP" = true ]; then
     echo -e "\n\n${GRN}Устанавливаем Telegram Web Proxy ${NC}"
     # shellcheck disable=SC1090
-    source <(fetch components/telegram/install.sh)
+    source "$STAGE/components/telegram/install.sh"
     [ -n "$MTProto" ] && autoxray telegram set "$MTProto"   # заодно пересоберёт nginx.conf и подписки
 else
     echo -e "\n\n${YEL}Установка Telegram Web Proxy пропущена.${NC}"

@@ -9,9 +9,9 @@ set -uo pipefail
 # bash >= 5.2: '&' в замене ${var//a/b} — спецсимвол; ссылки содержат '&'
 shopt -u patsub_replacement 2>/dev/null || true
 
-AX_VERSION="3.12.0"
+AX_VERSION="3.13.0"
 AX_REPO="cergo666/autoXRAY"
-XRAY_TESTED="v26.9.9"          # версия ядра, с которой этот релиз проверен тестами
+XRAY_TESTED="v26.10.21"          # версия ядра, с которой этот релиз проверен тестами
 API="${AX_API:-https://api.github.com}"
 AX_ETC="${AX_ETC:-/etc/autoxray}"
 STATE="$AX_ETC/state.json"
@@ -101,6 +101,8 @@ rand()     { LC_ALL=C tr -dc "$1" </dev/urandom | head -c "$2"; }
 new_uuid() { cat /proc/sys/kernel/random/uuid; }
 now()      { date +%s; }
 next_month() { date -d "$(date +%Y-%m-01) +1 month" +%s; }
+next_week()  { date -d "$(date +%F) +$(( 8 - $(date +%u) )) days" +%s; }          # ближайший понедельник, 00:00
+next_reset_ts() { case ${1:-} in monthly) next_month ;; weekly) next_week ;; *) echo 0 ;; esac; }
 
 urldecode() { printf '%b' "${1//%/\\x}"; }
 
@@ -234,9 +236,19 @@ $s[0] as $S
     outbounds: (
       [
         {tag: "direct", protocol: "freedom", settings: {}, streamSettings: {sockopt: {domainStrategy: "ForceIPv4"}}},
-        {tag: "block", protocol: "blackhole"}
+        {tag: "block", protocol: "blackhole"},
+        {tag: "block-bt", protocol: "blackhole"}
       ]
-      + (if $W.registered == true then [{
+      + (if $W.registered == true and $W.transport == "masque" and ($W.masque // null) != null then [{
+          tag: "warp", protocol: "masque",
+          settings: {address: $W.masque.endpoint, port: 443},
+          streamSettings: {
+            network: "masque", security: "tls",
+            tlsSettings: {serverName: "consumer-masque.cloudflareclient.com", alpn: ["h3"]},
+            masqueSettings: {warp: {privateKey: $W.masque.privateKey, publicKey: $W.masque.publicKey, address: $W.masque.address}}
+          }
+        }]
+        elif $W.registered == true then [{
           tag: "warp", protocol: "wireguard",
           settings: {
             secretKey: $W.secretKey,
@@ -257,11 +269,11 @@ $s[0] as $S
         + [
           {ip: ["geoip:private"], outboundTag: "block"},
           {port: "25, 135, 137-139, 445", outboundTag: "block"},
-          {protocol: ["bittorrent"], outboundTag: "block"},
-          {domain: ["geosite:category-ads", "geosite:win-spy", "geosite:private"], outboundTag: "block"}
+          {protocol: ["bittorrent"], outboundTag: "block-bt"}
         ]
+        + rule_if({domain: geo(["geosite:category-ads", "geosite:win-spy", "geosite:private"]), outboundTag: "block"})
         + (if $warp_on then
-             [{domain: (["full:one.one.one.one"] + ($W.domains // []) + (if $ru then ru_domains else [] end)), outboundTag: "warp"}]
+             [{domain: (["full:one.one.one.one"] + ($W.domains // []) + (if $ru then geo(ru_domains) else [] end)), outboundTag: "warp"}]
              + (if $ru then [{ip: ["geoip:ru"], outboundTag: "warp"}] else [] end)
            else [] end)
         + [{outboundTag: "block", domain: ["ifconfig.me", "checkip.amazonaws.com", "pify.org", "2ip.io", "geosite:category-ip-geo-detect"]}]
@@ -274,7 +286,9 @@ JQ
 # Общее для серверных конфигов: лог доступа нужен только при лимитах IP; блокировка лишних IP по правилу user + source
 SERVER_COMMON=$(cat <<'JQ'
 def debug_on($S): (($S.debug.until // 0) > $now);
-def has_ip_limit($S): ([$S.users[] | select(.enabled and (((.ip_limit // 0) > 0) or (.report == true)))] | length) > 0;
+def geo($l): $l | map(select(. as $c | ($geomiss | index($c)) == null));
+def rule_if($r): if (($r.domain // []) | length) > 0 then [$r] else [] end;
+def has_ip_limit($S): (([$S.users[] | select(.enabled and (((.ip_limit // 0) > 0) or (.report == true)))] | length) > 0) or ($S.torrent.alert == true);
 def ban_rules: ([$b[0][] | select(.until > $now)] | group_by(.user) | map({user: [.[0].user], source: (map(.ip) | unique), outboundTag: "block"}));
 JQ
 )
@@ -295,8 +309,11 @@ BRIDGE_JQ=$(cat <<'JQ'
 def used($u): (($t[0][$u.name].up // 0) + ($t[0][$u.name].down // 0));
 def active($u): $u.enabled and ($u.expire == 0 or $u.expire > $now) and ($u.limit == 0 or used($u) < $u.limit);
 def sniff: {enabled: true, destOverride: ["http", "tls", "quic"]};
-def node_out($n): {mux: {concurrency: -1, enabled: false}, tag: ("proxy-" + ($n.id | tostring)), protocol: "vless",
-  settings: {vnext: [{port: $n.port, users: [node_user($n)], address: $n.addr}]}, streamSettings: node_stream($n)};
+# Xray с 26.10 проверяет TLS по встроенным корневым сертификатам, не по системным. Если у узлов EU собственный CA, его файл
+# задаётся командой `autoxray node ca <файл>` и добавляется как доверенный.
+def node_out($n; $S): {mux: {concurrency: -1, enabled: false}, tag: ("proxy-" + ($n.id | tostring)), protocol: "vless",
+  settings: {vnext: [{port: $n.port, users: [node_user($n)], address: $n.addr}]},
+  streamSettings: (node_stream($n) | if (($S.tls.ca_file // "") != "") and .security == "tls" then .tlsSettings.certificates = [{usage: "verify", certificateFile: $S.tls.ca_file}] else . end)};
 
 $s[0] as $S
 | [$S.users[] | select(active(.))] as $U
@@ -360,9 +377,9 @@ $s[0] as $S
       {tag: "api", port: 10085, listen: "127.0.0.1", protocol: "dokodemo-door", settings: {address: "127.0.0.1"}}
     ],
     outbounds: (
-      [$S.nodes[] | node_out(.)]
+      [$S.nodes[] | node_out(.; $S)]
       + [{tag: "direct", protocol: "freedom", settings: {}, streamSettings: {sockopt: {domainStrategy: "ForceIPv4"}}},
-         {tag: "block", protocol: "blackhole"}]
+         {tag: "block", protocol: "blackhole"}, {tag: "block-bt", protocol: "blackhole"}]
     ),
     routing: {
       domainMatcher: "hybrid", domainStrategy: "IPIfNonMatch",
@@ -379,13 +396,13 @@ $s[0] as $S
         + [
           {ip: ["geoip:private"], outboundTag: "block"},
           {port: "25, 135, 137-139, 445", outboundTag: "block"},
-          {protocol: ["bittorrent"], outboundTag: "block"},
-          {domain: ["geosite:category-ads", "geosite:win-spy", "geosite:private"], outboundTag: "block"},
-          {domain: ["testipv6.net", "ifconfig.me", "checkip.amazonaws.com", "pify.org", "2ip.io", "domain:ru", "domain:su", "domain:xn--p1ai",
-                    "geosite:category-ip-geo-detect", "geosite:apple", "geosite:apple-pki", "geosite:f-droid", "geosite:yandex", "geosite:vk", "geosite:category-ru"],
-           outboundTag: "direct"},
-          {ip: ["geoip:ru"], outboundTag: "direct"}
+          {protocol: ["bittorrent"], outboundTag: "block-bt"}
         ]
+        + rule_if({domain: geo(["geosite:category-ads", "geosite:win-spy", "geosite:private"]), outboundTag: "block"})
+        + rule_if({domain: geo(["testipv6.net", "ifconfig.me", "checkip.amazonaws.com", "pify.org", "2ip.io", "domain:ru", "domain:su", "domain:xn--p1ai",
+                    "geosite:category-ip-geo-detect", "geosite:apple", "geosite:apple-pki", "geosite:f-droid", "geosite:yandex", "geosite:vk", "geosite:category-ru"]),
+           outboundTag: "direct"})
+        + [{ip: ["geoip:ru"], outboundTag: "direct"}]
         + [$S.nodes[] | {vlessRoute: (.id | tostring), outboundTag: ("proxy-" + (.id | tostring))}]
         + [{inboundTag: ["RUsocks5"], balancerTag: "Super_Balancer"},
            {network: "tcp,udp", balancerTag: "Super_Balancer"}]
@@ -395,6 +412,17 @@ $s[0] as $S
 JQ
 )
 
+# Списки geosite, которых нет в установленном geosite.dat. Xray не запускается целиком, если в правилах есть неизвестный список
+# (так бывает после смены источника гео-данных), поэтому такие списки из серверного конфига исключаются.
+geo_missing() {
+  local dat=${XRAY_LOCATION_ASSET:-/usr/local/share/xray}/geosite.dat c out=()
+  [[ -f $dat ]] || { echo '[]'; return 0; }
+  for c in category-ads win-spy private category-ru yandex vk category-ip-geo-detect; do
+    grep -qiaF -- "$c" "$dat" || out+=("geosite:$c")
+  done
+  printf '%s\n' "${out[@]}" | jq -Rn '[inputs | select(length > 0)]'
+}
+
 render_xray_json() {
   local prog="$SERVER_COMMON"$'\n'"$XRAY_JQ"
   [[ $(mode) == bridge ]] && prog="$SERVER_COMMON"$'\n'"$BRIDGE_COMMON"$'\n'"$BRIDGE_JQ"
@@ -402,7 +430,7 @@ render_xray_json() {
   # ключи-заглушки (когда активных пользователей нет) постоянны: иначе каждый render менял бы конфиг и перезапускал Xray
   local h; h=$(jq -r '"dummy:" + (.socks.pass // "") + (.domain // "")' "$STATE" | sha256sum)
   jq -n --slurpfile s "$STATE" --slurpfile t "$TRAFFIC" --slurpfile b "$BANS" --argjson now "$(now)" \
-    --arg dummy_id "${h:0:8}-${h:8:4}-4${h:13:3}-8${h:17:3}-${h:20:12}" --arg dummy_auth "${h:32:16}" "$prog"
+    --argjson geomiss "$(geo_missing)" --arg dummy_id "${h:0:8}-${h:8:4}-4${h:13:3}-8${h:17:3}-${h:20:12}" --arg dummy_auth "${h:32:16}" "$prog"
 }
 
 xray_group() {
@@ -441,30 +469,78 @@ apply_xray() {
 
 EXTRA='%7B%22noGRPCHeader%22%3Afalse%2C%22xPaddingBytes%22%3A%22150-400%22%2C%22scMaxEachPostBytes%22%3A500000%2C%22scMinPostsIntervalMs%22%3A%225-15%22%2C%22scMaxBufferedPosts%22%3A20%2C%22scStreamUpServerSecs%22%3A%2290-180%22%2C%22xmux%22%3A%7B%22maxConcurrency%22%3A%222-4%22%2C%22cMaxReuseTimes%22%3A%22800-1500%22%2C%22hMaxReusableSecs%22%3A%22900-1200%22%7D%7D'
 
-# Печатает «название|ссылка» по строке на каждый протокол.
-user_links() {
-  jq -r --arg n "$1" --arg ex "$EXTRA" "$BRIDGE_COMMON"'
-    def xl($S; $id; $u; $tag): "vless://\(route_uuid($u.uuid; $id))@\($S.domain):443?security=tls&alpn=h2&type=xhttp&mode=stream-up&path=%2F\($S.paths.xhttp)&extra=\($ex)&sni=\($S.domain)&fp=\($S.fingerprint)#\($tag | @uri)";
-    . as $S | ($S.users[] | select(.name == $n)) as $u
-    | if $S.mode == "bridge" then
-        (if ($S.nodes | length) > 1 then "🇷🇺 RU>EU Автобалансир|\(xl($S; 0; $u; "RU>EU Автобалансир"))" else empty end),
-        ($S.nodes[] as $x
-         | "XHTTP TLS stream-up (RU>EU \($x.name))|\(xl($S; $x.id; $u; "RU>EU_xhttp_" + $x.name))",
-           "RAW VISION (RU>EU \($x.name))|vless://\(route_uuid($u.uuid; $x.id))@\($S.domain):443?security=tls&type=tcp&headerType=&path=&host=&flow=xtls-rprx-vision&sni=\($S.domain)&fp=\($S.fingerprint)&spx=%2F#\("RU>EU_raw_" + $x.name | @uri)",
-           "Direct EU (\($x.name))|\($x.url)")
-      else
-        "VLESS XHTTP TLS stream-up|vless://\($u.uuid)@\($S.domain):443?security=tls&alpn=h2&type=xhttp&mode=stream-up&path=%2F\($S.paths.xhttp)&extra=\($ex)&sni=\($S.domain)&fp=\($S.fingerprint)#vlessXHTTPtls-\($u.name)",
-        "VLESS RAW TLS VISION|vless://\($u.uuid)@\($S.domain):443?security=tls&type=tcp&headerType=&path=&host=&flow=xtls-rprx-vision&sni=\($S.domain)&fp=\($S.fingerprint)&spx=%2F#vlessRAWtlsVision-\($u.name)",
-        "HYSTERIA2|hy2://\($u.hy2)@\($S.domain):443/?sni=\($S.domain)&alpn=h3#Hysteria2-\($u.name)"
-      end
-  ' "$STATE"
+# Общие определения для всех форматов подписок (Xray JSON, Clash, sing-box, ссылки).
+# hidden/visible: профили, которые администратор скрыл у пользователя (user set --hide hy2|xhttp|vision).
+# rt: свои правила маршрутов (autoxray route add direct|proxy|block ...) и готовые наборы (route preset).
+# statustext: строка «осталось ... до ...» для необязательного профиля-статуса (autoxray sub statusnode on).
+SUB_COMMON_JQ=$(cat <<'JQ'
+def hidden($u; $k): (($u.hide // []) | index($k)) != null;
+def visible($u; $k): hidden($u; $k) | not;
+def is_cidr: test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}(/[0-9]{1,2})?$");
+def push_domains: ["mtalk.google.com", "push.apple.com", "courier.push.apple.com", "push-apple.com.akadns.net"];
+def rt($S; $k): (($S.routes // {})[$k] // []) + (if $k == "direct" and ((($S.routes // {}).presets // []) | index("push")) != null then push_domains else [] end) | unique;
+def routes($S): {direct: rt($S; "direct"), proxy: rt($S; "proxy"), block: rt($S; "block")};
+def used($u): (($t[0][$u.name].up // 0) + ($t[0][$u.name].down // 0));
+def gb($b): ((($b * 10 / 1073741824) | round) / 10 | tostring) + " ГБ";
+def statustext($u): "ℹ️ " + (if $u.limit > 0 then "Осталось " + gb([$u.limit - used($u), 0] | max) + " из " + gb($u.limit) else "Без лимита" end)
+  + (if $u.expire > 0 then " · до " + ($u.expire | strftime("%d.%m.%Y")) else " · бессрочно" end);
+def ru_direct($S; $u):
+  $S.mode == "bridge" or (($u.ru // (if ($S.warp.enabled == true and $S.warp.registered == true and $S.warp.ru == true) then "server" else "direct" end)) == "direct");
+# Профили для Clash/sing-box и «Авто»: {name, kind: xhttp|vision|hy2, secret}. В режиме моста UUID содержит номер маршрута.
+def profiles($S; $u):
+  (if $S.mode == "bridge" then
+    ((if ($S.nodes | length) > 1 then [{name: "🇷🇺 RU>EU Автобалансир", kind: "xhttp", secret: route_uuid($u.uuid; 0)}] else [] end)
+     + [$S.nodes[] as $x
+        | {name: "🇷🇺 RU>EU xhttp | \($x.name)", kind: "xhttp", secret: route_uuid($u.uuid; $x.id)},
+          {name: "🇷🇺 RU>EU raw | \($x.name)", kind: "vision", secret: route_uuid($u.uuid; $x.id)}])
+  else
+    [{name: "🇪🇺 VLESS XHTTP", kind: "xhttp", secret: $u.uuid},
+     {name: "🇪🇺 VLESS Vision", kind: "vision", secret: $u.uuid},
+     {name: "🇪🇺 Hysteria2", kind: "hy2", secret: $u.hy2}]
+  end) | map(select(visible($u; .kind)));
+JQ
+)
+
+# подписки строятся одним вызовом jq с общими аргументами: subjq <имя> <программа> [параметры jq]
+subjq() {
+  local name=$1 prog=$2; shift 2
+  jq "$@" --arg n "$name" --arg ex "$EXTRA" --slurpfile t "$TRAFFIC" --argjson now "$(now)" "$BRIDGE_COMMON"$'\n'"$SUB_COMMON_JQ"$'\n'"$prog" "$STATE"
+}
+
+USER_LINKS_JQ=$(cat <<'JQ'
+def xl($S; $id; $u; $tag): "vless://\(route_uuid($u.uuid; $id))@\($S.domain):443?security=tls&alpn=h2&type=xhttp&mode=stream-up&path=%2F\($S.paths.xhttp)&extra=\($ex)&sni=\($S.domain)&fp=\($S.fingerprint)#\($tag | @uri)";
+. as $S | ($S.users[] | select(.name == $n)) as $u
+| if $S.mode == "bridge" then
+    (if ($S.nodes | length) > 1 and visible($u; "xhttp") then "🇷🇺 RU>EU Автобалансир|\(xl($S; 0; $u; "RU>EU Автобалансир"))" else empty end),
+    ($S.nodes[] as $x
+     | (if visible($u; "xhttp") then "XHTTP TLS stream-up (RU>EU \($x.name))|\(xl($S; $x.id; $u; "RU>EU_xhttp_" + $x.name))" else empty end),
+       (if visible($u; "vision") then "RAW VISION (RU>EU \($x.name))|vless://\(route_uuid($u.uuid; $x.id))@\($S.domain):443?security=tls&type=tcp&headerType=&path=&host=&flow=xtls-rprx-vision&sni=\($S.domain)&fp=\($S.fingerprint)&spx=%2F#\("RU>EU_raw_" + $x.name | @uri)" else empty end),
+       "Direct EU (\($x.name))|\($x.url)")
+  else
+    (if visible($u; "xhttp") then "VLESS XHTTP TLS stream-up|vless://\($u.uuid)@\($S.domain):443?security=tls&alpn=h2&type=xhttp&mode=stream-up&path=%2F\($S.paths.xhttp)&extra=\($ex)&sni=\($S.domain)&fp=\($S.fingerprint)#vlessXHTTPtls-\($u.name)" else empty end),
+    (if visible($u; "vision") then "VLESS RAW TLS VISION|vless://\($u.uuid)@\($S.domain):443?security=tls&type=tcp&headerType=&path=&host=&flow=xtls-rprx-vision&sni=\($S.domain)&fp=\($S.fingerprint)&spx=%2F#vlessRAWtlsVision-\($u.name)" else empty end),
+    (if visible($u; "hy2") then "HYSTERIA2|hy2://\($u.hy2)@\($S.domain):443/?sni=\($S.domain)&alpn=h3#Hysteria2-\($u.name)" else empty end)
+  end
+JQ
+)
+
+# Печатает «название|ссылка» по строке на каждый протокол (скрытые у пользователя не печатаются).
+user_links() { subjq "$1" "$USER_LINKS_JQ" -r; }
+
+# Текст строки статуса (если включена: autoxray sub statusnode on); пусто, если выключена
+sub_status_text() {
+  [[ $(st '.sub.statusnode // false') == true ]] || return 0
+  subjq "$1" '. as $S | ($S.users[] | select(.name == $n)) as $u | statustext($u)' -r
 }
 
 CLIENT_JQ=$(cat <<'JQ'
 def ru_domains: ["domain:ru", "domain:su", "domain:xn--p1ai", "geosite:yandex", "geosite:vk", "geosite:category-ru"];
 def sniff: {enabled: true, destOverride: ["http", "tls", "quic"]};
+def mk($arr; $key; $tag): if ($arr | length) > 0 then [{($key): $arr, outboundTag: $tag}] else [] end;
+def xr_domains($l): [$l[] | select(is_cidr | not) | "domain:" + .];
+def xr_ips($l): [$l[] | select(is_cidr)];
 
-def client($proxy; $remark; $ru_direct): {
+def client($proxy; $remark; $ru_direct; $R): {
   log: {loglevel: "warning"},
   dns: {
     servers: [
@@ -477,16 +553,19 @@ def client($proxy; $remark; $ru_direct): {
   },
   routing: {
     domainMatcher: "hybrid", domainStrategy: "IPIfNonMatch",
-    rules: [
-      {domain: ["geosite:category-ads", "geosite:win-spy"], outboundTag: "block"},
-      {protocol: ["bittorrent"], outboundTag: "direct"},
-      {domain: ["habr.com", "apkmirror.com"], outboundTag: "proxy"},
-      {domain: (["geosite:private", "ifconfig.me", "checkip.amazonaws.com", "pify.org", "2ip.io",
-                 "geosite:category-ip-geo-detect", "geosite:apple", "geosite:apple-pki", "geosite:f-droid"]
-                + (if $ru_direct then ru_domains else [] end)),
-       outboundTag: "direct"},
-      {ip: (["geoip:private"] + (if $ru_direct then ["geoip:ru"] else [] end)), outboundTag: "direct"}
-    ]
+    rules: (
+      # win-spy есть не во всех наборах geosite (в официальном v2fly, который ставится на OpenWrt, его нет, и тогда Xray не
+      # запускается совсем), поэтому телеметрия Windows перечислена явно
+      [{domain: ["geosite:category-ads", "domain:vortex.data.microsoft.com", "domain:telemetry.microsoft.com", "domain:watson.telemetry.microsoft.com", "domain:settings-win.data.microsoft.com"], outboundTag: "block"}]
+      + mk(xr_domains($R.block); "domain"; "block") + mk(xr_ips($R.block); "ip"; "block")
+      + [{protocol: ["bittorrent"], outboundTag: "direct"}]
+      + mk(xr_domains($R.proxy); "domain"; "proxy") + mk(xr_ips($R.proxy); "ip"; "proxy")
+      + [{domain: ["habr.com", "apkmirror.com"], outboundTag: "proxy"},
+         {domain: (["geosite:private", "ifconfig.me", "checkip.amazonaws.com", "pify.org", "2ip.io",
+                    "geosite:category-ip-geo-detect", "geosite:apple", "geosite:apple-pki", "geosite:f-droid"]
+                   + (if $ru_direct then ru_domains else [] end) + xr_domains($R.direct)),
+          outboundTag: "direct"},
+         {ip: (["geoip:private"] + (if $ru_direct then ["geoip:ru"] else [] end) + xr_ips($R.direct)), outboundTag: "direct"}])
   },
   inbounds: [
     {tag: "socks-in", protocol: "socks", listen: "127.0.0.1", port: 10808, settings: {udp: true}, sniffing: sniff},
@@ -497,13 +576,25 @@ def client($proxy; $remark; $ru_direct): {
   remarks: $remark
 };
 
+# Профиль «Авто»: все доступные протоколы сразу, клиент сам выбирает самый быстрый отвечающий (leastPing) и уходит с упавшего.
+# Теги исходящих начинаются с «proxy-», пока замеров нет, трафик идёт через первый.
+def client_auto($proxies; $remark; $ru_direct; $R):
+  client($proxies[0]; $remark; $ru_direct; $R)
+  | .outbounds = ($proxies + [{tag: "direct", protocol: "freedom"}, {tag: "block", protocol: "blackhole"}])
+  | .burstObservatory = {subjectSelector: ["proxy-"], pingConfig: {destination: "https://www.gstatic.com/generate_204", connectivity: "", interval: "1m", sampling: 3, timeout: "5s"}}
+  | .routing.balancers = [{tag: "auto", selector: ["proxy-"], strategy: {type: "leastPing"}, fallbackTag: $proxies[0].tag}]
+  | .routing.rules |= (map(if .outboundTag == "proxy" then del(.outboundTag) | .balancerTag = "auto" else . end) + [{network: "tcp,udp", balancerTag: "auto"}]);
+
+# строка статуса: профиль без соединения, в названии остаток трафика и срок
+def client_status($text; $R): client({tag: "proxy", protocol: "blackhole"}; $text; false; $R);
 JQ
 )
 
 CLIENT_DIRECT_TAIL=$(cat <<'JQ'
 . as $S
 | ($S.users[] | select(.name == $n)) as $u
-| (($u.ru // (if ($S.warp.enabled == true and $S.warp.registered == true and $S.warp.ru == true) then "server" else "direct" end)) == "direct") as $ru_direct
+| ru_direct($S; $u) as $ru_direct
+| routes($S) as $R
 | {tag: "proxy", protocol: "vless",
    settings: {vnext: [{address: $S.domain, port: 443, users: [{id: $u.uuid, encryption: "none"}]}]},
    streamSettings: {
@@ -529,9 +620,12 @@ CLIENT_DIRECT_TAIL=$(cat <<'JQ'
      hysteriaSettings: {version: 2, auth: $u.hy2},
      finalmask: {quicParams: {congestion: "brutal", brutalUp: "100 mbps", brutalDown: "100 mbps"}}
    }} as $hy2
-| [client($xhttp; "🇪🇺 VLESS XHTTP TLS stream-up"; $ru_direct),
-   client($vision; "🇪🇺 VLESS RAW TLS VISION"; $ru_direct),
-   client($hy2; "🇪🇺 HYSTERIA2"; $ru_direct)]
+| ([{kind: "xhttp", name: "🇪🇺 VLESS XHTTP TLS stream-up", out: $xhttp},
+    {kind: "vision", name: "🇪🇺 VLESS RAW TLS VISION", out: $vision},
+    {kind: "hy2", name: "🇪🇺 HYSTERIA2", out: $hy2}] | map(select(visible($u; .kind)))) as $V
+| ($V | map(client(.out; .name; $ru_direct; $R)))
+  + (if ($V | length) > 1 then [client_auto($V | map(.out + {tag: ("proxy-" + .kind)}); "🧭 Авто: само выбирает быстрый протокол"; $ru_direct; $R)] else [] end)
+  + (if ($S.sub.statusnode // false) then [client_status(statustext($u); $R)] else [] end)
 JQ
 )
 
@@ -552,42 +646,27 @@ def direct_eu($n): {mux: {concurrency: -1, enabled: false}, tag: "proxy", protoc
 
 . as $S
 | ($S.users[] | select(.name == $n)) as $u
-| ((if ($S.nodes | length) > 1 then [client(via_xhttp($S; $u; 0); "🇷🇺 RU>EU Автобалансир"; true)] else [] end)
+| routes($S) as $R
+| ((if ($S.nodes | length) > 1 and visible($u; "xhttp") then [client(via_xhttp($S; $u; 0); "🇷🇺 RU>EU Автобалансир"; true; $R)] else [] end)
    + [$S.nodes[] as $x
-      | client(via_xhttp($S; $u; $x.id); "🇷🇺 RU>EU xhttp | \($x.name)"; true),
-        client(via_vision($S; $u; $x.id); "🇷🇺 RU>EU raw | \($x.name)"; true),
-        client(direct_eu($x); "🇪🇺 EU dir | \($x.name)"; true)])
-JQ
-)
-
-# Профили для клиентов Clash/Mihomo и sing-box. Список один на оба формата: {name, kind: xhttp|vision|hy2, secret}
-# (secret: UUID, у Hysteria2 пароль). В режиме моста UUID содержит номер маршрута. sing-box не умеет XHTTP, там он пропускается.
-SUB_FORMATS_JQ=$(cat <<'JQ'
-def profiles($S; $u):
-  if $S.mode == "bridge" then
-    ((if ($S.nodes | length) > 1 then [{name: "🇷🇺 RU>EU Автобалансир", kind: "xhttp", secret: route_uuid($u.uuid; 0)}] else [] end)
-     + [$S.nodes[] as $x
-        | {name: "🇷🇺 RU>EU xhttp | \($x.name)", kind: "xhttp", secret: route_uuid($u.uuid; $x.id)},
-          {name: "🇷🇺 RU>EU raw | \($x.name)", kind: "vision", secret: route_uuid($u.uuid; $x.id)}])
-  else
-    [{name: "🇪🇺 VLESS XHTTP", kind: "xhttp", secret: $u.uuid},
-     {name: "🇪🇺 VLESS Vision", kind: "vision", secret: $u.uuid},
-     {name: "🇪🇺 Hysteria2", kind: "hy2", secret: $u.hy2}]
-  end;
-def ru_direct($S; $u):
-  $S.mode == "bridge" or (($u.ru // (if ($S.warp.enabled == true and $S.warp.registered == true and $S.warp.ru == true) then "server" else "direct" end)) == "direct");
-
-. as $S | ($S.users[] | select(.name == $n)) as $u | profiles($S; $u) as $P | ru_direct($S; $u) as $rd
+      | (if visible($u; "xhttp") then client(via_xhttp($S; $u; $x.id); "🇷🇺 RU>EU xhttp | \($x.name)"; true; $R) else empty end),
+        (if visible($u; "vision") then client(via_vision($S; $u; $x.id); "🇷🇺 RU>EU raw | \($x.name)"; true; $R) else empty end),
+        client(direct_eu($x); "🇪🇺 EU dir | \($x.name)"; true; $R)]
+   + (if ($S.sub.statusnode // false) then [client_status(statustext($u); $R)] else [] end))
 JQ
 )
 
 SUB_CLASH_TAIL=$(cat <<'JQ'
+def crules($l; $target): [$l[] | if is_cidr then "IP-CIDR,\(.),\($target),no-resolve" else "DOMAIN-SUFFIX,\(.),\($target)" end];
+. as $S | ($S.users[] | select(.name == $n)) as $u | profiles($S; $u) as $P | ru_direct($S; $u) as $rd | routes($S) as $R
 | ["DOMAIN-SUFFIX,ru,DIRECT", "DOMAIN-SUFFIX,su,DIRECT", "DOMAIN-SUFFIX,xn--p1ai,DIRECT", "GEOSITE,category-ru,DIRECT", "GEOIP,RU,DIRECT"] as $ru_rules
+| (if ($P | length) > 1 and $S.mode != "bridge" then ["🧭 Авто"] else [] end) as $auto
+| (if ($S.sub.statusnode // false) then [statustext($u)] else [] end) as $status
 | {
     "mixed-port": 7890, "allow-lan": false, mode: "rule", "log-level": "warning", ipv6: false,
     dns: ({enable: true, "enhanced-mode": "fake-ip", nameserver: ["https://8.8.8.8/dns-query", "https://1.1.1.1/dns-query"]}
           + (if $rd then {"nameserver-policy": {"geosite:category-ru": ["https://77.88.8.8/dns-query"]}} else {} end)),
-    proxies: [$P[] | . as $p
+    proxies: ([$P[] | . as $p
       | if .kind == "xhttp" then
           {name: .name, type: "vless", server: $S.domain, port: 443, uuid: .secret, network: "xhttp", tls: true, udp: true,
            servername: $S.domain, alpn: ["h2"], "client-fingerprint": $S.fingerprint,
@@ -597,15 +676,22 @@ SUB_CLASH_TAIL=$(cat <<'JQ'
            flow: "xtls-rprx-vision", servername: $S.domain, "client-fingerprint": $S.fingerprint}
         else
           {name: .name, type: "hysteria2", server: $S.domain, port: 443, password: .secret, sni: $S.domain, alpn: ["h3"]}
-        end],
-    "proxy-groups": [{name: "autoXRAY", type: "select", proxies: [$P[].name]}],
-    rules: (["GEOIP,private,DIRECT,no-resolve"] + (if $rd then $ru_rules else [] end) + ["MATCH,autoXRAY"])
+        end]
+      + [$status[] | {name: ., type: "socks5", server: "127.0.0.1", port: 1}]),
+    "proxy-groups": ([{name: "autoXRAY", type: "select", proxies: ([$P[].name] + $auto + $status)}]
+      + (if ($auto | length) > 0 then [{name: "🧭 Авто", type: "url-test", proxies: [$P[].name], url: "https://www.gstatic.com/generate_204", interval: 300, tolerance: 50}] else [] end)),
+    rules: (["GEOIP,private,DIRECT,no-resolve"] + crules($R.block; "REJECT") + crules($R.proxy; "autoXRAY") + crules($R.direct; "DIRECT")
+            + (if $rd then $ru_rules else [] end) + ["MATCH,autoXRAY"])
   }
 JQ
 )
 
 SUB_SING_TAIL=$(cat <<'JQ'
+def srules($l; $out): ([$l[] | select(is_cidr | not)]) as $d | ([$l[] | select(is_cidr)]) as $c
+  | (if ($d | length) > 0 then [{domain_suffix: $d} + $out] else [] end) + (if ($c | length) > 0 then [{ip_cidr: $c} + $out] else [] end);
+. as $S | ($S.users[] | select(.name == $n)) as $u | profiles($S; $u) as $P | ru_direct($S; $u) as $rd | routes($S) as $R
 | [$P[] | select(.kind != "xhttp")] as $Q
+| (if ($Q | length) > 1 and $S.mode != "bridge" then ["🧭 Авто"] else [] end) as $auto
 | "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs" as $geoip
 | "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ru.srs" as $geosite
 | {
@@ -620,9 +706,11 @@ SUB_SING_TAIL=$(cat <<'JQ'
           {type: "hysteria2", tag: .name, server: $S.domain, server_port: 443, password: .secret,
            tls: {enabled: true, server_name: $S.domain, alpn: ["h3"]}}
         end]
-      + [{type: "selector", tag: "proxy", outbounds: [$Q[].name], default: $Q[0].name}, {type: "direct", tag: "direct"}]),
+      + (if ($auto | length) > 0 then [{type: "urltest", tag: "🧭 Авто", outbounds: [$Q[].name], url: "https://www.gstatic.com/generate_204", interval: "3m"}] else [] end)
+      + [{type: "selector", tag: "proxy", outbounds: ([$Q[].name] + $auto), default: $Q[0].name}, {type: "direct", tag: "direct"}]),
     route: {
       rules: ([{action: "sniff"}, {protocol: "dns", action: "hijack-dns"}, {ip_is_private: true, action: "route", outbound: "direct"}]
+              + srules($R.block; {action: "reject"}) + srules($R.proxy; {action: "route", outbound: "proxy"}) + srules($R.direct; {action: "route", outbound: "direct"})
               + (if $rd then [{domain_suffix: ["ru", "su", "xn--p1ai"], action: "route", outbound: "direct"},
                               {rule_set: ["geoip-ru", "geosite-category-ru"], action: "route", outbound: "direct"}] else [] end)),
       rule_set: (if $rd then [{tag: "geoip-ru", type: "remote", format: "binary", url: $geoip, download_detour: "direct"},
@@ -634,16 +722,22 @@ JQ
 )
 
 # Clash/Mihomo: JSON является подмножеством YAML, поэтому отдаётся он же (клиенты его принимают как .yaml)
-sub_clash() { jq --arg n "$1" "$BRIDGE_COMMON"$'\n'"$SUB_FORMATS_JQ"$'\n'"$SUB_CLASH_TAIL" "$STATE"; }
-sub_sing()  { jq --arg n "$1" "$BRIDGE_COMMON"$'\n'"$SUB_FORMATS_JQ"$'\n'"$SUB_SING_TAIL" "$STATE"; }
+sub_clash() { subjq "$1" "$SUB_CLASH_TAIL"; }
+sub_sing()  { subjq "$1" "$SUB_SING_TAIL"; }
 
 # Универсальная подписка: ссылки vless:// и hy2:// через перевод строки в base64 (v2rayNG, NekoBox, Streisand, Hiddify и др.)
-sub_txt() { user_links "$1" | cut -d'|' -f2- | base64 -w0; echo; }
+sub_txt() {
+  local txt; txt=$(sub_status_text "$1")
+  {
+    user_links "$1" | cut -d'|' -f2-
+    [[ -n $txt ]] && printf 'vless://00000000-0000-4000-8000-000000000000@127.0.0.1:1?security=none&type=tcp#%s\n' "$(jq -rn --arg t "$txt" '$t | @uri')"
+  } | base64 -w0; echo
+}
 
 sub_json() {
   local prog="$CLIENT_JQ"$'\n'"$CLIENT_DIRECT_TAIL"
-  [[ $(mode) == bridge ]] && prog="$BRIDGE_COMMON"$'\n'"$CLIENT_JQ"$'\n'"$CLIENT_BRIDGE_TAIL"
-  jq --arg n "$1" "$prog" "$STATE"
+  [[ $(mode) == bridge ]] && prog="$CLIENT_JQ"$'\n'"$CLIENT_BRIDGE_TAIL"
+  subjq "$1" "$prog"
 }
 
 html_esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
@@ -806,14 +900,29 @@ user_summary() {
   jq_state -r "$JQ_DEFS"'.users[] | [.name, status(.), (used(.)|tostring), (.limit|tostring), (.expire|tostring), ((.ip_limit // 0)|tostring), (.ru // "direct"), ((.report // false)|tostring)] | @tsv'
 }
 
+# user_filter <tag|find> <значение> — имена пользователей по метке или по тексту (в имени, заметке, метках), по одному в строке
+user_filter() {
+  jq -r --arg m "$1" --arg v "$2" 'def rx: gsub("(?<c>[\\^$.|?*+()\\[\\]{}])"; "\\" + .c);
+    .users[] | select(
+      if $m == "tag" then any((.tags // [])[]; test("^" + ($v | rx) + "$"; "i"))
+      else ([.name, (.note // ""), ((.tags // []) | join(" "))] | join(" ") | test($v | rx; "i")) end) | .name' "$STATE"
+}
+
 cmd_user_list() {
   need_state
+  local only=""
   if [[ ${1:-} == --plain ]]; then user_summary; return; fi
+  case ${1:-} in
+    --tag|--find) [[ -n ${2:-} ]] || die "user list ${1} <значение>"; only=" $(user_filter "${1#--}" "$2" | tr '\n' ' ')"
+                  [[ $only != " " ]] || { echo -e " ${DIM}Никого не найдено.${NC}"; return 0; } ;;
+  esac
   section "👥 Пользователи"
   printf '%b   %s %s %s %s %s %s %s%b\n' "$DIM" "$(pad ИМЯ 14)" "$(pad СТАТУС 12)" "$(pad РАСХОД 15)" "$(pad ТРАФИК 17)" "$(pad RU 7)" "$(pad IP 6)" ДЕЙСТВУЕТ "$NC"
   local name status used limit expire ipl ru icon col col2 label txt left exp rul ipt wru
   wru=$([[ $(st '.warp.enabled // false') == true && $(st '.warp.ru // false') == true ]] && echo 1 || echo 0)
+  local meta
   while IFS=$'\t' read -r name status used limit expire ipl ru _rp; do
+    [[ -z $only || $only == *" $name "* ]] || continue
     case $status in
       active)   icon="🟢"; col=$GRN;  label="активен" ;;
       disabled) icon="⚫"; col=$DIM;  label="отключён" ;;
@@ -829,6 +938,8 @@ cmd_user_list() {
     if [[ $ru == server ]]; then rul=$([[ $wru == 1 ]] && echo WARP || echo сервер); else rul=прямо; fi
     if [[ ${ipl:-0} -gt 0 ]]; then ipt="$(ips_count "$name")/$ipl"; else ipt="∞"; fi
     printf '%s %b%s%b %b%s%b %b %s %s %s %b\n' "$icon" "$BOLD" "$(pad "$name" 14)" "$NC" "$col" "$(pad "$label" 12)" "$NC" "$(bar "$used" "$limit" 10)" "$(pad "$txt" 17)" "$(pad "$rul" 7)" "$(pad "$ipt" 6)" "$exp"
+    meta=$(jq -r --arg n "$name" '.users[] | select(.name == $n) | [((.tags // []) | map("#" + .) | join(" ")), (.note // ""), ((.hide // []) | if length > 0 then "скрыто: " + join(",") else "" end)] | map(select(length > 0)) | join(" · ")' "$STATE")
+    [[ -z $meta ]] || echo -e "      ${DIM}$meta${NC}"
   done < <(user_summary)
 }
 
@@ -842,7 +953,7 @@ cmd_user_add() {
     case $1 in
       --limit) [[ $# -ge 2 ]] && is_num "$2" || die "--limit <ГБ>"; limit=$(awk -v g="$2" 'BEGIN{printf "%d", g*1073741824}'); shift 2 ;;
       --days)  [[ $# -ge 2 ]] && is_num "$2" || die "--days <N> (0 — бессрочно)"; expire=$(awk -v n="$2" -v t="$(now)" 'BEGIN{printf "%d", (n>0) ? t+n*86400 : 0}'); shift 2 ;;
-      --reset) [[ ${2:-} =~ ^(monthly|never)$ ]] || die "--reset monthly|never"; reset=$2; shift 2 ;;
+      --reset) [[ ${2:-} =~ ^(monthly|weekly|never)$ ]] || die "--reset monthly|weekly|never"; reset=$2; shift 2 ;;
       --ru)    [[ ${2:-} =~ ^(direct|server)$ ]] || die "--ru direct|server"; ru=$2; shift 2 ;;
       --ips)   [[ ${2:-} =~ ^[0-9]+$ ]] || die "--ips <число IP> (0 без лимита)"; ips=$2; shift 2 ;;
       --report) [[ ${2:-} =~ ^(on|off)$ ]] || die "--report on|off"; [[ $2 == on ]] && rpt=true || rpt=false; shift 2 ;;
@@ -851,7 +962,7 @@ cmd_user_add() {
   done
   [[ $rpt == true ]] && report_ensure_token
   st_edit --arg n "$name" --arg ru "$ru" --argjson ips "$ips" --argjson rpt "$rpt" --arg id "$(user_uuid "$(mode)")" --arg h "$(rand 'a-f0-9' 16)" --arg t "$(rand 'A-Za-z0-9' 24)" \
-          --argjson l "$limit" --argjson e "$expire" --argjson c "$(now)" --arg rs "$reset" --argjson nr "$([[ $reset == monthly ]] && next_month || echo 0)" \
+          --argjson l "$limit" --argjson e "$expire" --argjson c "$(now)" --arg rs "$reset" --argjson nr "$(next_reset_ts "$reset")" \
     '.users += [{name: $n, uuid: $id, hy2: $h, token: $t, created: $c, first_seen: 0, expire: $e, limit: $l, enabled: true, reset: $rs, next_reset: $nr, ru: $ru, ip_limit: $ips, report: $rpt}]'
   apply_or_die
   ok "✅ Пользователь '$name' создан."
@@ -876,20 +987,33 @@ cmd_user_del() {
 cmd_user_set() {
   need_root; need_state
   local name=${1:-} report_after=""; user_must "$name" >/dev/null; shift
-  (($#)) || die "Укажите параметры: --report on|off | --limit ГБ | --days N | --ips N | --trust IP|сеть | --untrust IP|all | --ru direct|server | --reset monthly|never | --enable | --disable | --reset-traffic"
+  (($#)) || die "Укажите параметры: --report on|off | --limit ГБ | --days N | --ips N | --trust IP|сеть | --untrust IP|all | --ru direct|server | --reset monthly|weekly|never | --hide hy2|xhttp|vision | --show протокол|all | --note текст | --tags a,b | --enable | --disable | --reset-traffic"
   while (($#)); do
     case $1 in
       --limit)  [[ $# -ge 2 ]] && is_num "$2" || die "--limit <ГБ> (0 — без лимита)"
                 st_edit --arg n "$name" --argjson l "$(awk -v g="$2" 'BEGIN{printf "%d", g*1073741824}')" '(.users[] | select(.name == $n) | .limit) = $l'; shift 2 ;;
       --days)   [[ $# -ge 2 ]] && is_num "$2" || die "--days <N> (0 — бессрочно)"
                 st_edit --arg n "$name" --argjson e "$(awk -v n="$2" -v t="$(now)" 'BEGIN{printf "%d", (n>0) ? t+n*86400 : 0}')" '(.users[] | select(.name == $n) | .expire) = $e'; shift 2 ;;
-      --reset)  [[ ${2:-} =~ ^(monthly|never)$ ]] || die "--reset monthly|never"
-                st_edit --arg n "$name" --arg r "$2" --argjson nr "$([[ $2 == monthly ]] && next_month || echo 0)" '(.users[] | select(.name == $n)) |= (.reset = $r | .next_reset = $nr)'; shift 2 ;;
+      --reset)  [[ ${2:-} =~ ^(monthly|weekly|never)$ ]] || die "--reset monthly|weekly|never"
+                st_edit --arg n "$name" --arg r "$2" --argjson nr "$(next_reset_ts "$2")" '(.users[] | select(.name == $n)) |= (.reset = $r | .next_reset = $nr)'; shift 2 ;;
       --ips)    [[ ${2:-} =~ ^[0-9]+$ ]] || die "--ips <число IP> (0 без лимита)"
                 st_edit --arg n "$name" --argjson v "$2" '(.users[] | select(.name == $n) | .ip_limit) = $v'
                 [[ $2 -gt 0 ]] || { jq --arg n "$name" 'del(.[$n])' "$IPS" >"$IPS.tmp" 2>/dev/null && mv "$IPS.tmp" "$IPS"; }; shift 2 ;;
       --ru)     [[ ${2:-} =~ ^(direct|server)$ ]] || die "--ru direct|server"
                 st_edit --arg n "$name" --arg v "$2" '(.users[] | select(.name == $n) | .ru) = $v'; shift 2 ;;
+      --hide)   [[ ${2:-} =~ ^(xhttp|vision|hy2)$ ]] || die "--hide xhttp|vision|hy2 (протокол пропадёт из подписок этого пользователя, на сервере он остаётся)"
+                local left; left=$(jq -r --arg n "$name" --arg k "$2" --arg m "$(mode)" '.users[] | select(.name == $n) | ((.hide // []) + [$k] | unique) as $h | (if $m == "bridge" then ["xhttp","vision"] else ["xhttp","vision","hy2"] end) - $h | length' "$STATE")
+                [[ $left -ge 1 ]] || die "Нельзя скрыть все протоколы: у пользователя не останется ни одного профиля."
+                st_edit --arg n "$name" --arg k "$2" '(.users[] | select(.name == $n) | .hide) = ((((.users[] | select(.name == $n) | .hide) // []) + [$k]) | unique)'; shift 2 ;;
+      --show)   [[ ${2:-} =~ ^(xhttp|vision|hy2|all)$ ]] || die "--show xhttp|vision|hy2|all"
+                if [[ $2 == all ]]; then st_edit --arg n "$name" '(.users[] | select(.name == $n) | .hide) = []'
+                else st_edit --arg n "$name" --arg k "$2" '(.users[] | select(.name == $n) | .hide) = (((.users[] | select(.name == $n) | .hide) // []) - [$k])'; fi; shift 2 ;;
+      --note)   [[ $# -ge 2 ]] || die "--note <текст> (пустой убирает)"
+                local nt; nt=$(printf '%s' "$2" | tr -d '[:cntrl:]' | sed 's/^ *//; s/ *$//' | cut -c1-120)
+                st_edit --arg n "$name" --arg v "$nt" '(.users[] | select(.name == $n) | .note) = $v'; shift 2 ;;
+      --tags)   [[ $# -ge 2 ]] || die "--tags метка1,метка2 (пустое значение убирает)"
+                [[ $2 =~ ^[^[:cntrl:]\|\<\>\"\']*$ ]] || die "В метках нельзя управляющие символы и | < > кавычки."
+                st_edit --arg n "$name" --arg v "$2" '(.users[] | select(.name == $n) | .tags) = ($v | split(",") | map(gsub("^ +| +$"; "") | .[0:24]) | map(select(length > 0)) | unique | .[0:8])'; shift 2 ;;
       --trust)  valid_trust "${2:-}" || die "--trust <IP или сеть IPv4: 1.2.3.4, 1.2.3.0/24>"
                 st_edit --arg n "$name" --arg v "$2" '(.users[] | select(.name == $n) | .ip_trust) = ((((.users[] | select(.name == $n) | .ip_trust) // []) + [$v]) | unique)'; shift 2 ;;
       --untrust) [[ -n ${2:-} ]] || die "--untrust <IP, сеть или all>"
@@ -912,6 +1036,36 @@ cmd_user_set() {
   if [[ $report_after == on ]]; then report_build "$name"; report_build_index; echo -e " 📈 ${DIM}Отчёт:${NC} ${CYAN}$(report_url "$name")${NC}"
   elif [[ $report_after == off ]]; then report_build_index; echo -e " 📈 ${DIM}Отчёт выключен, страница удалена. Накопленные данные хранятся до истечения срока, удалить сразу: autoxray report purge $name${NC}"; fi
   ok "✅ Параметры '$name' обновлены."
+}
+
+# Приглашение: одноразовая ссылка t.me/<бот>?start=<код> на 7 дней. Клиент открывает её и привязывает свой Telegram к пользователю:
+# после этого он сам видит в боте трафик, срок и ссылки (и получает уведомления о лимите).
+bot_username() {
+  local u; u=$(st '.bot.username // empty')
+  if [[ -z $u ]] && [[ -s $BOT_TOKEN_FILE ]]; then
+    u=$(tg_call getMe '{}' 15 2>/dev/null | jq -r '.result.username // empty')
+    [[ -n $u ]] && st_edit --arg u "$u" '.bot.username = $u'
+  fi
+  printf '%s' "$u"
+}
+
+cmd_user_invite() {
+  need_root; need_state
+  local name=${1:-} code uname
+  user_must "$name" >/dev/null
+  bot_enabled || die "Сначала настройте бота: autoxray bot setup"
+  uname=$(bot_username); [[ -n $uname ]] || die "Не удалось узнать имя бота (нет связи с Telegram)."
+  code=$(rand 'A-Za-z0-9' 16)
+  st_edit --arg n "$name" --arg c "$code" --argjson u "$(( $(now) + 604800 ))" '(.users[] | select(.name == $n) | .invite) = {code: $c, until: $u}'
+  ok "✅ Приглашение для «$name» (действует 7 дней, одноразовое)"
+  echo -e "    ${CYAN}https://t.me/$uname?start=$code${NC}"
+}
+
+cmd_user_unlink() {
+  need_root; need_state
+  local name=${1:-}; user_must "$name" >/dev/null
+  st_edit --arg n "$name" '(.users[] | select(.name == $n)) |= (del(.tg) | del(.invite))'
+  ok "✅ Telegram отвязан от «$name», приглашение отозвано"
 }
 
 cmd_user_rotate() {
@@ -980,10 +1134,78 @@ cmd_users() {
     del|rm) locked cmd_user_del "$@" ;;
     set)    locked cmd_user_set "$@" ;;
     rotate) locked cmd_user_rotate "$@" ;;
+    invite) locked cmd_user_invite "$@" ;;
+    unlink) locked cmd_user_unlink "$@" ;;
     list|ls) cmd_user_list "$@" ;;
+    find)   [[ -n ${1:-} ]] || die "user find <текст>: ищет в имени, заметке и метках"; cmd_user_list --find "$*" ;;
     link|show) if [[ ${2:-} == --plain ]]; then need_state; user_must "${1:-}" >/dev/null; user_links "$1"; else show_user "${1:-}"; fi ;;
     qr)     cmd_user_qr "$@" ;;
-    *) die "user: add | del | set | rotate | list | link | qr" ;;
+    *) die "user: add | del | set | rotate | invite | unlink | list [--tag метка|--find текст] | find <текст> | link | qr" ;;
+  esac
+}
+
+# --------------------------------------------- свои правила маршрутов и строка статуса
+
+# Нормализует домен или IPv4-сеть для правил; код 1, если ввод неверный
+route_norm() {
+  local v=${1,,}
+  if [[ $v =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then valid_trust "$v" && [[ $v != */* || ${v#*/} -ge 8 ]] && { echo "$v"; return 0; }; return 1; fi
+  v=${v#http://}; v=${v#https://}; v=${v%%/*}; v=${v#domain:}; v=${v#\*.}; v=${v%.}
+  [[ $v =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9-]{2,}$ ]] || return 1
+  echo "$v"
+}
+
+# autoxray route list | add direct|proxy|block <домен|сеть>... | del <домен|сеть>... | preset push on|off
+# Правила попадают в подписки (Xray JSON, Clash, sing-box) всех пользователей: direct идёт мимо сервера, proxy через сервер, block режется на устройстве.
+cmd_route() {
+  need_state
+  local sub=${1:-list}; shift || true
+  case $sub in
+    list|ls)
+      section "🧭 Свои правила маршрутов"
+      local k ico title
+      for k in direct proxy block; do
+        case $k in direct) ico="🏠"; title="напрямую, мимо сервера" ;; proxy) ico="🛰 "; title="через сервер" ;; block) ico="🚫"; title="блокировать" ;; esac
+        echo -e " $ico ${BOLD}$k${NC} ${DIM}($title)${NC}: $(jq -r --arg k "$k" '((.routes // {})[$k] // []) | if length == 0 then "нет" else join(", ") end' "$STATE")"
+      done
+      echo -e " 📲 ${BOLD}push${NC} ${DIM}(пуш-уведомления Apple и Google напрямую)${NC}: $(tick "$(jq -r '((.routes // {}).presets // []) | index("push") != null' "$STATE")")"
+      echo -e "\n ${DIM}Добавить: autoxray route add direct|proxy|block сайт.ру 1.2.3.0/24. Убрать: route del сайт.ру. После изменения обновите подписку в приложении.${NC}" ;;
+    add) need_root
+      local kind=${1:-} item norm items=()
+      [[ $kind =~ ^(direct|proxy|block)$ ]] || die "route add direct|proxy|block <домен|сеть>..."
+      shift; [[ $# -gt 0 ]] || die "Укажите домен или IPv4-сеть: route add $kind example.com 203.0.113.0/24"
+      for item in "$@"; do norm=$(route_norm "$item") || die "Не похоже на домен или IPv4-сеть: $item (кириллические домены записывайте в punycode: xn--...)"; items+=("$norm"); done
+      st_edit --arg k "$kind" --argjson l "$(printf '%s\n' "${items[@]}" | jq -Rn '[inputs]')" '
+        .routes = ((.routes // {}) | reduce ("direct", "proxy", "block") as $x (.; .[$x] = ((.[$x] // []) - $l)) | .[$k] = (((.[$k] // []) + $l) | unique))'
+      locked render_subs; ok "✅ $kind: ${items[*]}"
+      echo -e " ${DIM}Подписки обновлены. В приложении клиента нажмите «обновить подписку».${NC}" ;;
+    del|rm) need_root
+      local item norm items=()
+      [[ $# -gt 0 ]] || die "route del <домен|сеть>..."
+      for item in "$@"; do norm=$(route_norm "$item") || die "Не похоже на домен или IPv4-сеть: $item"; items+=("$norm"); done
+      st_edit --argjson l "$(printf '%s\n' "${items[@]}" | jq -Rn '[inputs]')" '.routes = ((.routes // {}) | reduce ("direct", "proxy", "block") as $x (.; .[$x] = ((.[$x] // []) - $l)))'
+      locked render_subs; ok "✅ Убрано: ${items[*]}" ;;
+    preset) need_root
+      [[ ${1:-} == push && ${2:-} =~ ^(on|off)$ ]] || die "route preset push on|off"
+      if [[ $2 == on ]]; then st_edit '.routes.presets = (((.routes.presets // []) + ["push"]) | unique)'; else st_edit '.routes.presets = ((.routes.presets // []) - ["push"])'; fi
+      locked render_subs; ok "✅ Пуш-уведомления Apple и Google: $2" ;;
+    *) die "route: list | add direct|proxy|block <домен|сеть>... | del <домен|сеть>... | preset push on|off" ;;
+  esac
+}
+
+# autoxray sub statusnode on|off — необязательный профиль-строка «Осталось 12 ГБ, до 30.10.2026» в подписках
+cmd_sub() {
+  need_state
+  case ${1:-status} in
+    statusnode) need_root
+      case ${2:-} in
+        on) st_edit '.sub.statusnode = true'; locked render_subs; ok "✅ В подписках появится строка со статусом (остаток трафика и срок), обновляется раз в 5 минут" ;;
+        off) st_edit '.sub.statusnode = false'; locked render_subs; ok "✅ Строка статуса убрана" ;;
+        *) die "sub statusnode on|off" ;;
+      esac ;;
+    status|*) section "📥 Подписки"
+      kv "ℹ️ " "Строка статуса" "$(tick "$(st '.sub.statusnode // false')") ${DIM}остаток трафика и срок отдельным профилем (sub statusnode on|off)${NC}"
+      kv "🧭" "Свои маршруты" "$(jq -r '[(.routes // {}) | (.direct // [], .proxy // [], .block // []) | length] | add' "$STATE") ${DIM}(autoxray route list)${NC}" ;;
   esac
 }
 
@@ -1004,7 +1226,7 @@ ips_count() { jq -r --arg n "$1" --argjson now "$(now)" '((.[$n] // {}) | [to_en
 # Логи Xray не должны расти и храниться: при отсутствии лимитов IP они очищаются, иначе ограничиваются по размеру.
 trim_logs() {
   local f max=${AX_LOG_MAX:-20971520} limited=0
-  jq -e --argjson now "$(now)" '(.debug.until // 0) > $now or any(.users[]; .enabled and (((.ip_limit // 0) > 0) or (.report == true)))' "$STATE" >/dev/null 2>&1 && limited=1
+  jq -e --argjson now "$(now)" '(.debug.until // 0) > $now or (.torrent.alert == true) or any(.users[]; .enabled and (((.ip_limit // 0) > 0) or (.report == true)))' "$STATE" >/dev/null 2>&1 && limited=1
   for f in "$ACCESS_LOG" "$(dirname "$ACCESS_LOG")/error.log"; do
     [[ -f $f ]] || continue
     if [[ $limited == 0 ]] || [[ $(stat -c %s "$f") -gt $max ]]; then : >"$f"; fi
@@ -1044,6 +1266,36 @@ ip_in() { # адрес список-доверенных(через пробел
 }
 ip_trusted_list() { jq -r --arg n "$1" '.users[] | select(.name == $n) | (.ip_trust // []) | join(" ")' "$STATE"; }
 
+# Попытки торрента: сервер блокирует такие соединения отдельным выходом block-bt. Уведомление не чаще раза в час на пользователя.
+# Видны только клиенты, чьё приложение шлёт торрент на сервер: наши подписки направляют его напрямую с устройства, мимо сервера.
+torrent_check() { # файл журнала
+  local f="$AX_ETC/.torrent-alerted" u n last t; t=$(now); touch "$f"
+  while read -r n u; do
+    [[ -n $u ]] || continue
+    last=$(awk -v u="$u" '$1 == u {print $2}' "$f"); last=${last:-0}
+    [[ $(( t - last )) -gt 3600 ]] || continue
+    { grep -v "^$u " "$f"; echo "$u $t"; } >"$f.tmp"; mv "$f.tmp" "$f"
+    bot_notify "🧲 <b>$u</b>: попытки торрента ($n соединений), трафик заблокирован"
+    echo "🧲 $u: попытки торрента ($n соединений) заблокированы"
+  done < <(awk '/ accepted / && /block-bt\]/ && / email: / {c[$NF]++} END {for (u in c) print c[u], u}' "$1")
+}
+
+cmd_torrent() {
+  need_state
+  case ${1:-status} in
+    alert) need_root
+      case ${2:-} in
+        on) st_edit '.torrent.alert = true'; locked apply_or_die; ok "✅ Уведомления о торрентах включены (для этого Xray пишет журнал доступа, он очищается раз в минуту)" ;;
+        off) st_edit '.torrent.alert = false'; locked apply_or_die; ok "✅ Уведомления о торрентах выключены" ;;
+        *) die "torrent alert on|off" ;;
+      esac ;;
+    status|*) section "🧲 Торренты"
+      kv "🚫" "Блокировка на сервере" "${GRN}всегда включена${NC} ${DIM}(сервер режет BitTorrent)${NC}"
+      kv "🔔" "Уведомления" "$(tick "$(st '.torrent.alert // false')") ${DIM}torrent alert on|off${NC}"
+      echo -e " ${DIM}Подписки autoXRAY отправляют торрент напрямую с устройства, поэтому на сервере виден только трафик клиентов без такой маршрутизации (ссылки vless:// в роутерах).${NC}" ;;
+  esac
+}
+
 # Раз в минуту из cron. Для пользователей с лимитом IP: первые N адресов считаются «своими» (пока их видно,
 # слот занят; через 10 минут без активности слот освобождается), следующие блокируются на 30 минут.
 # Лог доступа читается и сразу обнуляется: он живёт не дольше минуты.
@@ -1051,15 +1303,17 @@ cmd_ipwatch() {
   need_state
   debug_expire
   trim_logs
-  local ipl=0 rep=0
+  local ipl=0 rep=0 ta=0
   jq -e '[.users[] | select(.enabled and ((.ip_limit // 0) > 0))] | length > 0' "$STATE" >/dev/null && ipl=1
   [[ -n $(report_users) ]] && rep=1
-  [[ $ipl == 1 || $rep == 1 ]] || return 0
+  [[ $(st '.torrent.alert // false') == true ]] && ta=1
+  [[ $ipl == 1 || $rep == 1 || $ta == 1 ]] || return 0
   [[ -f $ACCESS_LOG ]] || return 0
   local tmp seen new old_act new_act t
   t=$(now)
   tmp=$(mktemp); cp "$ACCESS_LOG" "$tmp"; : >"$ACCESS_LOG"
   [[ $rep == 1 ]] && report_ingest "$tmp"
+  [[ $ta == 1 ]] && torrent_check "$tmp"
   if [[ $ipl == 1 ]]; then
     local pairs u ip
     pairs=$(ipwatch_parse <"$tmp")
@@ -1395,12 +1649,12 @@ report_summary() {
 }
 
 report_build_index() {
-  local u items="" at dir
+  local u lis="" at dir
   at=$(st '.reports.token // empty'); [[ -n $at ]] || return 0
   dir="$REPORT_WEB/$at"; mkdir -p "$dir"
   rm -f "$REPORT_WEB/index.html"                      # список в корне был до 3.10
-  while read -r u; do [[ -n $u ]] && items+="<li><a href=\"../$(report_user_token "$u")/\">$u</a></li>"; done < <(report_users)
-  printf '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="robots" content="noindex"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Отчёты</title><style>body{font:16px system-ui;max-width:520px;margin:40px auto;padding:0 16px}a{color:#0a84d6}li{margin:8px 0}</style></head><body><h1>Отчёты</h1><ul>%s</ul></body></html>\n' "$items" >"$dir/index.html"
+  while read -r u; do [[ -n $u ]] && lis+="<li><a href=\"../$(report_user_token "$u")/\">$u</a></li>"; done < <(report_users)
+  printf '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="robots" content="noindex"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Отчёты</title><style>body{font:16px system-ui;max-width:520px;margin:40px auto;padding:0 16px}a{color:#0a84d6}li{margin:8px 0}</style></head><body><h1>Отчёты</h1><ul>%s</ul></body></html>\n' "$lis" >"$dir/index.html"
   chmod 755 "$REPORT_WEB" "$dir"; chmod 644 "$dir/index.html"
 }
 
@@ -1473,8 +1727,11 @@ bot_status_changes() {
       local was; was=$(awk -F'\t' -v n="$n" '$1 == n {print $2}' <<<"$old")
       [[ -n $was && $was != "$new" ]] || continue
       if [[ $was == active ]]; then
-        case $new in limit) bot_notify "🚫 <b>$n</b>: исчерпан лимит трафика, доступ закрыт" ;; expired) bot_notify "⌛ <b>$n</b>: истёк срок, доступ закрыт" ;; esac
-      elif [[ $new == active ]]; then bot_notify "✅ <b>$n</b>: доступ снова открыт"; fi
+        case $new in
+          limit) bot_notify "🚫 <b>$n</b>: исчерпан лимит трафика, доступ закрыт"; bot_notify_user "$n" "🚫 Лимит трафика исчерпан, доступ закрыт. Обратитесь к администратору." ;;
+          expired) bot_notify "⌛ <b>$n</b>: истёк срок, доступ закрыт"; bot_notify_user "$n" "⌛ Срок доступа истёк. Обратитесь к администратору." ;;
+        esac
+      elif [[ $new == active ]]; then bot_notify "✅ <b>$n</b>: доступ снова открыт"; bot_notify_user "$n" "✅ Доступ снова открыт."; fi
     done <<<"$cur"
   fi
   printf '%s\n' "$cur" >"$f"
@@ -1509,9 +1766,11 @@ bot_warnings() {
       if [[ ${key##*:} == lim ]]; then
         read -r used limit < <(user_summary | awk -F'\t' -v n="$n" '$1 == n {print $3, $4}')
         bot_notify "⚠️ <b>$n</b>: израсходовано $(( used * 100 / limit ))% лимита ($(hbytes "$used") из $(hbytes "$limit"))"
+        bot_notify_user "$n" "⚠️ Израсходовано $(( used * 100 / limit ))% трафика ($(hbytes "$used") из $(hbytes "$limit"))."
       else
         expire=$(user_summary | awk -F'\t' -v n="$n" '$1 == n {print $5}'); left=$(days_left "$expire")
         bot_notify "⏳ <b>$n</b>: срок заканчивается $(hdate "$expire") (дней: $left)"
+        bot_notify_user "$n" "⏳ Срок доступа заканчивается $(hdate "$expire") (дней: $left)."
       fi
     done <<<"$new"
   fi
@@ -1561,12 +1820,12 @@ cmd_collect() {
         && printf '%s\n' "$merged" >"$TRAFFIC.tmp" && mv "$TRAFFIC.tmp" "$TRAFFIC"
     fi
   fi
-  local due
-  while IFS= read -r due; do
+  local due mode_
+  while IFS=$'\t' read -r due mode_; do
     [[ -n $due ]] || continue
     jq --arg n "$due" 'del(.[$n])' "$TRAFFIC" >"$TRAFFIC.tmp" && mv "$TRAFFIC.tmp" "$TRAFFIC"
-    st_edit --arg n "$due" --argjson nr "$(next_month)" '(.users[] | select(.name == $n) | .next_reset) = $nr'
-  done < <(jq -r --argjson now "$(now)" '.users[] | select((.reset // "never") == "monthly" and (.next_reset // 0) <= $now) | .name' "$STATE")
+    st_edit --arg n "$due" --argjson nr "$(next_reset_ts "$mode_")" '(.users[] | select(.name == $n) | .next_reset) = $nr'
+  done < <(jq -r --argjson now "$(now)" '.users[] | select(((.reset // "never") == "monthly" or (.reset // "never") == "weekly") and (.next_reset // 0) <= $now) | [.name, .reset] | @tsv' "$STATE")
   bot_first_seen
   latest_ax force >/dev/null
   trim_logs
@@ -1622,11 +1881,16 @@ cmd_node() {
          [[ $(jq --arg k "$k" '[.nodes[] | select(.name != $k and (.id | tostring) != $k)] | length' "$STATE") -gt 0 ]] || die "Нельзя удалить последний узел."
          st_edit --arg k "$k" '.nodes |= map(select(.name != $k and (.id | tostring) != $k))'
          locked apply_or_die; ok "✅ Узел удалён." ;;
+    ca) need_root
+        if [[ ${1:-} == off ]]; then st_edit 'del(.tls.ca_file)'; locked apply_or_die; ok "✅ Свой CA для узлов выключен"
+        else [[ -r ${1:-} ]] || die "node ca <файл сертификата CA в формате PEM | off>"
+             openssl x509 -in "$1" -noout 2>/dev/null || die "Файл не похож на сертификат PEM: $1"
+             st_edit --arg f "$(readlink -f "$1")" '.tls.ca_file = $f'; locked apply_or_die; ok "✅ Узлы EU проверяются и по CA из $1"; fi ;;
     list|ls) section "🔀 Узлы моста (EU)"
              printf '%b   %s %s %s %s%b\n' "$DIM" "$(pad ID 4)" "$(pad УЗЕЛ 22)" "$(pad АДРЕС 32)" ТРАНСПОРТ "$NC"
              jq -r '.nodes[] | [(.id | tostring), .name, "\(.addr):\(.port)", "\(.type)/\(.security)"] | @tsv' "$STATE" \
                | while IFS=$'\t' read -r id name addr tr; do printf ' 🇪🇺 %s %b%s%b %s %s\n' "$(pad "$id" 4)" "$BOLD" "$(pad "$name" 22)" "$NC" "$(pad "$addr" 32)" "$tr"; done ;;
-    *) die "node: add <vless://...> | del <имя|id> | list" ;;
+    *) die "node: add <vless://...> | del <имя|id> | ca <файл|off> | list" ;;
   esac
 }
 
@@ -1678,6 +1942,64 @@ warp_register() {
     | .warp.enabled = (.warp.enabled // false) | .warp.ru = (.warp.ru // false) | .warp.domains = (.warp.domains // [])'
   ok "✅ WARP-устройство зарегистрировано ($v4)."
 }
+
+# ---- WARP через MASQUE (экспериментально)
+# MASQUE это CONNECT-IP поверх HTTP/3 на 443: выглядит как обычный HTTPS и не зависит от UDP-порта 2408, на котором часто режут WireGuard.
+# Регистрация идёт так же, как у приложения WARP для Android (устройство регистрируется, затем для него заводится ключ ECDSA P-256).
+# Хранится отдельно от WireGuard-профиля (.warp.masque), переключение: autoxray warp transport masque|wireguard.
+WARP_MASQUE_API="https://api.cloudflareclient.com/v0a4471"
+
+curl_masque() { # METHOD PATH ТОКЕН ТЕЛО
+  local auth=()
+  [[ -n ${3:-} ]] && auth=(-H "Authorization: Bearer $3")
+  "$CURL" -fsS --max-time 30 -H 'CF-Client-Version: a-6.35-4471' -H 'User-Agent: WARP for Android' -H 'Content-Type: application/json' \
+    "${auth[@]}" -X "$1" "$WARP_MASQUE_API/$2" -d "$4"
+}
+
+warp_register_masque() {
+  command -v openssl >/dev/null || die "Нужен openssl"
+  local kf host wgpub resp id token ecpub enrolled peer v4 v6 ep pem tmp
+  tmp=$(mktemp); kf=$tmp.wg
+  openssl genpkey -algorithm X25519 -out "$kf" 2>/dev/null && wgpub=$(openssl pkey -in "$kf" -pubout -outform DER 2>/dev/null | tail -c 32 | base64 -w0)
+  rm -f "$kf"
+  [[ -n ${wgpub:-} ]] || { rm -f "$tmp"; die "openssl не умеет X25519"; }
+  kf=$tmp.ec
+  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$kf" 2>/dev/null || { rm -f "$tmp" "$kf"; die "openssl не умеет ECDSA P-256"; }
+  pem=$(<"$kf"); ecpub=$(openssl pkey -in "$kf" -pubout -outform DER 2>/dev/null | base64 -w0)
+  rm -f "$tmp" "$kf"
+  host=$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-' | head -c 30); host=${host:-autoxray}
+
+  resp=$(curl_masque POST reg "" "$(jq -nc --arg k "$wgpub" --arg t "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" --arg n "$host" '{key: $k, tos: $t, type: "PC", model: "autoxray", name: $n}')") \
+    || die "Cloudflare не ответил на регистрацию MASQUE (сеть или блокировка API)."
+  id=$(jq -r '(.result // .) | .id // empty' <<<"$resp"); token=$(jq -r '(.result // .) | .token // empty' <<<"$resp")
+  [[ -n $id && -n $token ]] || die "Cloudflare отклонил регистрацию MASQUE: $(jq -c '.errors // .' <<<"$resp" 2>/dev/null | sed -E 's/"(token|key|secret)[A-Za-z]*":"[^"]*"/"\1":"<скрыто>"/Ig' | head -c 300)"
+
+  enrolled=$(curl_masque PATCH "reg/$id" "$token" "$(jq -nc --arg k "$ecpub" --arg n "$host" '{key: $k, key_type: "secp256r1", tunnel_type: "masque", name: $n}')") \
+    || die "Cloudflare не принял ключ MASQUE для устройства (формат API мог измениться)."
+  peer=$(jq -r '(.result // .) | .config.peers[0].public_key // empty' <<<"$enrolled")
+  ep=$(jq -r '(.result // .) | .config.peers[0].endpoint.v4 // empty' <<<"$enrolled"); ep=${ep%:*}
+  v4=$(jq -r '(.result // .) | .config.interface.addresses.v4 // empty' <<<"$enrolled")
+  v6=$(jq -r '(.result // .) | .config.interface.addresses.v6 // empty' <<<"$enrolled")
+  [[ -n $peer && -n $ep && -n $v4 ]] || die "В ответе Cloudflare нет ключа точки, адреса или IPv4 туннеля: формат API мог измениться."
+
+  st_edit --arg pem "$pem" --arg pub "$peer" --arg ep "$ep" --arg v4 "$v4" --arg v6 "$v6" --arg id "$id" --arg tk "$token" '
+    .warp = ((.warp // {}) + {registered: true, masque: {privateKey: $pem, publicKey: $pub, endpoint: $ep, address: ([$v4] + (if $v6 != "" then [$v6] else [] end)), deviceId: $id, deviceToken: $tk}})
+    | .warp.enabled = (.warp.enabled // false) | .warp.ru = (.warp.ru // false) | .warp.domains = (.warp.domains // [])'
+  ok "✅ Устройство WARP для MASQUE зарегистрировано ($v4, точка $ep)."
+}
+
+# туннель отвечает? (запрос к one.one.one.one идёт через WARP и показывает warp=on)
+warp_trace_ok() {
+  local su sp i; su=$(st .socks.user); sp=$(st .socks.pass)
+  for i in 1 2 3; do
+    "$CURL" -fsS --max-time "${AX_WARP_TRACE_TIMEOUT:-15}" --socks5-hostname "$su:$sp@127.0.0.1:10443" https://one.one.one.one/cdn-cgi/trace 2>/dev/null | grep -qE '^warp=(on|plus)' && return 0
+    sleep "${AX_WARP_TRACE_GAP:-3}"
+  done
+  return 1
+}
+
+warp_masque_on() { [[ $(st '.warp.transport // "wireguard"') == masque ]]; }
+warp_need_wg() { ! warp_masque_on || die "Сейчас WARP работает через MASQUE: адрес точки выдаёт Cloudflare, сканировать и подбирать нечего. Вернуться на WireGuard: autoxray warp transport wireguard"; }
 
 # Кандидаты на endpoint: порты WARP бывают закрыты провайдером выборочно (список можно задать через AX_WARP_CANDIDATES)
 warp_candidates() {
@@ -2051,6 +2373,7 @@ warp_rescan_commit() { if [[ $1 == change ]]; then warp_apply_best >/dev/null; a
 # Endpoint меняется, только если он заметно лучше текущего (минус 10%), чтобы зря не перезапускать Xray.
 warp_rescan() { # [now]
   local force=${1:-} thr cur tops mode=top best bsc cur_sc act=keep
+  if warp_masque_on; then [[ $force == now ]] && warn "WARP работает через MASQUE: адрес точки выдаёт Cloudflare, подбирать нечего."; return 0; fi
   [[ $(st '.warp.registered // false') == true && $(st '.warp.enabled // false') == true ]] || { [[ $force == now ]] && warn "WARP не включён."; return 0; }
   [[ $force == now || $(st '.warp.nightly // false') == true ]] || return 0
   thr=$(st '.warp.threshold_ms // 300'); cur=$(st '.warp.endpoint // empty')
@@ -2204,6 +2527,7 @@ warp_renew() {
 
 warp_enable_checked() { # [--force]; печатает причину и возвращает 1, если WARP не отвечает
   if [[ ${1:-} == --force ]]; then return 0; fi
+  if warp_masque_on; then return 0; fi                # у MASQUE нет перебора адресов; проверка идёт при переключении
   if ! warp_pick_endpoint; then
     warn "WARP не отвечает ни на одном endpoint. Включение отменено, чтобы не оборвать доступ к сайтам."
     echo -e "   ${DIM}Запустите ${NC}${CYAN}autoxray warp debug${NC}${DIM} и пришлите вывод, либо ${NC}${CYAN}--force${NC}${DIM} чтобы включить без проверки.${NC}"
@@ -2264,7 +2588,27 @@ cmd_warp() {
     debug) warp_debug "$@" ;;
     candidates) warp_scan_candidates "${1:-quick}" ;;
     warm) warp_warm ;;
-    soak) need_root; warp_soak "$@" ;;
+    soak) need_root; warp_need_wg; warp_soak "$@" ;;
+    transport) need_root
+      case ${1:-status} in
+        masque)
+          local prev; prev=$(st '.warp.transport // "wireguard"')
+          [[ $(st '.warp.masque // null') != null ]] || locked warp_register_masque
+          st_edit '.warp.transport = "masque"'; locked apply_or_die
+          if [[ ${2:-} == --force ]]; then ok "✅ WARP через MASQUE включён без проверки (--force)."
+          else
+            echo -e " ${DIM}Проверяю туннель MASQUE...${NC}"
+            if warp_trace_ok; then ok "✅ WARP через MASQUE работает."
+            else
+              st_edit --arg t "$prev" '.warp.transport = $t'; locked apply_or_die
+              die "Туннель MASQUE не ответил, возвращён $prev. Возможно, сервер не может открыть HTTP/3 (UDP 443) до Cloudflare. Повторить: autoxray warp transport masque; оставить без проверки: --force."
+            fi
+          fi ;;
+        wireguard)
+          [[ $(st '.warp.secretKey // empty') != "" ]] || locked warp_register
+          st_edit '.warp.transport = "wireguard"'; locked apply_or_die; ok "✅ WARP через WireGuard." ;;
+        status|*) kv "🚇" "Транспорт" "$(st '.warp.transport // "wireguard"') ${DIM}(autoxray warp transport masque|wireguard; MASQUE экспериментальный)${NC}" ;;
+      esac ;;
     stable) need_root
          case ${1:-} in
            on) st_edit '.warp.stable = true'; ok "✅ После замера скорости endpoint выбирается по стабильности среди лучших" ;;
@@ -2272,11 +2616,11 @@ cmd_warp() {
            top) [[ ${2:-} =~ ^[1-9][0-9]*$ ]] || die "warp stable top <сколько лучших проверять на стабильность>"; st_edit --argjson n "$2" '.warp.soak_top = $n'; ok "✅ На стабильность проверяются $2 лучших" ;;
            *) die "warp stable on|off|top N" ;;
          esac ;;
-    renew) need_root
+    renew) need_root; warp_need_wg
          warn "Будет зарегистрировано новое устройство Cloudflare (новый ключ). Домены, режимы и endpoint сохранятся."
          locked warp_renew; locked apply_or_die; ok "✅ Новое устройство WARP подключено. Проверьте: autoxray warp coldtest" ;;
-    coldtest) need_root; warp_coldtest "$@" ;;
-    keepalive) need_root; [[ ${1:-} =~ ^[0-9]+$ ]] || die "warp keepalive <секунды, 0 выключает> (по умолчанию 25)"
+    coldtest) need_root; warp_need_wg; warp_coldtest "$@" ;;
+    keepalive) need_root; warp_need_wg; [[ ${1:-} =~ ^[0-9]+$ ]] || die "warp keepalive <секунды, 0 выключает> (по умолчанию 25)"
          st_edit --argjson k "$1" '.warp.keepalive = $k'; locked apply_or_die; ok "✅ Keepalive WireGuard: $1 с" ;;
     warmhosts) need_root
          case ${1:-} in
@@ -2296,7 +2640,7 @@ cmd_warp() {
     hosts) need_root; [[ -n ${1:-} ]] || die "warp hosts <сайт> [сайт...] (по умолчанию: $WARP_PROBE_HOSTS_DEFAULT)"
          st_edit --argjson h "$(printf '%s\n' "$@" | jq -Rn '[inputs]')" '.warp.probe_hosts = $h'; ok "✅ Сайты для замера: $*" ;;
     rescan) need_root; local rarg=""; [[ ${1:-} == now ]] && rarg=now; warp_rescan "$rarg" ;;
-    scan) need_root
+    scan) need_root; warp_need_wg
          local apply=0 nosoak=0 sargs=()
          while (($#)); do case $1 in --apply) apply=1 ;; --no-soak) nosoak=1 ;; *) sargs+=("$1") ;; esac; shift; done
          [[ $(st '.warp.registered // false') == true ]] || locked warp_register
@@ -2307,7 +2651,7 @@ cmd_warp() {
              warp_apply_best; locked apply_or_die; ok "✅ Endpoint сохранён."
            else echo -e "\n ${DIM}Применить лучший: ${NC}${CYAN}autoxray warp scan --apply${NC}${DIM}. Ограничить узлы: --colo FRA,AMS или --exclude-colo DME${NC}"; fi
          else die "Ни один endpoint не ответил: WARP недоступен с этого сервера (autoxray warp debug)."; fi ;;
-    endpoint) need_root; [[ -n ${1:-} ]] || die "warp endpoint <ip:порт>"
+    endpoint) need_root; warp_need_wg; [[ -n ${1:-} ]] || die "warp endpoint <ip:порт>"
          st_edit --arg ep "$1" '.warp.endpoint = $ep'; locked apply_or_die; ok "✅ endpoint → $1" ;;
     off) need_root; st_edit '.warp.enabled = false'; locked apply_or_die && ok "✅ WARP выключен." ;;
     ru)  need_root
@@ -2335,6 +2679,7 @@ cmd_warp() {
          section "🌍 Cloudflare WARP"
          kv "🆔" "Профиль" "$(tick "$(st '.warp.registered // false')") зарегистрирован"
          kv "🔌" "Состояние" "$(tick "$(st '.warp.enabled // false')") включён"
+         kv "🚇" "Транспорт" "$(st '.warp.transport // "wireguard"') $(warp_masque_on && echo "${DIM}(точка $(st .warp.masque.endpoint), её выдаёт Cloudflare)${NC}")"
          kv "🇷🇺" "RU на сервере" "$(tick "$(st '.warp.ru // false')") российские сайты, дошедшие до сервера, идут через WARP"
          local wf; wf=$(cat "$WARP_WARM_FILE" 2>/dev/null)
          if [[ -n $wf ]]; then read -r _t _s _m _k <<<"$wf"; kv "🔥" "Прогрев" "$([[ $_s == ok ]] && echo "${GRN}✔${NC} $_m мс" || echo "${RED}✘ неудач подряд: $_k${NC}") ${DIM}$(( ($(now) - _t) / 60 )) мин назад, keepalive $(st '.warp.keepalive // 25') с${NC}"; fi
@@ -2366,7 +2711,7 @@ cmd_warp() {
            || die "Нет ответа. Проверьте: autoxray warp status; systemctl status xray"
          echo "$trace" | sed 's/^/   /'
          grep -qE '^warp=(on|plus)' <<<"$trace" && ok "✅ WARP работает" || warn "warp не включён в ответе — трафик идёт мимо WARP" ;;
-    *) die "warp: register | on | off | ru on|off | add | del | list | check | scan | coldtest | soak | stable | renew | warm | warmhosts | keepalive | keepwarm | debug | endpoint" ;;
+    *) die "warp: register | on | off | ru on|off | add | del | list | check | scan | coldtest | soak | stable | renew | warm | warmhosts | keepalive | keepwarm | debug | endpoint | transport masque|wireguard" ;;
   esac
 }
 
@@ -2669,6 +3014,15 @@ cmd_self_update() {
     mkdir -p "$tmp/$(dirname "$f")"
     "$CURL" -fsSL --max-time 30 "$raw/$f" -o "$tmp/$f" || { rm -rf "${tmp:?}"; die "Не удалось скачать $f ($tag)"; }
   done
+  # Файлы релиза сверяются с контрольными суммами, опубликованными вместе с ним (FILES.sha256). Релизы до 3.13 их не имеют.
+  local sums sums_url="${AX_SUMS_BASE:-https://github.com/$AX_REPO/releases/download}/$tag/FILES.sha256"
+  if sums=$("$CURL" -fsSL --max-time 30 "$sums_url" 2>/dev/null) && [[ -n $sums ]]; then
+    (cd "$tmp" && printf '%s\n' "$sums" | sha256sum -c --quiet >/dev/null 2>&1) \
+      || { rm -rf "${tmp:?}"; die "Контрольные суммы файлов релиза $tag не совпали: обновление остановлено, ничего не изменено."; }
+    echo -e " 🔏 ${DIM}Контрольные суммы релиза $tag совпали${NC}"
+  elif ver_gt "${tag#v}" "3.12.99"; then
+    rm -rf "${tmp:?}"; die "Не удалось получить контрольные суммы релиза $tag ($sums_url): обновление остановлено."
+  else warn "У релиза $tag нет контрольных сумм (он выпущен до 3.13): файлы не проверены."; fi
   snap=$(snapshot_create) || { rm -rf "${tmp:?}"; die "Не удалось сделать снимок перед обновлением."; }
   echo -e " 💾 ${DIM}Снимок для отката: $snap${NC}"
   install -m 755 "$tmp/autoxray" "$AX_BIN"
@@ -2908,6 +3262,10 @@ bot_help() {
 /report <code>имя on|off</code> — включить или выключить отчёт
 /trust <code>имя IP|сеть</code>, /untrust <code>имя IP|all</code> — доверенные адреса (не считаются в лимите устройств)
 /backup — зашифрованная копия настроек файлом
+/invite <code>имя</code> — ссылка-приглашение: клиент сам привяжет Telegram и увидит трафик и ссылки, /unlink <code>имя</code> — отвязать
+/note <code>имя текст</code>, /tags <code>имя метка1,метка2</code>, /find <code>текст</code> — заметки, метки и поиск
+/hide, /show <code>имя xhttp|vision|hy2</code> — скрыть протокол в подписке пользователя
+/broadcast <code>текст</code> — сообщение всем клиентам с привязанным Telegram
 /enable, /disable <code>имя</code>
 /del <code>имя</code> — удалить (с подтверждением)
 /stats — трафик
@@ -2931,6 +3289,12 @@ bot_user_card() {
   [[ $rpt == true ]] && rptt="вкл" || rptt="выкл"
   printf '👤 <b>%s</b>  %s %s\n📊 %s%s%s\n⏳ срок: %s\n📱 IP: %s   🇷🇺 RU: %s   📈 отчёт: %s' \
     "$name" "$icon" "$label" "$(hbytes "$used")" "$([[ $limit -gt 0 ]] && echo " / $(hbytes "$limit")")" "$pct" "$left" "$ipt" "$rul" "$rptt"
+  # заметка, метки, скрытые протоколы и привязка Telegram
+  jq -r --arg n "$name" '.users[] | select(.name == $n) | [
+      (if (.tg // null) != null then "✈️ Telegram привязан" else "✈️ Telegram не привязан" end),
+      (if ((.tags // []) | length) > 0 then "🏷 " + ((.tags // []) | map("#" + .) | join(" ")) else empty end),
+      (if ((.hide // []) | length) > 0 then "🙈 скрыто: " + ((.hide // []) | join(", ")) else empty end),
+      (if (.note // "") != "" then "📝 " + .note else empty end)] | "\n" + join("\n")' "$STATE" | html_esc
 }
 bot_user_kb() {
   local n=$1 enabled rep
@@ -2938,7 +3302,7 @@ bot_user_kb() {
   rep=$(jq -r --arg n "$n" '.users[] | select(.name == $n) | (.report // false)' "$STATE")
   jq -nc --argjson rep "$rep" --arg n "$n" --arg tog "$([[ $enabled == true ]] && echo "⏸ Отключить" || echo "▶️ Включить")" '
     {inline_keyboard: [
-      [{text: "🔗 Ссылки", callback_data: "u:\($n):links"}, {text: "📷 QR", callback_data: "u:\($n):qr"}],
+      [{text: "🔗 Ссылки", callback_data: "u:\($n):links"}, {text: "📷 QR", callback_data: "u:\($n):qr"}, {text: "✉️ Пригласить", callback_data: "u:\($n):inv"}],
       [{text: "∞", callback_data: "u:\($n):lim:0"}, {text: "10 ГБ", callback_data: "u:\($n):lim:10"}, {text: "50 ГБ", callback_data: "u:\($n):lim:50"}, {text: "100 ГБ", callback_data: "u:\($n):lim:100"}],
       [{text: $tog, callback_data: "u:\($n):tog"}, {text: "🔁 Новые ключи", callback_data: "u:\($n):rot"}],
       (if $rep then [{text: "📎 Отчёт файлом", callback_data: "u:\($n):repsend"}, {text: "🔗 Ссылка на отчёт", callback_data: "u:\($n):replink"}]
@@ -3032,6 +3396,7 @@ bot_callback() { # chat message_id callback_id data
   IFS=: read -r a b c d <<<"$data"
   tg_answer "$cbid"
   case $a in
+    bc) if [[ $b == ok && -s $AX_ETC/.broadcast.txt ]]; then bot_broadcast_send "$chat"; else rm -f "$AX_ETC/.broadcast.txt"; tg_send "$chat" "Рассылка отменена."; fi ;;
     list) bot_show_list "$chat" "$mid" ;;
     new) tg_send "$chat" "Создайте пользователя: <code>/add имя [ГБ] [дней]</code>" ;;
     status) bot_do cmd_status; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" "$BOT_MAIN_KB" ;;
@@ -3054,6 +3419,7 @@ bot_callback() { # chat message_id callback_id data
         rep) if [[ $(jq -r --arg n "$name" '.users[] | select(.name == $n) | (.report // false)' "$STATE") == true ]]
              then tg_edit "$chat" "$mid" "📈 Отчёт о посещениях <b>$name</b>" "$(jq -nc --arg n "$name" '{inline_keyboard: [[{text: "📎 Файл HTML", callback_data: "u:\($n):repsend"}, {text: "🔗 Ссылка", callback_data: "u:\($n):replink"}], [{text: "⏸ Выключить", callback_data: "u:\($n):repoffq"}], [{text: "⬅️ Назад", callback_data: "u:\($n)"}]]}')"
              else tg_edit "$chat" "$mid" "📈 Включить отчёт о посещениях <b>$name</b>? Будут записываться сайты и IP, на которые он заходит. Предупредите пользователя." "$(bot_confirm_kb "u:$name:repon" "u:$name")"; fi ;;
+        inv) bot_do locked cmd_user_invite "$name"; tg_send "$chat" "$(printf '✉️ Приглашение для <b>%s</b> (7 дней, одноразовое). Отправьте эту ссылку клиенту:\n%s' "$name" "$(printf '%s' "$BOT_OUT" | grep -o 'https://t.me/[^ ]*' | head -n1)")" ;;
         repsend) bot_send_report "$chat" "$name" ;;
         replink) tg_send "$chat" "📈 $name: $(report_url "$name")" ;;
         repoffq) tg_edit "$chat" "$mid" "📈 Выключить отчёт о посещениях <b>$name</b> и удалить страницу?" "$(bot_confirm_kb "u:$name:repoff" "u:$name:rep")" ;;
@@ -3101,6 +3467,18 @@ bot_command() { # chat текст
     /untrust) need_name || return 0; [[ -n ${a[1]:-} ]] || { tg_send "$chat" "Пример: <code>/untrust $name 203.0.113.5</code> или <code>all</code>"; return 0; }
       bot_do locked cmd_user_set "$name" --untrust "${a[1]}"; tg_send "$chat" "$(bot_report_text)" ;;
     /backup) bot_send_backup "$chat" ;;
+    /invite) need_name || return 0; bot_do locked cmd_user_invite "$name"
+      if [[ $BOT_RC -eq 0 ]]; then tg_send "$chat" "$(printf '✉️ Приглашение для <b>%s</b> (7 дней, одноразовое). Отправьте эту ссылку клиенту:\n%s' "$name" "$(printf '%s' "$BOT_OUT" | grep -o 'https://t.me/[^ ]*' | head -n1)")"; else tg_send "$chat" "$(bot_report_text)"; fi ;;
+    /unlink) need_name || return 0; bot_do locked cmd_user_unlink "$name"; tg_send "$chat" "$(bot_report_text)" ;;
+    /note) need_name || return 0; bot_do locked cmd_user_set "$name" --note "${rest#"$name"}"; tg_send "$chat" "$(bot_report_text)" ;;
+    /tags) need_name || return 0; bot_do locked cmd_user_set "$name" --tags "${a[1]:-}"; tg_send "$chat" "$(bot_report_text)" ;;
+    /hide) need_name || return 0; [[ ${a[1]:-} =~ ^(xhttp|vision|hy2)$ ]] || { tg_send "$chat" "Пример: <code>/hide $name hy2</code> (xhttp, vision или hy2)"; return 0; }
+      bot_do locked cmd_user_set "$name" --hide "${a[1]}"; tg_send "$chat" "$(bot_report_text)" ;;
+    /show) need_name || return 0; [[ ${a[1]:-} =~ ^(xhttp|vision|hy2|all)$ ]] || { tg_send "$chat" "Пример: <code>/show $name hy2</code> или <code>all</code>"; return 0; }
+      bot_do locked cmd_user_set "$name" --show "${a[1]}"; tg_send "$chat" "$(bot_report_text)" ;;
+    /find) [[ -n $rest ]] || { tg_send "$chat" "Пример: <code>/find мама</code> (ищет в имени, заметке и метках)"; return 0; }
+      bot_do cmd_user_list --find "$rest"; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" ;;
+    /broadcast) bot_broadcast_ask "$chat" "$rest" ;;
     /enable) need_name || return 0; bot_do locked cmd_user_set "$name" --enable; bot_show_user "$chat" "" "$name" ;;
     /disable) need_name || return 0; bot_do locked cmd_user_set "$name" --disable; bot_show_user "$chat" "" "$name" ;;
     /del) need_name || return 0; tg_send "$chat" "🗑 Удалить <b>$name</b> без возможности восстановления?" "$(bot_confirm_kb "u:$name:delok" "u:$name")" ;;
@@ -3109,6 +3487,80 @@ bot_command() { # chat текст
     /warp) bot_do cmd_warp status; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" ;;
     *) tg_send "$chat" "Не знаю такой команды. /help" ;;
   esac
+}
+
+# --- режим клиента: пользователь с привязанным Telegram видит только свои данные
+
+user_by_tg() { jq -r --argjson i "$1" '[.users[] | select((.tg // null) == $i) | .name][0] // empty' "$STATE"; }
+
+bot_client_card() { # имя
+  local line name status used limit expire _ icon label pct="" left="∞"
+  line=$(user_summary | awk -F'\t' -v n="$1" '$1 == n') || true
+  [[ -n $line ]] || return 1
+  IFS=$'\t' read -r name status used limit expire _ <<<"$line"
+  case $status in active) icon="🟢"; label="доступ открыт" ;; disabled) icon="⚫"; label="доступ отключён" ;; expired) icon="⌛"; label="срок истёк" ;; limit) icon="🚫"; label="лимит трафика исчерпан" ;; *) icon="❔"; label=$status ;; esac
+  [[ $limit -gt 0 ]] && pct=" ($(( used * 100 / limit ))%)"
+  [[ $expire -gt 0 ]] && left="до $(hdate "$expire") (дней: $(days_left "$expire"))"
+  printf '👤 <b>%s</b>  %s %s\n📊 Использовано: %s%s%s\n⏳ Срок: %s' "$name" "$icon" "$label" "$(hbytes "$used")" "$([[ $limit -gt 0 ]] && echo " из $(hbytes "$limit")")" "$pct" "$left"
+}
+
+BOT_CLIENT_KB='{"inline_keyboard":[[{"text":"📊 Мой трафик","callback_data":"c:me"},{"text":"🔗 Ссылки","callback_data":"c:links"}],[{"text":"📷 QR подписки","callback_data":"c:qr"}]]}'
+
+bot_client() { # chat имя текст cbid data
+  local chat=$1 name=$2 text=$3 cbid=$4 data=$5 cmd
+  if [[ -n $cbid ]]; then
+    tg_answer "$cbid"; cmd=${data#c:}
+  else cmd=${text%% *}; cmd=${cmd%%@*}; fi
+  case $cmd in
+    me|/me|/start|/menu) tg_send "$chat" "$(bot_client_card "$name")" "$BOT_CLIENT_KB" ;;
+    links|/link|/links) tg_send "$chat" "$(bot_links_text "$name")" ;;
+    qr|/qr) bot_send_qr "$chat" "$name" ;;
+    *) tg_send "$chat" "Вам доступны: /me (трафик и срок), /link (ссылки), /qr (QR подписки)." "$BOT_CLIENT_KB" ;;
+  esac
+}
+
+# Привязка по приглашению. Неверные коды считаются: после пяти ошибок за час бот молчит.
+bot_invite_redeem() { # chat uid код имя_в_telegram
+  local chat=$1 uid=$2 code=$3 who=$4 f="$AX_ETC/.invite-fails" name t; t=$(now)
+  touch "$f"
+  [[ $(awk -v u="$uid" -v t="$t" '$1 == u && t - $2 < 3600' "$f" | wc -l) -lt 5 ]] || return 0
+  name=""
+  [[ $code =~ ^[A-Za-z0-9]{16}$ ]] && name=$(jq -r --arg c "$code" --argjson t "$t" '[.users[] | select((.invite.code // "") == $c and (.invite.until // 0) > $t and (.tg // null) == null) | .name][0] // empty' "$STATE")
+  if [[ -z $name ]]; then
+    printf '%s %s\n' "$uid" "$t" >>"$f"
+    tg_send "$chat" "Приглашение недействительно или просрочено. Попросите у администратора новое."; return 0
+  fi
+  locked bot_bind_user "$name" "$uid"
+  tg_send "$chat" "✅ Готово, вы подключены как <b>$name</b>." "$BOT_CLIENT_KB"
+  tg_send "$chat" "$(bot_client_card "$name")" "$BOT_CLIENT_KB"
+  bot_notify "✈️ <b>$name</b> привязал(а) Telegram: $(html_esc <<<"$who") (ID <code>$uid</code>)"
+}
+bot_bind_user() { st_edit --arg n "$1" --argjson i "$2" '(.users[] | select(.name == $n)) |= (.tg = $i | del(.invite))'; }
+
+# Уведомление самому клиенту (если привязан Telegram)
+bot_notify_user() { # имя текст
+  bot_enabled || return 0
+  local tg; tg=$(jq -r --arg n "$1" '(.users[] | select(.name == $n) | .tg) // empty' "$STATE")
+  [[ -n $tg ]] && { tg_send "$tg" "$2" "" 8 || true; }
+  return 0
+}
+
+# Рассылка: текст сначала показывается администратору с числом получателей и отправляется после подтверждения
+bot_broadcast_ask() { # chat текст
+  local chat=$1 text=${2:0:1000} n
+  [[ -n $text ]] || { tg_send "$chat" "Пример: <code>/broadcast Завтра с 02:00 до 03:00 возможны перебои</code>"; return 0; }
+  n=$(jq '[.users[] | select(.enabled and ((.tg // null) != null))] | length' "$STATE")
+  [[ $n -gt 0 ]] || { tg_send "$chat" "Нет клиентов с привязанным Telegram. Выдать приглашение: /invite имя"; return 0; }
+  (umask 077; printf '%s' "$text" >"$AX_ETC/.broadcast.txt")
+  tg_send "$chat" "$(printf '📢 Отправить %s клиент(ам) сообщение?\n\n<i>%s</i>' "$n" "$(html_esc <<<"$text")")" "$(bot_confirm_kb "bc:ok" "bc:no")"
+}
+bot_broadcast_send() { # chat
+  local chat=$1 text n=0 tg
+  text=$(<"$AX_ETC/.broadcast.txt"); rm -f "$AX_ETC/.broadcast.txt"
+  for tg in $(jq -r '.users[] | select(.enabled and ((.tg // null) != null)) | .tg' "$STATE"); do
+    tg_send "$tg" "$(printf '📢 <b>Сообщение от администратора</b>\n\n%s' "$(html_esc <<<"$text")")" "" 10 && n=$((n + 1)) || true
+  done
+  tg_send "$chat" "✅ Отправлено: $n"
 }
 
 bot_handle_update() { # json одного update
@@ -3122,8 +3574,17 @@ bot_handle_update() { # json одного update
   [[ -n $uid && -n $chat ]] || return 0
   # /id работает у всех: так проще узнать свой числовой ID для настройки
   if [[ $text == /id || $text == /id@* ]]; then tg_send "$chat" "Ваш Telegram ID: <code>$uid</code>"; return 0; fi
-  bot_is_admin "$uid" || return 0                      # посторонним бот не отвечает
   [[ $ctype == private ]] || return 0                  # только личные чаты
+  # приглашение может предъявить любой, у кого есть ссылка
+  if [[ $text == "/start "* ]]; then
+    bot_invite_redeem "$chat" "$uid" "$(printf '%s' "${text#/start }" | tr -d '[:space:]' | head -c 40)" "$(jq -r '(.message.from | (.first_name // "") + " @" + (.username // "-"))' <<<"$u")"
+    return 0
+  fi
+  if ! bot_is_admin "$uid"; then                       # посторонним бот не отвечает, привязанным клиентам отвечает по-своему
+    local cname; cname=$(user_by_tg "$uid")
+    [[ -n $cname ]] && bot_client "$chat" "$cname" "$text" "$cbid" "$data"
+    return 0
+  fi
   if [[ -n $cbid ]]; then bot_callback "$chat" "$mid" "$cbid" "$data"
   elif [[ $text == /* ]]; then bot_command "$chat" "$text"; fi
 }
@@ -3205,7 +3666,7 @@ bot_setup() { # [--token T] [--admin ID] [--proxy URL]
   fi
   [[ $adm =~ ^[0-9]+$ ]] || setup_fail "ID администратора: число"
   mv -f "$BOT_TOKEN_FILE" "$real"; BOT_TOKEN_FILE=$real
-  st_edit --argjson a "$adm" '.bot = ((.bot // {}) + {enabled: true, admins: (((.bot.admins // []) + [$a]) | unique)})'
+  st_edit --argjson a "$adm" --arg un "$uname" '.bot = ((.bot // {}) + {enabled: true, username: $un, admins: (((.bot.admins // []) + [$a]) | unique)})'
   bot_write_unit; svc daemon-reload; svc enable autoxray-bot; svc restart autoxray-bot
   tg_send "$adm" "✅ <b>autoXRAY</b>: бот подключён. Нажмите /help." "$BOT_MAIN_KB" 10 || true
   ok "✅ Бот @$uname настроен, администратор: $adm"
@@ -3395,7 +3856,7 @@ user_menu_actions() { # имя
   while true; do
     clear; cmd_user_list; echo
     choose "Пользователь «$name»" "🔗 Ссылки и ключи" "📷 QR подписки" "📝 Лимит трафика и срок" "📱 Лимит устройств (IP)" \
-      "🇷🇺 Российские сайты: куда идут" "📈 Отчёт о посещениях: вкл / выкл" "🔌 Отключить / включить" "🔁 Новые ключи и ссылка" "❌ Удалить" "🔙 Назад" || return 0
+      "🇷🇺 Российские сайты: куда идут" "📈 Отчёт о посещениях: вкл / выкл" "📝 Заметка и метки" "✉️  Пригласить в Telegram" "🙈 Скрыть или вернуть протокол" "🔌 Отключить / включить" "🔁 Новые ключи и ссылка" "❌ Удалить" "🔙 Назад" || return 0
     act=$CHOICE
     case $act in
       0) show_user "$name"; pause ;;
@@ -3419,11 +3880,20 @@ user_menu_actions() { # имя
            echo -e " ${DIM}Будут записываться сайты и IP-адреса, на которые заходит пользователь. Предупредите его об этом.${NC}"
            confirm "Включить отчёт о посещениях «$name»" && (locked cmd_user_set "$name" --report on)
          fi; pause ;;
-      6) if [[ $(jq -r --arg n "$name" '.users[] | select(.name == $n) | .enabled' "$STATE") == true ]]
+      6) lim=$(ask "Заметка (Enter: оставить как есть)"); days=$(ask "Метки через запятую (Enter: оставить как есть)")
+         [[ -n $lim ]] && (locked cmd_user_set "$name" --note "$lim"); [[ -n $days ]] && (locked cmd_user_set "$name" --tags "$days"); pause ;;
+      7) (locked cmd_user_invite "$name"); pause ;;
+      8) if choose "Протокол" "⚡ XHTTP" "🔐 Vision (RAW)" "🚀 Hysteria2" "🔙 Отмена" && [[ $CHOICE -lt 3 ]]; then
+           local proto=(xhttp vision hy2); local pr=${proto[$CHOICE]}
+           if choose "Что сделать с $pr" "🙈 Скрыть из подписок" "👁 Вернуть" "🔙 Отмена"; then
+             case $CHOICE in 0) (locked cmd_user_set "$name" --hide "$pr") ;; 1) (locked cmd_user_set "$name" --show "$pr") ;; esac
+           fi
+         fi; pause ;;
+      9) if [[ $(jq -r --arg n "$name" '.users[] | select(.name == $n) | .enabled' "$STATE") == true ]]
          then (locked cmd_user_set "$name" --disable); else (locked cmd_user_set "$name" --enable); fi; pause ;;
-      7) confirm "Выпустить новые ключи? Старая ссылка перестанет работать" && (locked cmd_user_rotate "$name"); pause ;;
-      8) if confirm "Удалить «$name» без возможности восстановления"; then (locked cmd_user_del "$name"); pause; return 0; fi ;;
-      9) return 0 ;;
+      10) confirm "Выпустить новые ключи? Старая ссылка перестанет работать" && (locked cmd_user_rotate "$name"); pause ;;
+      11) if confirm "Удалить «$name» без возможности восстановления"; then (locked cmd_user_del "$name"); pause; return 0; fi ;;
+      12) return 0 ;;
     esac
   done
 }
@@ -3466,7 +3936,7 @@ menu_warp() {
   while true; do
     clear; cmd_warp status; echo
     choose "WARP" "🟢 Включить WARP" "🔴 Выключить WARP" "🇷🇺 Российские сайты ЧЕРЕЗ WARP" "🏠 Российские сайты напрямую" \
-      "➕ Добавить домен в WARP" "➖ Убрать домен из WARP" "🔎 Проверить работу" "⚡ Найти самый быстрый endpoint" "🌙 Ночная проверка и глубина сканирования" "🧪 Отладка (отчёт для разбора проблем)" "🔙 Назад" || return 0
+      "➕ Добавить домен в WARP" "➖ Убрать домен из WARP" "🔎 Проверить работу" "⚡ Найти самый быстрый endpoint" "🌙 Ночная проверка и глубина сканирования" "🧪 Отладка (отчёт для разбора проблем)" "🚇 Транспорт: MASQUE или WireGuard" "🔙 Назад" || return 0
     case $CHOICE in
       0) (cmd_warp on); pause ;;
       1) (cmd_warp off); pause ;;
@@ -3479,7 +3949,11 @@ menu_warp() {
       7) (cmd_warp scan --apply); pause ;;
       8) menu_warp_scan ;;
       9) (cmd_warp debug); pause ;;
-      10) return 0 ;;
+      10) echo -e " ${DIM}MASQUE (экспериментально): WARP через HTTP/3 на порту 443 вместо WireGuard на 2408. Если туннель не заработает, вернётся WireGuard.${NC}"
+          if choose "Транспорт WARP" "🚇 MASQUE" "🛡 WireGuard" "🔙 Отмена" && [[ $CHOICE -lt 2 ]]; then
+            if [[ $CHOICE == 0 ]]; then (cmd_warp transport masque); else (cmd_warp transport wireguard); fi
+          fi; pause ;;
+      11) return 0 ;;
     esac
   done
 }
@@ -3575,17 +4049,22 @@ usage() {
   echo -e "  ${C}autoxray stats${N}                 📊 трафик по пользователям"
   echo -e "${H}Пользователи${N}"
   echo -e "  ${C}autoxray user list${N} ${D}[--plain]${N}"
-  echo -e "  ${C}autoxray user add${N} <имя> ${D}[--limit ГБ] [--days N] [--ips N] [--ru direct|server] [--reset monthly]${N}"
-  echo -e "  ${C}autoxray user set${N} <имя> ${D}[--limit ГБ] [--days N] [--ips N] [--ru direct|server] [--reset monthly|never] [--enable|--disable] [--reset-traffic]${N}"
+  echo -e "  ${C}autoxray user add${N} <имя> ${D}[--limit ГБ] [--days N] [--ips N] [--ru direct|server] [--reset monthly|weekly]${N}"
+  echo -e "  ${C}autoxray user set${N} <имя> ${D}[--limit ГБ] [--days N] [--ips N] [--ru direct|server] [--reset monthly|weekly|never] [--hide hy2|xhttp|vision] [--show протокол|all] [--note текст] [--tags a,b] [--enable|--disable] [--reset-traffic]${N}"
   echo -e "  ${C}autoxray ips${N} ${D}[имя]${N}  ${C}unban${N} <имя|--all>   ${D}лимит устройств (IP) и блокировки${N}"
   echo -e "  ${C}autoxray user set${N} <имя> ${D}--trust 1.2.3.4|1.2.3.0/24  --untrust IP|all${N}   ${D}доверенные адреса: не считаются в лимите IP${N}"
   echo -e "  ${C}autoxray report${N} list|build [имя]|url <имя>|purge <имя>|keep <дней>   ${D}html-отчёты о посещениях (user set --report on)${N}"
+  echo -e "  ${C}autoxray user find${N} <текст>  ${C}user list${N} --tag метка   ${D}поиск по имени, заметке и меткам${N}"
+  echo -e "  ${C}autoxray route${N} list|add direct|proxy|block <домен|сеть>|del|preset push on|off   ${D}свои правила маршрутов в подписках${N}"
+  echo -e "  ${C}autoxray torrent${N} alert on|off   ${D}уведомление в бот о попытках торрента через сервер${N}"
+  echo -e "  ${C}autoxray sub statusnode${N} on|off   ${D}строка «осталось ... до ...» в подписках${N}"
   echo -e "  ${C}autoxray user del${N} <имя>        ${C}user rotate${N} <имя>  ${D}новые ключи и ссылка${N}"
   echo -e "  ${C}autoxray user link${N} <имя> ${D}[--plain]${N}  ${C}user qr${N} <имя> ${D}[sub|links|xhttp|vision|hy2]${N}"
   echo -e "${H}Сеть${N}"
   echo -e "  ${C}autoxray warp${N} register|on|off|status|check|add|del  ${C}warp debug${N} ${D}[--quick]${N} ${D}разбор проблем${N}"
   echo -e "  ${C}autoxray warp scan${N} ${D}[--apply] [--depth quick|more|all] [--colo FRA,AMS] [--exclude-colo DME]${N}  ${D}самый быстрый endpoint${N}"
   echo -e "  ${C}autoxray warp soak${N} ${D}[--apply] [--rounds N] [endpoint...]${N}  ${D}стабильность endpoint'ов${N}   ${C}warp renew${N} ${D}новое устройство Cloudflare${N}"
+  echo -e "  ${C}autoxray warp transport${N} masque|wireguard   ${D}WARP через MASQUE (HTTP/3 на 443) вместо WireGuard, экспериментально${N}"
   echo -e "  ${C}autoxray warp coldtest${N} ${D}[--idle 200] [--site сайт]${N}  ${D}почему первый запрос после простоя медленный${N}"
   echo -e "  ${C}autoxray debug${N} on [минут]|show [сайт]|off   ${D}временный подробный лог (адреса видны, выключается сам)${N}"
   echo -e "  ${C}autoxray warp nightly${N} on|off  ${C}depth${N} quick|more|all  ${C}threshold${N} <мс>  ${C}rescan${N} now  ${C}hosts${N} <сайты>"
@@ -3632,6 +4111,9 @@ main() {
     rollback)     cmd_rollback "$@" ;;
     ipwatch)      need_root; locked cmd_ipwatch ;;
     report)       cmd_report "$@" ;;
+    route)        cmd_route "$@" ;;
+    torrent)      cmd_torrent "$@" ;;
+    sub)          cmd_sub "$@" ;;
     ips)          cmd_ips "$@" ;;
     unban)        cmd_unban "$@" ;;
     setup-cron)   cmd_setup_cron ;;

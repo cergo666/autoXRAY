@@ -37,6 +37,7 @@ L1=$(sed "s/@eu.test:443/@$EU_IP:443/" "$SHARED/bridge1.link")
 L2=$(sed "s/@eu.test:443/@$EU_IP:443/" "$SHARED/bridge2.link")
 autoxray init --domain "$DOMAIN" --fp chrome --xhttp-path ru4n8k --web "/var/www/$DOMAIN" --user anna --mode bridge \
     --node "$L1#DE-1" --node "$L2#DE-2" >/dev/null || fail "init bridge"
+autoxray node ca /tmp/ca/ca.pem >/dev/null && jq -e '.outbounds[] | select(.tag == "proxy-1") | .streamSettings.tlsSettings.certificates[0].usage == "verify"' /usr/local/etc/xray/config.json >/dev/null && pass "node ca: свой CA добавлен в проверку TLS узлов" || fail "node ca"
 check "RU render (xray -test с balancer и vlessRoute)" autoxray render
 check "xray -test принимает конфиг моста" xray run -test -c /usr/local/etc/xray/config.json
 check "nginx -t" nginx -t

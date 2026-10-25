@@ -9,6 +9,19 @@ WEB=/var/www/$DOMAIN
 echo "127.0.0.1 $DOMAIN" >> /etc/hosts
 export PATH=/opt/autoxray/tests/stubs:$PATH
 
+if [ "$scenario" = verify ]; then
+    step "install.sh: контрольные суммы релиза"
+    export PATH=/opt/autoxray/tests/stubs:$PATH
+    rm -rf /tmp/rel/v9.9.9; mkdir -p /tmp/rel/v9.9.9; cp -r /opt/autoxray/autoxray /opt/autoxray/templates /opt/autoxray/components /tmp/rel/v9.9.9/
+    (cd /tmp/rel/v9.9.9 && files=$(sed -n '/^RELEASE_FILES=(/,/)/p' autoxray | tr -d '()' | sed 's/^RELEASE_FILES=//' | tr ' ' '\n' | grep -E '^[A-Za-z0-9_./-]+$') && sha256sum $files > FILES.sha256)
+    echo '<!-- подмена -->' >> /tmp/rel/v9.9.9/templates/sub.html
+    AX_TG=n AX_FP=2 AX_USER=anna AX_WARP=n AUTOXRAY_REF=v9.9.9 AUTOXRAY_RAW=file:///tmp/rel AX_SUMS_BASE=file:///tmp/rel \
+        bash /opt/autoxray/install.sh vpn.test </dev/null >/tmp/install-tamper.log 2>&1 && fail "install.sh принял подменённый файл" \
+        || { grep -q 'не совпали' /tmp/install-tamper.log && pass "install.sh с подменённым файлом остановился" || { fail "install.sh: другая причина"; tail -n 8 /tmp/install-tamper.log; }; }
+    [ ! -e /usr/local/bin/autoxray ] && pass "при несовпадении сумм ничего не установлено" || fail "autoxray установлен несмотря на подмену"
+    finish; exit
+fi
+
 step "Окружение: сертификат (его «выпустит» заглушка acme.sh), цель"
 mkdir -p /var/lib/xray/cert /root/.acme.sh
 setup_tls "$DOMAIN"
@@ -43,7 +56,7 @@ check "xray и nginx запущены" bash -c 'pgrep -x xray && pgrep -x nginx'
 check "cron: учёт трафика, лимит IP, гео-данные" bash -c 'grep -q collect /etc/cron.d/autoxray && grep -q ipwatch /etc/cron.d/autoxray && grep -q geo-update /etc/cron.d/autoxray'
 [ "$(stat -c %a /var/lib/xray/cert/privkey.pem)" = 640 ] && pass "ключ TLS: права 640" || fail "права ключа: $(stat -c %a /var/lib/xray/cert/privkey.pem)"
 TOKEN=$(jq -r '.users[0].token' /etc/autoxray/state.json)
-check "подписка отдаётся" bash -c "curl -fsS --max-time 8 https://$DOMAIN/$TOKEN.json | jq -e 'length == 3'"
+check "подписка отдаётся (три протокола и «Авто»)" bash -c "curl -fsS --max-time 8 https://$DOMAIN/$TOKEN.json | jq -e 'length == 4'"
 check "страница пользователя" curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN.html" -o /dev/null
 
 if [ "$scenario" = migrate ]; then
@@ -56,7 +69,7 @@ fi
 
 step "Трафик через установленный сервер (RAW Vision)"
 curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN.json" -o "$WEB/sub-copy.json"
-jq '.[1] | .outbounds[0].settings.vnext[0].address = "127.0.0.1"' "$WEB/sub-copy.json" > /tmp/cl.json
+jq '.[1] | .outbounds[0].settings.vnext[0].address = "127.0.0.1" | .outbounds[0].streamSettings.tlsSettings.certificates = [{usage: "verify", certificateFile: "/tmp/ca/ca.pem"}]' "$WEB/sub-copy.json" > /tmp/cl.json
 client_start /tmp/cl.json && via_proxy ok.txt >/dev/null && pass "трафик идёт" || fail "трафик не идёт"
 client_stop
 

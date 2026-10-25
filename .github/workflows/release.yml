@@ -33,6 +33,11 @@ jobs:
           grep -q "^AX_REF_DEFAULT=\"${GITHUB_REF_NAME}\"" dist/install.sh
           cp autoxray dist/autoxray
           (cd dist && sha256sum install.sh autoxray > SHA256SUMS)
+          # суммы всех файлов, которые ставит установщик и обновление (список берётся из RELEASE_FILES в autoxray)
+          files=$(sed -n '/^RELEASE_FILES=(/,/)/p' autoxray | tr -d '()' | sed 's/^RELEASE_FILES=//' | tr ' ' '\n' | grep -E '^[A-Za-z0-9_./-]+$')
+          [ "$(echo "$files" | wc -l)" -ge 8 ]
+          sha256sum $files > dist/FILES.sha256
+          sha256sum -c dist/FILES.sha256
 
       - name: Заметки из CHANGELOG
         run: |

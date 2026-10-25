@@ -48,7 +48,11 @@ install_cli() {
 
 # Профиль i из подписки пользователя -> клиентский конфиг, адрес сервера заменён на $2 (DNS в тесте не нужен)
 client_cfg() { # токен индекс адрес
-    jq --argjson i "$2" --arg a "$3" '.[$i] | .outbounds[0].settings |= (if .vnext then .vnext[0].address = $a else .address = $a end)' \
+    # Xray 26.10 проверяет TLS по своим встроенным корням, а не по системным: тестовый CA добавляется как доверенный.
+    # Адрес сервера подменяется во всех исходящих профиля (у «Авто» их три).
+    jq --argjson i "$2" --arg a "$3" '.[$i] | .outbounds |= map(if (.tag | startswith("proxy")) then
+          (.settings |= (if .vnext then .vnext[0].address = $a else .address = $a end))
+          | .streamSettings.tlsSettings.certificates = [{usage: "verify", certificateFile: "/tmp/ca/ca.pem"}] else . end)' \
         "/var/www/$DOMAIN/$1.json"
 }
 
