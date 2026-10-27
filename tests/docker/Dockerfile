@@ -4,7 +4,7 @@ FROM nginx:1.28
 ARG XRAY_VERSION=v26.10.21
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends jq curl openssl ca-certificates unzip qrencode iproute2 procps python3 util-linux \
+ && apt-get install -y --no-install-recommends jq curl openssl ca-certificates unzip qrencode iproute2 procps python3 util-linux nftables \
  && rm -rf /var/lib/apt/lists/*
 
 # Xray с проверкой контрольной суммы из официального .dgst

@@ -444,6 +444,106 @@ ok_auto=0; for _ in $(seq 1 12); do curl -fsS --max-time 6 --socks5-hostname 127
 [ $ok_auto = 1 ] && pass "«Авто»: первый профиль не отвечает, клиент перешёл на рабочий" || fail "«Авто» не ушёл с неработающего профиля"
 client_stop
 
+step "Одна ссылка для любого приложения (формат по User-Agent)"
+ua_get() { curl -fsS --max-time 8 -A "$1" -D /tmp/hu.txt "https://$DOMAIN/$TOKEN_A"; }
+ua_get "Happ/2.3.1" | jq -e 'type == "array" and (.[0].outbounds | length) > 0' >/dev/null && pass "Happ получает Xray JSON" || fail "Happ: не JSON"
+grep -qi '^routing:' /tmp/hu.txt && pass "Happ получает и заголовок маршрутизации" || fail "у одной ссылки нет заголовка routing"
+ua_get "v2RayTun/5.20 (Android)" | jq -e 'type == "array"' >/dev/null && pass "v2RayTun получает Xray JSON" || fail "v2RayTun"
+ua_get "ClashMetaForAndroid/2.11" | jq -e '.proxies | length > 0' >/dev/null && pass "Clash Meta получает Clash" || fail "Clash Meta"
+ua_get "FlClash/v0.8.80 clash-verge Platform/android" | jq -e '."proxy-groups" | length > 0' >/dev/null && pass "FlClash получает Clash" || fail "FlClash"
+ua_get "SFA/1.11.4 (Android 14; sing-box 1.11.4)" | jq -e '.outbounds and .route' >/dev/null && pass "sing-box (SFA) получает sing-box" || fail "SFA"
+ua_get "singbox/1.12.9" | jq -e '[.outbounds[] | select(.type == "vless" or .type == "hysteria2")] | length > 0' >/dev/null && pass "NetShift (User-Agent singbox/<версия>) получает sing-box" || fail "NetShift"
+ua_get "HiddifyNext/2.5.7 (android) like ClashMeta v2ray sing-box" | base64 -d 2>/dev/null | grep -q '^vless://' && pass "Hiddify получает список ссылок (в нём есть XHTTP)" || fail "Hiddify"
+ua_get "v2rayNG/1.9.40" | base64 -d 2>/dev/null | grep -q '^hy2://' && pass "v2rayNG получает список ссылок" || fail "v2rayNG"
+ua_get "SomeNewApp/1.0" | base64 -d 2>/dev/null | grep -q '^vless://' && pass "неизвестное приложение получает список ссылок" || fail "неизвестное приложение"
+ua_get "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)" | grep -q '<html' && pass "браузер получает личную страницу" || fail "браузер"
+code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' -A Happ/2 "https://$DOMAIN/ZZZZZZZZZZZZZZZZZZZZZZZZ"); [ "$code" = 404 ] && pass "одна ссылка с чужим токеном -> 404" || fail "чужой токен одной ссылки: $code"
+curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.html" | grep -q "https://$DOMAIN/$TOKEN_A<" && pass "на личной странице одна ссылка" || fail "одна ссылка на странице"
+autoxray user link alice | sed 's/\x1b\[[0-9;]*m//g' | grep -q "https://$DOMAIN/$TOKEN_A\$" && pass "user link показывает одну ссылку" || fail "user link без одной ссылки"
+autoxray user qr alice sub >/dev/null 2>&1 && autoxray user qr alice json >/dev/null 2>&1 && pass "user qr sub и json" || fail "user qr sub/json"
+
+step "Заголовки для Happ: страница, пароль на локальный прокси, объявления, поддержка"
+curl -fsS --max-time 8 -D /tmp/hh.txt -o /dev/null "https://$DOMAIN/$TOKEN_A.json"
+grep -qi "^profile-web-page-url: https://$DOMAIN/$TOKEN_A.html" /tmp/hh.txt && pass "profile-web-page-url ведёт на личную страницу" || { fail "profile-web-page-url"; cat /tmp/hh.txt; }
+grep -qi '^socks-auth-mode: auto' /tmp/hh.txt && grep -qi '^http-auth-mode: auto' /tmp/hh.txt && pass "Happ: пароль на локальный SOCKS и HTTP" || fail "socks-auth-mode"
+grep -qi '^announce:' /tmp/hh.txt && fail "объявление без настройки" || pass "без объявления заголовка announce нет"
+grep -qi '^support-url:' /tmp/hh.txt && fail "support-url без настройки" || pass "без настройки кнопки поддержки нет"
+hdr() { curl -fsS --max-time 8 -D - -o /dev/null "https://$DOMAIN/$1" | tr -d '\r' | awk -v h="$2" 'tolower($1) == h":" {sub(/^[^:]*: /, ""); print}'; }
+ann() { local v; v=$(hdr "$1" announce); v=${v#base64:}; [ -n "$v" ] && printf '%s' "$v" | base64 -d; }
+autoxray sub announce "Плановые работы в субботу" >/dev/null
+wait_for bash -c "[ \"\$(curl -fsS --max-time 8 -D - -o /dev/null https://$DOMAIN/$TOKEN_A.yaml | tr -d '\r' | grep -ci '^announce: base64:')\" = 1 ]"
+[ "$(ann "$TOKEN_A.yaml")" = "Плановые работы в субботу" ] && pass "sub announce: общий текст в base64" || fail "sub announce: '$(ann "$TOKEN_A.yaml")'"
+autoxray sub announce "$(printf 'x%.0s' $(seq 1 201))" >/dev/null 2>&1 && fail "принято объявление длиннее 200" || pass "объявление длиннее 200 символов отклоняется"
+jq '.alice.down = ((.alice.down // 0) + 5000)' /etc/autoxray/traffic.json > /tmp/tr.json && cat /tmp/tr.json > /etc/autoxray/traffic.json
+autoxray user set alice --limit 0.000001 >/dev/null
+wait_for bash -c "curl -fsS --max-time 8 -D - -o /dev/null https://$DOMAIN/$TOKEN_A.json | grep -qi '^announce: base64:4puU'"
+[ "$(ann "$TOKEN_A.json")" = "⛔ Трафик закончился" ] && pass "у исчерпавшего лимит своё объявление вместо общего" || fail "объявление о лимите: '$(ann "$TOKEN_A.json")'"
+TOKEN_B=$(jq -r '.users[] | select(.name != "alice") | .token' /etc/autoxray/state.json | head -n1)
+[ -z "$TOKEN_B" ] || { [ "$(ann "$TOKEN_B.json")" = "Плановые работы в субботу" ] && pass "у остальных общее объявление" || fail "общее объявление у других"; }
+autoxray sub warn off >/dev/null
+wait_for bash -c "! curl -fsS --max-time 8 -D - -o /dev/null https://$DOMAIN/$TOKEN_A.json | grep -qi '^announce: base64:4puU'"
+[ "$(ann "$TOKEN_A.json")" = "Плановые работы в субботу" ] && pass "sub warn off: предупреждений нет" || fail "sub warn off"
+autoxray sub warn on >/dev/null; autoxray user set alice --limit 0 >/dev/null; autoxray sub announce off >/dev/null
+wait_for bash -c "! curl -fsS --max-time 8 -D - -o /dev/null https://$DOMAIN/$TOKEN_A.json | grep -qi '^announce:'" && pass "sub announce off убирает заголовок" || fail "announce остался"
+autoxray sub support @autoxray_help >/dev/null
+wait_for bash -c "curl -fsS --max-time 8 -D - -o /dev/null https://$DOMAIN/$TOKEN_A.txt | grep -qi '^support-url: https://t.me/autoxray_help'" && pass "sub support @имя: кнопка поддержки" || fail "support-url"
+autoxray sub support 'https://x.test/"; return 200' >/dev/null 2>&1 && fail "support принял опасный адрес" || pass "sub support отклоняет кавычки и пробелы"
+autoxray sub support off >/dev/null; check "nginx -t после настроек подписки" nginx -t
+autoxray sub | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'Предупреждения' && pass "sub показывает новые настройки" || fail "sub status"
+lp=$(jq -r '.users[] | select(.name == "alice") | .lpass' /etc/autoxray/state.json)
+[ ${#lp} = 16 ] && curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.sing" | jq -e --arg p "$lp" '.inbounds[0].users == [{username: "ax", password: $p}]' >/dev/null && pass "sing-box: локальный прокси с паролем" || fail "sing-box mixed без пароля"
+
+step "Устройства по HWID и их лимит"
+dev_get() { curl -s --max-time 8 -o /dev/null -w '%{http_code}' -A "Happ/2.3.1" -H "X-HWID: $1" -H "X-Device-OS: Android" -H "X-Ver-OS: 14" -H "X-Device-Model: ${2:-Pixel 8}" "https://$DOMAIN/$TOKEN_A"; }
+autoxray user set alice --devices 1 >/dev/null
+[ "$(dev_get dev-one)" = 200 ] && pass "первое устройство получает подписку" || fail "первое устройство"
+autoxray collect >/dev/null 2>&1
+jq -e '.alice["dev-one"] | .ok and .model == "Pixel 8" and .os == "Android"' /etc/autoxray/devices.json >/dev/null && pass "устройство записано: модель, ОС" || { fail "devices.json"; cat /etc/autoxray/devices.json; }
+grep -q "\"$TOKEN_A:dev-one\" 0;" /etc/nginx/autoxray-devices.map && grep -q "\"~^$TOKEN_A:.\" 1;" /etc/nginx/autoxray-devices.map && pass "map: известное разрешено, остальные запрещены" || { fail "devices map"; cat /etc/nginx/autoxray-devices.map; }
+wait_for bash -c "[ \"\$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' -H 'X-HWID: dev-two' https://$DOMAIN/$TOKEN_A.json)\" = 403 ]" && pass "второе устройство сверх лимита получает 403" || fail "лимит устройств не сработал"
+[ "$(dev_get dev-one)" = 200 ] && pass "первое устройство по-прежнему получает подписку" || fail "первое устройство после лимита"
+[ "$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' "https://$DOMAIN/$TOKEN_A.txt")" = 200 ] && pass "приложение без HWID не ограничивается" || fail "без HWID"
+dev_get dev-two "Galaxy S24" >/dev/null; autoxray collect >/dev/null 2>&1
+jq -e '.alice["dev-two"].ok == false' /etc/autoxray/devices.json >/dev/null && pass "отклонённое устройство записано как не допущенное" || fail "отклонённое устройство"
+autoxray user devices alice | sed 's/\x1b\[[0-9;]*m//g' > /tmp/dev.out
+grep -q 'Pixel 8' /tmp/dev.out && grep -q 'Galaxy S24.*не допущено\|не допущено.*Galaxy S24' /tmp/dev.out && pass "user devices: список с отклонёнными" || { fail "user devices"; cat /tmp/dev.out; }
+autoxray user devices alice del 1 >/dev/null
+wait_for bash -c "[ \"\$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' -H 'X-HWID: dev-two' https://$DOMAIN/$TOKEN_A.json)\" = 200 ]" && pass "после удаления старого новое устройство получает подписку" || fail "место в лимите не освободилось"
+autoxray collect >/dev/null 2>&1
+jq -e '(.alice | keys) == ["dev-two"] and .alice["dev-two"].ok' /etc/autoxray/devices.json >/dev/null && pass "новое устройство допущено" || { fail "новое устройство"; cat /etc/autoxray/devices.json; }
+autoxray user set alice --devices 0 >/dev/null
+[ ! -s /etc/nginx/autoxray-devices.map ] && pass "без лимита map пустой" || fail "map без лимита"
+autoxray user devices alice del all >/dev/null; jq -e 'has("alice") | not' /etc/autoxray/devices.json >/dev/null && pass "user devices del all" || fail "del all"
+
+step "Hysteria2 меняет порты (port hopping)"
+autoxray hop on 20000-20010 >/dev/null && nft list table inet autoxray_hop >/dev/null 2>&1 && pass "hop on: правила nftables стоят" || fail "hop on"
+autoxray hop on 400-500 >/dev/null 2>&1 && fail "hop принял диапазон с 443" || pass "hop отклоняет неверный диапазон"
+curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.json" -o /tmp/hop.json
+jq -e '[.[] | .outbounds[] | select(.protocol == "hysteria") | .streamSettings.finalmask.udp[0]] | length >= 2 and all(.type == "udphop" and .settings.remotePorts == "20000-20010")' /tmp/hop.json >/dev/null && pass "Xray JSON: udphop в Hysteria2 и «Авто»" || { fail "udphop в JSON"; jq -c '.[2].outbounds[0].streamSettings' /tmp/hop.json; }
+curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.yaml" | jq -e '.proxies[] | select(.type == "hysteria2") | .ports == "20000-20010" and ."hop-interval" == 30' >/dev/null && pass "Clash: ports и hop-interval" || fail "Clash hop"
+curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.sing" | jq -e '.outbounds[] | select(.type == "hysteria2") | .server_ports == ["20000:20010"]' >/dev/null && pass "sing-box: server_ports" || fail "sing-box hop"
+autoxray user link alice --plain | grep -q 'hy2://.*mport=20000-20010' && pass "ссылка hy2 с mport" || fail "mport в ссылке"
+jq '.[2] | .outbounds |= map(if .tag == "proxy" then .settings.address = "127.0.0.1" | .streamSettings.tlsSettings.certificates = [{usage: "verify", certificateFile: "/tmp/ca/ca.pem"}] else . end)' /tmp/hop.json > /tmp/client-hop.json
+check "клиентский Xray принимает конфиг с udphop" xray run -test -c /tmp/client-hop.json
+nft reset counters table inet autoxray_hop >/dev/null 2>&1
+if client_start /tmp/client-hop.json; then
+  out=$(via_proxy ok.txt 2>&1); [ "$out" = TARGET-OK ] && pass "Hysteria2 со сменой портов: трафик идёт" || { fail "трафик с udphop: $out"; tail -n 8 /tmp/client.out; }
+  pk=$(nft -j list table inet autoxray_hop | jq '[.nftables[] | .rule? | select(. != null) | .expr[] | .counter? | select(. != null) | .packets] | add')
+  [ "${pk:-0}" -gt 0 ] && pass "пакеты шли на порты диапазона ($pk)" || fail "счётчик перенаправления пуст"
+else fail "клиент с udphop не стартовал"; fi
+client_stop
+# смена порта посреди работы: интервал 5 с (минимум Xray), трафик ~16 с, каждый переход виден в счётчике как новый поток
+jq '.outbounds[0].streamSettings.finalmask.udp[0].settings.interval = "5"' /tmp/client-hop.json > /tmp/client-hop5.json
+nft reset counters table inet autoxray_hop >/dev/null 2>&1
+if client_start /tmp/client-hop5.json; then
+  okn=0; for _ in $(seq 1 8); do via_proxy ok.txt 2>/dev/null | grep -q TARGET-OK && okn=$((okn + 1)); sleep 2; done
+  pk=$(nft -j list table inet autoxray_hop | jq '[.nftables[] | .rule? | select(. != null) | .expr[] | .counter? | select(. != null) | .packets] | add')
+  [ "$okn" = 8 ] && [ "${pk:-0}" -ge 3 ] && pass "соединение переживает смену порта (переходов: $pk, запросов: $okn/8)" || { fail "смена порта: переходов $pk, запросов $okn/8"; tail -n 8 /tmp/client.out; }
+else fail "клиент с интервалом 5 с не стартовал"; fi
+client_stop
+autoxray hop off >/dev/null; ! nft list table inet autoxray_hop >/dev/null 2>&1 && pass "hop off: правила сняты" || fail "hop off"
+curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.json" | jq -e '[.[] | .outbounds[] | select(.protocol == "hysteria") | .streamSettings.finalmask.udp] | all(. == null)' >/dev/null && pass "hop off: udphop убран из подписки" || fail "udphop остался"
+
 step "Свои маршруты, скрытие профилей, строка статуса, метки"
 autoxray route add direct Example.ORG https://site.test/page 203.0.113.0/24 >/dev/null && autoxray route add proxy habr.test >/dev/null && autoxray route add block ads.test >/dev/null && pass "route add принимает домены, адреса страниц и сети" || fail "route add"
 autoxray route add direct 'bad domain' >/dev/null 2>&1 && fail "route add принял мусор" || pass "route add отклоняет неверный ввод"
@@ -619,6 +719,14 @@ tgmsg 666 "/start $CODE"; sent_to 666 "недействительно" && pass "
 tgmsg 555 "/me"; sent_to 555 "Использовано" && pass "клиент видит свой трафик и срок" || fail "/me клиента"
 tgmsg 555 "/link"; sent_to 555 "vless://" && pass "клиент получает свои ссылки" || fail "/link клиента"
 tgcb 555 "c:qr"; sent_method sendPhoto && pass "кнопка QR у клиента" || fail "QR клиента"
+# устройства: клиент видит свои и удаляет; удалить чужое через u:...:devdel он не может
+echo '{"alice":{"hw-a":{"os":"iOS","ver":"18","model":"iPhone 15","app":"Happ/2","ip":"1.2.3.4","first":1,"last":9999999999,"ok":true},"hw-b":{"os":"Android","ver":"14","model":"Pixel 8","app":"Happ/2","ip":"1.2.3.5","first":2,"last":9999999999,"ok":true}}}' > /etc/autoxray/devices.json
+tgmsg 555 "/devices"; sent_to 555 "Устройства alice[\s\S]*iPhone 15[\s\S]*Pixel 8" && pass "клиент видит свои устройства" || fail "/devices клиента"
+tgcb 555 "u:alice:devdel:1"; tg_sync; jq -e '.alice | has("hw-a")' /etc/autoxray/devices.json >/dev/null && pass "админская кнопка удаления устройства клиентом не работает" || fail "клиент удалил устройство админской кнопкой"
+tgcb 555 "c:devdel:1"; tg_sync; jq -e '(.alice | keys) == ["hw-b"]' /etc/autoxray/devices.json >/dev/null && pass "клиент удаляет своё устройство" || fail "удаление устройства клиентом: $(jq -c . /etc/autoxray/devices.json)"
+tgmsg 111 "/devices alice 2"; tg_sync; jq -e '.users[] | select(.name == "alice") | .devices == 2' /etc/autoxray/state.json >/dev/null && sent_has "лимит: 2" && pass "/devices имя N у администратора задаёт лимит" || fail "/devices администратора"
+tgcb 111 "u:alice:devlim:0"; tg_sync; jq -e '.users[] | select(.name == "alice") | .devices == 0' /etc/autoxray/state.json >/dev/null && pass "кнопка «∞» снимает лимит устройств" || fail "devlim"
+echo '{}' > /etc/autoxray/devices.json
 tgmsg 555 "/users"; tgmsg 555 "/del alice"; tgmsg 555 "/add hacker"; tg_sync
 [ "$(jq -s '[.[] | select(.method == "sendMessage" and .payload.chat_id == 555 and ((.payload.text // "") | test("Пользователи|создан")))] | length' "$TG/sent.jsonl")" = 0 ] && jq -e '.users[] | select(.name == "alice")' /etc/autoxray/state.json >/dev/null && ! jq -e '.users[] | select(.name == "hacker")' /etc/autoxray/state.json >/dev/null && pass "клиент не может управлять сервером (/users, /del, /add игнорируются)" || fail "клиент получил админские права"
 tgcb 555 "u:alice:del"; tgcb 555 "u:alice:delok"; tg_sync; jq -e '.users[] | select(.name == "alice")' /etc/autoxray/state.json >/dev/null && pass "админские кнопки клиентом не работают" || fail "клиент удалил пользователя кнопкой"
