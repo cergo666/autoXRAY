@@ -9,7 +9,7 @@ set -uo pipefail
 # bash >= 5.2: '&' в замене ${var//a/b} — спецсимвол; ссылки содержат '&'
 shopt -u patsub_replacement 2>/dev/null || true
 
-AX_VERSION="3.14.1"
+AX_VERSION="3.14.2"
 AX_REPO="cergo666/autoXRAY"
 XRAY_TESTED="v26.10.31"          # версия ядра, с которой этот релиз проверен тестами
 API="${AX_API:-https://api.github.com}"
@@ -458,6 +458,53 @@ xray_group() {
   id -gn "$u" 2>/dev/null || echo ""
 }
 
+# Официальный установщик Xray может переключить службу на xray, оставив старые
+# каталоги/ключи нечитаемыми для неё. Приводим только нужные пути к безопасным
+# правам: секреты остаются root-owned и доступны группе службы.
+ensure_xray_runtime_access() {
+  local g dir f mode owner expected changed=0
+  g=$(xray_group)
+  [[ -n $g ]] || return 1
+
+  if [[ -e /usr/local/bin/xray ]]; then
+    owner=$(stat -c %U:%G /usr/local/bin/xray 2>/dev/null || true)
+    mode=$(stat -c %a /usr/local/bin/xray 2>/dev/null || true)
+    [[ $owner == root:root ]] || { chown root:root /usr/local/bin/xray 2>/dev/null || return 1; changed=1; }
+    [[ $mode == 755 ]] || { chmod 755 /usr/local/bin/xray 2>/dev/null || return 1; changed=1; }
+  fi
+
+  dir=$(dirname "$XRAY_CFG")
+  if [[ -d $dir ]]; then
+    owner=$(stat -c %U:%G "$dir" 2>/dev/null || true)
+    mode=$(stat -c %a "$dir" 2>/dev/null || true)
+    [[ $owner == root:$g ]] || { chown "root:$g" "$dir" 2>/dev/null || return 1; changed=1; }
+    [[ $mode == 750 ]] || { chmod 750 "$dir" 2>/dev/null || return 1; changed=1; }
+  fi
+  if [[ -f $XRAY_CFG ]]; then
+    owner=$(stat -c %U:%G "$XRAY_CFG" 2>/dev/null || true)
+    mode=$(stat -c %a "$XRAY_CFG" 2>/dev/null || true)
+    [[ $owner == root:$g ]] || { chown "root:$g" "$XRAY_CFG" 2>/dev/null || return 1; changed=1; }
+    [[ $mode == 640 ]] || { chmod 640 "$XRAY_CFG" 2>/dev/null || return 1; changed=1; }
+  fi
+
+  for dir in /var/lib/xray /var/lib/xray/cert; do
+    [[ -d $dir ]] || continue
+    owner=$(stat -c %U:%G "$dir" 2>/dev/null || true)
+    mode=$(stat -c %a "$dir" 2>/dev/null || true)
+    [[ $owner == root:$g ]] || { chown "root:$g" "$dir" 2>/dev/null || return 1; changed=1; }
+    [[ $mode == 750 ]] || { chmod 750 "$dir" 2>/dev/null || return 1; changed=1; }
+  done
+  for f in /var/lib/xray/cert/privkey.pem /var/lib/xray/cert/fullchain.pem; do
+    [[ -f $f ]] || continue
+    expected=640; [[ $f == */fullchain.pem ]] && expected=644
+    owner=$(stat -c %U:%G "$f" 2>/dev/null || true)
+    mode=$(stat -c %a "$f" 2>/dev/null || true)
+    [[ $owner == root:$g ]] || { chown "root:$g" "$f" 2>/dev/null || return 1; changed=1; }
+    [[ $mode == "$expected" ]] || { chmod "$expected" "$f" 2>/dev/null || return 1; changed=1; }
+  done
+  AX_RUNTIME_PERMS_CHANGED=$changed
+}
+
 # Журналы обязан открывать пользователь службы, не root.
 # Обнуление из cron (`: > файл`) создаёт файл от root. При маске 077 он получается 600,
 # и включение журнала доступа (отчёт, лимит IP, торренты, debug) роняет Xray:
@@ -495,7 +542,8 @@ heal_xray_logs() {
     done
   fi
   ensure_xray_logs
-  [[ $mismatch == 1 && $(systemctl is-failed xray 2>/dev/null || true) == failed ]] || return 0
+  ensure_xray_runtime_access || true
+  [[ ( $mismatch == 1 || ${AX_RUNTIME_PERMS_CHANGED:-0} == 1 ) && $(systemctl is-failed xray 2>/dev/null || true) == failed ]] || return 0
   svc restart xray
 }
 
@@ -516,7 +564,10 @@ apply_xray() {
   [[ -f $XRAY_CFG ]] && cp -p "$XRAY_CFG" "$XRAY_CFG.bak"
   mkdir -p "$(dirname "$XRAY_CFG")"
   cat "$new" >"$XRAY_CFG"; rm -f "$new"
-  [[ $DRY != 1 ]] && ensure_xray_logs
+  if [[ $DRY != 1 ]]; then
+    ensure_xray_logs
+    ensure_xray_runtime_access || rc=1
+  fi
   grp=$([[ $DRY == 1 ]] && echo "" || xray_group)
   if [[ -n $grp ]]; then chown "root:$grp" "$XRAY_CFG"; chmod 640 "$XRAY_CFG"; else chmod 644 "$XRAY_CFG"; fi
   svc restart xray || rc=1
@@ -3103,16 +3154,21 @@ cmd_core() {
       core_is_pre "$v" && echo -e "\n ${BOLD}${RED}🧪 $v это пререлиз.${NC} ${DIM}Он может содержать ошибки и менять поведение. Для постоянной работы выбирайте стабильные версии.${NC}"
       echo -e "\n Сейчас: ${BOLD}${prev:-?}${NC}  →  будет установлена: ${BOLD}$v${NC}"
       if [[ $yes != 1 ]]; then read -rp "$(echo -e " ${BOLD}Продолжить? Введите yes:${NC} ")" a; [[ $a == yes ]] || die "Отменено."; fi
-      xray_installer install --version "$v" \
-        || die "Установка ядра $v не удалась."
+      local install_rc=0
+      xray_installer install --version "$v" || install_rc=$?
       [[ $(xray_version) == "$v" ]] || die "После установки ядро сообщает версию $(xray_version), а не $v. Проверьте вывод установщика выше."
-      if ! xray run -test -c "$XRAY_CFG" >/dev/null 2>&1; then
+      ensure_xray_runtime_access || die "Ядро $v установлено, но не удалось настроить права для службы xray. Проверьте владельца и режимы /usr/local/etc/xray и /var/lib/xray/cert."
+      local runtime_user; runtime_user=$(xray_runtime_user) || die "Не удалось определить пользователя службы xray."
+      if ! runuser -u "$runtime_user" -- /usr/local/bin/xray run -test -c "$XRAY_CFG" >/dev/null 2>&1; then
         warn "Текущий конфиг не проходит проверку на $v. Возвращаю $prev."
         [[ -n $prev ]] && xray_installer install --version "$prev"
+        ensure_xray_runtime_access || true
         svc restart xray; die "Обновление отменено: $v несовместима с вашим конфигом."
       fi
       st_edit --arg v "$v" '.xray_version = $v'
-      svc restart xray; ok "✅ Ядро обновлено: $prev → $v" ;;
+      svc restart xray || die "Ядро $v установлено, но Xray не запустился после исправления прав. Проверьте: journalctl -u xray -n 30 --no-pager"
+      [[ $install_rc == 0 ]] || warn "Установщик сообщил об ошибке запуска до исправления прав; ядро $v проверено и служба запущена успешно."
+      ok "✅ Ядро обновлено: $prev → $v" ;;
     *) die "core: list | update [версия] [--yes]" ;;
   esac
 }
