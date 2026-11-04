@@ -2,26 +2,20 @@
 # === Telegram Web Proxy (TeleMT Classic + tproxy-server) ===
 # Подключается через `source` из install.sh и ожидает переменные окружения:
 # DOMAIN, WEB_PATH, socksUser, socksPasw и цвета GRN/YEL/RED/NC. Экспортирует MTProto (tg://-ссылка).
+# shellcheck source=components/telegram/artifacts.sh
+source "$(dirname "${BASH_SOURCE[0]}")/artifacts.sh"
 echo -e "\n${GRN}=== Установка бэкенда TeleMT и Web Proxy шлюза ===${NC}"
-
-# Останавливаем старые службы, если были
-systemctl stop telemt tproxy-server 2>/dev/null || true
 
 # Генерируем 16-байтный (32 hex) секрет для Web Proxy
 SECRET=$(openssl rand -hex 16)
 
 # 1. Установка TeleMT (бэкенд на 127.0.0.1:9000 в Classic MTProto режиме)
-echo -e "${GRN}[1/4] Загрузка TeleMT...${NC}"
-ARCH_TYPE=$(uname -m)
-LIBC_TYPE=$(ldd --version 2>&1 | grep -iq musl && echo musl || echo gnu)
-
-rm -f /tmp/telemt
-curl -fsSL --retry 2 "https://github.com/telemt/telemt/releases/latest/download/telemt-${ARCH_TYPE}-linux-${LIBC_TYPE}.tar.gz" | tar -xz -C /tmp \
-    || { echo -e "${RED}❌ Ошибка скачивания TeleMT${NC}"; exit 1; }
-
-[ -f /tmp/telemt ] || { echo -e "${RED}❌ Бинарник TeleMT не найден в архиве${NC}"; exit 1; }
-mv -f /tmp/telemt /usr/local/bin/telemt
-chmod +x /usr/local/bin/telemt
+echo -e "${GRN}[1/4] Загрузка TeleMT $TELEMT_VERSION с проверкой SHA-256...${NC}"
+TELEMT_TMP=$(mktemp -d) || { echo -e "${RED}❌ Не удалось создать временный каталог${NC}"; exit 1; }
+telegram_install_telemt "$TELEMT_TMP/telemt" || { rm -rf "$TELEMT_TMP"; echo -e "${RED}❌ Проверка/установка TeleMT не прошла${NC}"; exit 1; }
+systemctl stop telemt 2>/dev/null || true
+mv -f "$TELEMT_TMP/telemt" /usr/local/bin/telemt
+rm -rf "$TELEMT_TMP"
 
 mkdir -p /etc/telemt /opt/telemt
 
@@ -116,17 +110,17 @@ rm -f /tmp/go.tgz
 
 [ -x /opt/go/bin/go ] || { echo -e "${RED}❌ Не удалось развернуть Go тулчейн${NC}"; exit 1; }
 
-# Скачивание исходников tproxy-server
-curl -fsSL --retry 2 "https://github.com/telegramdesktop/tproxy-server/archive/refs/heads/master.tar.gz" \
-    | tar -xz -C /tmp/tproxy-source --strip-components=1 \
-    || { echo -e "${RED}❌ Ошибка скачивания исходников tproxy-server${NC}"; exit 1; }
+# Скачивание закреплённого commit tproxy-server с проверкой SHA-256
+telegram_extract_tproxy_source /tmp/tproxy-source \
+    || { echo -e "${RED}❌ Проверка/распаковка исходников tproxy-server не прошла${NC}"; exit 1; }
 
 # Статическая компиляция
 cd /tmp/tproxy-source || exit 1
-CGO_ENABLED=0 /opt/go/bin/go build -trimpath -ldflags="-s -w" -o /usr/local/bin/tproxy-server ./cmd/tproxy-server \
+CGO_ENABLED=0 /opt/go/bin/go build -trimpath -ldflags="-s -w" -o /tmp/tproxy-source/tproxy-server.new ./cmd/tproxy-server \
     || { echo -e "${RED}❌ Ошибка сборки tproxy-server${NC}"; exit 1; }
 
-chmod +x /usr/local/bin/tproxy-server
+systemctl stop tproxy-server 2>/dev/null || true
+install -m 755 /tmp/tproxy-source/tproxy-server.new /usr/local/bin/tproxy-server
 
 # Чистим временные файлы компиляции
 rm -rf /tmp/tproxy-source /opt/go

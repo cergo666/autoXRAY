@@ -4,8 +4,10 @@ FROM nginx:1.28
 ARG XRAY_VERSION=v26.10.31
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends jq curl openssl ca-certificates unzip qrencode iproute2 procps python3 util-linux nftables \
+ && apt-get install -y --no-install-recommends jq curl openssl ca-certificates unzip qrencode iproute2 procps python3 util-linux nftables git openssh-client \
  && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --system xray && useradd --system --gid xray --home-dir /var/lib/xray --no-create-home --shell /usr/sbin/nologin xray
 
 # Xray с проверкой контрольной суммы из официального .dgst
 RUN set -eux; \

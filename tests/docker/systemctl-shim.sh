@@ -4,9 +4,17 @@ XRAY_PID=/run/xray-server.pid
 
 xray_stop()  { [ -f $XRAY_PID ] && kill "$(cat $XRAY_PID)" 2>/dev/null; rm -f $XRAY_PID; sleep 0.3; }
 xray_start() {
-    nohup setsid xray run -c /usr/local/etc/xray/config.json >>/var/log/xray/server.out 2>&1 9>&- &
+    if [ "${AX_XRAY_USER:-root}" = root ]; then
+        nohup setsid xray run -c /usr/local/etc/xray/config.json >>/var/log/xray/server.out 2>&1 9>&- &
+    else
+        nohup setsid runuser -u "$AX_XRAY_USER" -- xray run -c /usr/local/etc/xray/config.json >>/var/log/xray/server.out 2>&1 9>&- &
+    fi
     echo $! > $XRAY_PID
-    for _ in $(seq 1 30); do ss -ltn 2>/dev/null | grep -q ':443 ' && return 0; sleep 0.2; done
+    for _ in $(seq 1 30); do
+        if ss -ltn 2>/dev/null | grep -q ':443 '; then rm -f /run/xray-failed; return 0; fi
+        sleep 0.2
+    done
+    : > /run/xray-failed
     echo "shim: xray не поднялся, лог:" >&2; tail -n 20 /var/log/xray/server.out >&2; return 1
 }
 nginx_running() { [ -f /run/nginx.pid ] && kill -0 "$(cat /run/nginx.pid)" 2>/dev/null; }
@@ -21,6 +29,7 @@ case $cmd in
             User) printf '%s\n' "${AX_XRAY_USER:-root}" ;;
             *) printf '%s\n' root ;;
         esac ;;
+    is-failed) svc=${*: -1}; [ "$svc" = xray ] && [ -e /run/xray-failed ] && { echo failed; exit 0; }; echo active ;;
     is-active) svc=${*: -1}; case $svc in xray) [ -f $XRAY_PID ] && kill -0 "$(cat $XRAY_PID)" 2>/dev/null ;; nginx) nginx_running ;; autoxray-bot) [ -f /run/bot.active ] ;; *) false ;; esac ;;
     restart|start|reload|stop)
         for svc in "$@"; do

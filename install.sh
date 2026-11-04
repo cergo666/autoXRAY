@@ -17,7 +17,7 @@ BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
 
-AX_RELEASE="3.14.2"
+AX_RELEASE="3.14.3"
 AX_REF_DEFAULT="main"   # при выпуске релиза заменяется на тег (см. .github/workflows/release.yml)
 AX_REF="${AUTOXRAY_REF:-$AX_REF_DEFAULT}"
 RAW="${AUTOXRAY_RAW:-https://raw.githubusercontent.com/cergo666/autoXRAY}/$AX_REF"
@@ -75,11 +75,20 @@ KEYRING_PKG=$([ "$ID" = "ubuntu" ] && echo "ubuntu-keyring" || echo "debian-arch
 
 echo -e "${YEL}Подготовка официального репозитория Nginx для $ID ($VERSION_CODENAME)...${NC}"
 apt-get update || die "apt-get update не выполнен"
-apt-get install -y curl gnupg2 ca-certificates lsb-release "$KEYRING_PKG" jq dnsutils openssl wget tar socat cron gettext-base qrencode util-linux \
+apt-get install -y curl gnupg2 ca-certificates lsb-release "$KEYRING_PKG" jq dnsutils openssl wget tar socat cron gettext-base qrencode util-linux git openssh-client \
     || die "Не удалось установить зависимости"
 
-curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor --yes -o /usr/share/keyrings/nginx-archive-keyring.gpg \
+NGINX_KEY_TMP=$(mktemp)
+curl -fsSL --retry 2 https://nginx.org/keys/nginx_signing.key -o "$NGINX_KEY_TMP" \
     || die "Не удалось получить ключ nginx.org"
+NGINX_KEY_FINGERPRINT="573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62"
+gpg --show-keys --with-colons "$NGINX_KEY_TMP" 2>/dev/null \
+    | awk -F: '$1 == "fpr" { print toupper($10) }' \
+    | grep -qx "$NGINX_KEY_FINGERPRINT" \
+    || die "Отпечаток ключа nginx.org не совпал с опубликованным: ключ не установлен."
+gpg --dearmor --yes -o /usr/share/keyrings/nginx-archive-keyring.gpg "$NGINX_KEY_TMP" \
+    || die "Не удалось преобразовать ключ nginx.org"
+rm -f "$NGINX_KEY_TMP"
 
 echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/$ID $VERSION_CODENAME nginx" \
     | tee /etc/apt/sources.list.d/nginx.list >/dev/null
@@ -202,7 +211,7 @@ echo -e "${GRN}Лимиты применены. Текущий ulimit -n: $(ulim
 # ==========================================
 echo -e "${YEL}Устанавливаем autoxray...${NC}"
 RELEASE_FILES=(autoxray templates/sub.html templates/nginx.conf templates/report.html templates/gen_page.sh
-               components/telegram/install.sh components/telegram/update.sh components/telegram/uninstall.sh)
+               components/telegram/install.sh components/telegram/update.sh components/telegram/uninstall.sh components/telegram/artifacts.sh)
 STAGE=$(mktemp -d)
 for t in "${RELEASE_FILES[@]}"; do
     mkdir -p "$STAGE/$(dirname "$t")"
@@ -265,10 +274,14 @@ bash "$STAGE/templates/gen_page.sh" "$WEB_PATH" "$AUTH_PATH" || echo -e "${YEL}�
 # ==========================================
 # Xray
 # ==========================================
-# установщик скачивается в файл (сбой загрузки не должен выглядеть как успех); без TERM он падает на вызове tput
+# Установщик Xray закреплён на commit и SHA-256 проверяется перед запуском.
 XRAY_INSTALLER=$(mktemp)
-curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$XRAY_INSTALLER" && [ -s "$XRAY_INSTALLER" ] \
+XRAY_INSTALLER_URL="${AX_XRAY_INSTALLER:-https://raw.githubusercontent.com/XTLS/Xray-install/04e6f3bd9534811ed901a48c47b2c042dd64eb3a/install-release.sh}"
+XRAY_INSTALLER_SHA256="${AX_XRAY_INSTALLER_SHA256:-934ecb26ded1089f849ac238d5170f1159fe4b6ca300d4f1e67730bd41fe58cf}"
+curl -fsSL --retry 2 "$XRAY_INSTALLER_URL" -o "$XRAY_INSTALLER" && [ -s "$XRAY_INSTALLER" ] \
     || die "Не удалось скачать установщик Xray (GitHub недоступен?)"
+printf '%s  %s\n' "$XRAY_INSTALLER_SHA256" "$XRAY_INSTALLER" | sha256sum -c --quiet - \
+    || die "SHA-256 установщика Xray не совпал; выполнение остановлено."
 [[ -z "$TERM" || "$TERM" == dumb ]] && export TERM=xterm
 bash "$XRAY_INSTALLER" install --version "$XRAY_VERSION" || die "Не удалось установить Xray $XRAY_VERSION"
 rm -f "$XRAY_INSTALLER"
@@ -301,12 +314,28 @@ mkdir -p /var/lib/xray/cert/
 ACME_BIN="$HOME/.acme.sh/acme.sh"
 
 if [ ! -f "$ACME_BIN" ]; then
-    echo -e "${YEL}Установка acme.sh...${NC}"
-    curl -fsSL --connect-timeout 10 https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh | sh -s -- --install-online -m "mail@$DOMAIN"
-    if [ ! -f "$ACME_BIN" ]; then
-        echo -e "${YEL}Попытка через get.acme.sh...${NC}"
-        curl -fsSL --connect-timeout 10 https://get.acme.sh | sh -s email="mail@$DOMAIN"
-    fi
+    echo -e "${YEL}Установка проверенного выпуска acme.sh...${NC}"
+    ACME_VERSION="3.1.6"
+    ACME_TAG_OBJECT_SHA="c6e7807f8e2573bf8b02b71da186b4022afafa56"
+    ACME_TMP=$(mktemp -d)
+    ACME_REPO="$ACME_TMP/repo"
+    mkdir -p "$ACME_REPO" "$ACME_TMP/source"
+    git -C "$ACME_REPO" init -q \
+        && git -C "$ACME_REPO" remote add origin https://github.com/acmesh-official/acme.sh.git \
+        && git -C "$ACME_REPO" fetch -q --depth=1 origin "refs/tags/$ACME_VERSION:refs/tags/$ACME_VERSION" \
+        || die "Не удалось получить выпуск acme.sh $ACME_VERSION"
+    [[ $(git -C "$ACME_REPO" rev-parse "refs/tags/$ACME_VERSION") == "$ACME_TAG_OBJECT_SHA" ]] \
+        || die "Объект тега acme.sh $ACME_VERSION не совпал с закреплённым SHA"
+    cat > "$ACME_TMP/allowed_signers" <<'SIGNERS'
+github@neilpang.com namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBTjI0HBJn3uhfT2DsNcFybfAZi3ADbIacMpz1BItKdB
+SIGNERS
+    git -C "$ACME_REPO" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$ACME_TMP/allowed_signers" verify-tag "$ACME_VERSION" \
+        || die "Подпись выпуска acme.sh $ACME_VERSION не прошла проверку"
+    git -C "$ACME_REPO" archive "$ACME_VERSION" | tar -x -C "$ACME_TMP/source" \
+        || die "Не удалось распаковать проверенный выпуск acme.sh"
+    (cd "$ACME_TMP/source" && sh ./acme.sh --install -m "mail@$DOMAIN" --auto-upgrade 0) \
+        || die "Не удалось установить проверенный выпуск acme.sh"
+    rm -rf "$ACME_TMP"
 fi
 [ -f "$ACME_BIN" ] || die "Не удалось установить acme.sh!"
 

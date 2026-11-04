@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Запуск e2e в Docker:  tests/run.sh [direct|bridge|install|all]   (по умолчанию all)
+# Запуск проверок в Docker: tests/run.sh [direct|bridge|install|supply-chain|all] (по умолчанию all)
 # Наборы независимы (каждый в своём контейнере), поэтому `all` запускает их параллельно и печатает журналы по очереди.
 # AX_SERIAL=1 — по одному, с выводом в реальном времени.
 set -euo pipefail
@@ -18,6 +18,7 @@ suite() { # имя -> запуск набора
     fresh)   run "e2e-install.sh fresh" ;;
     migrate) run "e2e-install.sh migrate" ;;
     verify)  run "e2e-install.sh verify" ;;
+    supply-chain) run e2e-supply-chain.sh ;;
   esac
 }
 
@@ -25,8 +26,9 @@ case "${1:-all}" in
   direct)  suites=(direct) ;;
   bridge)  suites=(bridge) ;;
   install) suites=(fresh migrate verify) ;;
-  all)     suites=(direct bridge fresh migrate verify) ;;
-  *) echo "usage: $0 [direct|bridge|install|all]"; exit 2 ;;
+  supply-chain) suites=(supply-chain) ;;
+  all)     suites=(direct bridge fresh migrate verify supply-chain) ;;
+  *) echo "usage: $0 [direct|bridge|install|supply-chain|all]"; exit 2 ;;
 esac
 
 if [[ ${AX_SERIAL:-0} == 1 || ${#suites[@]} -eq 1 ]]; then

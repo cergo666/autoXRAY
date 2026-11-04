@@ -400,6 +400,40 @@ AX_API=file:///tmp/api autoxray core list 2>&1 | sed 's/\x1b\[[0-9;]*m//g' > /tm
 grep -q 'v99.1.0' /tmp/core.out && grep -q 'v100.0.0.*пререлиз' /tmp/core.out && ! grep -q 'v99.1.0.*пререлиз' /tmp/core.out && pass "core list: новее текущей, пререлиз помечен" || { fail "core list"; cat /tmp/core.out; }
 grep -q 'лучше не обновлять без необходимости' /tmp/core.out && pass "предупреждение об обновлении ядра" || fail "нет предупреждения"
 printf 'no\n' | autoxray core update v26.10.21 >/tmp/core-up.out 2>&1; grep -q 'Отменено' /tmp/core-up.out && pass "core update без подтверждения отменяется" || { fail "core update не спросил"; cat /tmp/core-up.out; }
+
+step "core update: переживает ошибку первого запуска, чинит права и запускает Xray как xray"
+mkdir -p /tmp/ax-api/repos/XTLS/Xray-core; printf '[]\n' > /tmp/ax-api/repos/XTLS/Xray-core/releases
+cat > /tmp/xray-installer-permissions-test.sh <<'INSTALLER'
+#!/bin/bash
+chmod 600 /usr/local/bin/xray
+chown root:root /usr/local/etc/xray /var/lib/xray /var/lib/xray/cert
+chmod 700 /usr/local/etc/xray /var/lib/xray /var/lib/xray/cert
+chown root:root /usr/local/etc/xray/config.json /var/lib/xray/cert/privkey.pem /var/lib/xray/cert/fullchain.pem
+chmod 600 /usr/local/etc/xray/config.json /var/lib/xray/cert/privkey.pem /var/lib/xray/cert/fullchain.pem
+systemctl restart xray >/dev/null 2>&1 || true
+exit 23
+INSTALLER
+fake_installer_sha=$(sha256sum /tmp/xray-installer-permissions-test.sh | cut -d' ' -f1)
+if AX_XRAY_USER=xray AX_API=file:///tmp/ax-api AX_XRAY_INSTALLER=file:///tmp/xray-installer-permissions-test.sh AX_XRAY_INSTALLER_SHA256="$fake_installer_sha" \
+    autoxray core update v26.10.31 --yes >/tmp/core-update-permissions.log 2>&1; then
+    grep -q 'Установщик сообщил об ошибке запуска до исправления прав' /tmp/core-update-permissions.log \
+      && pass "ошибка установщика восстановлена после проверки версии и прав" || fail "нет сообщения о восстановленном старте"
+    [ "$(stat -c '%U:%G:%a' /usr/local/bin/xray)" = root:root:755 ] \
+      && pass "бинарник Xray восстановлен как root:root 755" || fail "права бинарника: $(stat -c '%U:%G:%a' /usr/local/bin/xray)"
+    [ "$(stat -c '%U:%G:%a' /usr/local/etc/xray)" = root:xray:750 ] \
+      && [ "$(stat -c '%U:%G:%a' /usr/local/etc/xray/config.json)" = root:xray:640 ] \
+      && pass "каталог конфига и config.json доступны группе xray с закрытыми правами" || fail "права конфига не восстановлены"
+    [ "$(stat -c '%U:%G:%a' /var/lib/xray/cert/privkey.pem)" = root:xray:640 ] \
+      && pass "ключ сертификата восстановлен как root:xray 640" || fail "права ключа не восстановлены"
+    runuser -u xray -- /usr/local/bin/xray run -test -c /usr/local/etc/xray/config.json >/dev/null 2>&1 \
+      && pass "конфиг проходит проверку от имени xray" || fail "xray не может проверить конфиг после обновления"
+    ss -ltn | grep -q ':443 ' && pass "Xray запущен после восстановления прав" || fail "Xray не слушает 443 после core update"
+else
+    fail "core update не восстановил службу после отказа первого запуска"
+    tail -n 20 /tmp/core-update-permissions.log
+fi
+rm -f /tmp/xray-installer-permissions-test.sh
+
 step "Выбор пользователя без терминала (нумерованный список)"
 out=$(bash -c 'source <(sed -n "/^choose()/,/^}/p; /^CHOICE=/p" /opt/autoxray/autoxray); choose "T" "a" "b" "c" <<<2; echo "rc=$? CHOICE=$CHOICE"')
 echo "$out" | grep -q 'rc=0 CHOICE=1' && pass "choose: пункт 2 -> индекс 1" || fail "choose: $out"
@@ -414,8 +448,13 @@ check "конфиг без списка geosite, которого нет в ге
   jq -e "[.routing.rules[] | .domain? // empty] | flatten | (index(\"geosite:win-spy\") == null) and (index(\"geosite:category-ads\") != null)" $d/x.json'
 check "firewall --dry-run" autoxray firewall --dry-run
 printf '%s\n' '[ -n "$TERM" ] && [ "$TERM" != dumb ] || { echo "нет TERM" >&2; exit 2; }' '[ "$1" = install-geodata ] && touch /tmp/geo.called' > /tmp/fake-installer.sh
+fake_geo_installer_sha=$(sha256sum /tmp/fake-installer.sh | cut -d' ' -f1)
 rm -f /tmp/geo.called
-env -u TERM AX_XRAY_INSTALLER=file:///tmp/fake-installer.sh autoxray geo-update --quiet && [ -e /tmp/geo.called ] && pass "geo-update из cron (без TERM) вызывает установщик" || fail "geo-update без TERM"
+env -u TERM AX_XRAY_INSTALLER=file:///tmp/fake-installer.sh AX_XRAY_INSTALLER_SHA256="$fake_geo_installer_sha" autoxray geo-update --quiet && [ -e /tmp/geo.called ] && pass "geo-update из cron (без TERM) вызывает проверенный установщик" || fail "geo-update без TERM"
+rm -f /tmp/geo.called
+AX_XRAY_INSTALLER=file:///tmp/fake-installer.sh AX_XRAY_INSTALLER_SHA256="$(printf '%064d' 0)" \
+    autoxray geo-update --quiet >/tmp/geo-bad-hash.out 2>&1 && fail "geo-update запустил установщик с неверной контрольной суммой" \
+    || { [ ! -e /tmp/geo.called ] && pass "установщик Xray с неверным SHA-256 не запускается" || fail "ошибка SHA-256 обработана некорректно"; }
 AX_XRAY_INSTALLER=file:///nonexistent/install.sh autoxray geo-update >/dev/null 2>&1 && fail "geo-update «успешен» без скачанного установщика" || pass "geo-update сообщает об ошибке, если установщик не скачался"
 check "status/stats/user list печатаются" bash -c 'autoxray status && autoxray stats && autoxray user list'
 [ "$(autoxray user list | sed "s/\x1b\[[0-9;]*m//g" | grep -c "активен")" -ge 1 ] && pass "список пользователей с русскими статусами" || fail "список пользователей"

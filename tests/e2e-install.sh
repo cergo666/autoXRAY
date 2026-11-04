@@ -8,6 +8,9 @@ export DOMAIN=vpn.test
 WEB=/var/www/$DOMAIN
 echo "127.0.0.1 $DOMAIN" >> /etc/hosts
 export PATH=/opt/autoxray/tests/stubs:$PATH
+# Хеш скрипта, который тестовая заглушка XTLS/Xray-install записывает в -o.
+AX_XRAY_INSTALLER_SHA256=$(printf '%s\n' 'echo "[stub] xray уже установлен в образе"' | sha256sum | cut -d' ' -f1)
+export AX_XRAY_INSTALLER_SHA256
 
 if [ "$scenario" = verify ]; then
     step "install.sh: контрольные суммы релиза"

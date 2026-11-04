@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+# shellcheck source=components/telegram/artifacts.sh
+source "$(dirname "${BASH_SOURCE[0]}")/artifacts.sh"
+
 GRN='\033[1;32m'
 YEL='\033[1;33m'
 RED='\033[1;31m'
@@ -25,19 +28,11 @@ trap cleanup EXIT
 
 # --- 1. ОБНОВЛЕНИЕ TELEMT ---
 echo -e "${GRN}[1/2] Обновление TeleMT...${NC}"
+echo "Скачивание TeleMT $TELEMT_VERSION и проверка SHA-256..."
+telegram_install_telemt "$TMP_DIR/telemt" || { echo -e "${RED}❌ Проверка/скачивание TeleMT не прошла${NC}"; exit 1; }
+
 systemctl stop telemt 2>/dev/null || true
-
-ARCH_TYPE=$(uname -m)
-LIBC_TYPE=$(ldd --version 2>&1 | grep -iq musl && echo musl || echo gnu)
-
-echo "Скачивание актуального релиза TeleMT..."
-curl -fsSL --retry 2 "https://github.com/telemt/telemt/releases/latest/download/telemt-${ARCH_TYPE}-linux-${LIBC_TYPE}.tar.gz" \
-    | tar -xz -C "$TMP_DIR" || { echo -e "${RED}❌ Ошибка скачивания TeleMT${NC}"; exit 1; }
-
-[ -f "$TMP_DIR/telemt" ] || { echo -e "${RED}❌ Бинарник TeleMT не найден в архиве${NC}"; exit 1; }
-
 mv -f "$TMP_DIR/telemt" /usr/local/bin/telemt
-chmod +x /usr/local/bin/telemt
 
 systemctl start telemt
 echo -e "${YEL}TeleMT обновлен и запущен.${NC}\n"
@@ -45,7 +40,6 @@ echo -e "${YEL}TeleMT обновлен и запущен.${NC}\n"
 
 # --- 2. ОБНОВЛЕНИЕ TPROXY-SERVER ---
 echo -e "${GRN}[2/2] Обновление tproxy-server...${NC}"
-systemctl stop tproxy-server 2>/dev/null || true
 
 GO_ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 GO_BIN=""
@@ -87,17 +81,17 @@ if [ -z "$GO_BIN" ]; then
     GO_BIN="/opt/go/bin/go"
 fi
 
-# Скачивание свежих исходников tproxy-server
-echo "Скачивание исходников tproxy-server..."
-curl -fsSL --retry 2 "https://github.com/telegramdesktop/tproxy-server/archive/refs/heads/master.tar.gz" \
-    | tar -xz -C "$TMP_SRC" --strip-components=1 || { echo -e "${RED}❌ Ошибка скачивания исходников tproxy-server${NC}"; exit 1; }
+# Скачивание закреплённого commit tproxy-server и проверка SHA-256
+echo "Скачивание tproxy-server $TPROXY_COMMIT и проверка SHA-256..."
+telegram_extract_tproxy_source "$TMP_SRC" || { echo -e "${RED}❌ Проверка/скачивание исходников tproxy-server не прошла${NC}"; exit 1; }
 
 echo "Компиляция бинарника..."
 cd "$TMP_SRC"
-CGO_ENABLED=0 "$GO_BIN" build -trimpath -ldflags="-s -w" -o /usr/local/bin/tproxy-server ./cmd/tproxy-server \
+CGO_ENABLED=0 "$GO_BIN" build -trimpath -ldflags="-s -w" -o "$TMP_SRC/tproxy-server.new" ./cmd/tproxy-server \
     || { echo -e "${RED}❌ Ошибка сборки tproxy-server${NC}"; exit 1; }
 
-chmod +x /usr/local/bin/tproxy-server
+systemctl stop tproxy-server 2>/dev/null || true
+install -m 755 "$TMP_SRC/tproxy-server.new" /usr/local/bin/tproxy-server
 cd /root
 
 systemctl start tproxy-server

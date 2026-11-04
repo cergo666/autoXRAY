@@ -7,7 +7,7 @@ for a in "$@"; do
     *XTLS/Xray-install*)
       if [ -n "$out" ]; then echo 'echo "[stub] xray уже установлен в образе"' > "$out"; else echo 'echo "[stub] xray уже установлен в образе"'; fi
       exit 0 ;;
-    *nginx_signing.key*) exit 0 ;;
+    *nginx_signing.key*) [ -n "$out" ] && printf 'test nginx signing key\n' > "$out"; exit 0 ;;
     *api.ipify.org*) exit 22 ;;
   esac
 done

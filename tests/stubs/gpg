@@ -1,4 +1,7 @@
 #!/bin/bash
-# заглушка: install.sh делает `gpg --dearmor -o файл` — создаём пустой файл
+# Заглушка проверки отпечатка ключа nginx и его dearmor в install.sh.
+case " $* " in
+  *" --show-keys "*) printf 'fpr:::::::::573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62:\n'; exit 0 ;;
+esac
 out=""; while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out=$2; shift; done
 [ -n "$out" ] && : > "$out"; cat >/dev/null; exit 0

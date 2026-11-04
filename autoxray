@@ -9,7 +9,7 @@ set -uo pipefail
 # bash >= 5.2: '&' в замене ${var//a/b} — спецсимвол; ссылки содержат '&'
 shopt -u patsub_replacement 2>/dev/null || true
 
-AX_VERSION="3.14.2"
+AX_VERSION="3.14.3"
 AX_REPO="cergo666/autoXRAY"
 XRAY_TESTED="v26.10.31"          # версия ядра, с которой этот релиз проверен тестами
 API="${AX_API:-https://api.github.com}"
@@ -3092,11 +3092,22 @@ xray_version() { xray version 2>/dev/null | awk 'NR == 1 {print "v" $2}'; }
 # (раньше `bash -c "$(curl ...)"` с пустым скриптом считался успехом). TERM задаётся явно: установщик вызывает tput
 # и без TERM (cron) или с TERM=dumb завершается с ошибкой.
 xray_installer() {
-  local f rc term=${TERM:-}
+  local f rc term=${TERM:-} url sha
   [[ -z $term || $term == dumb ]] && term=xterm
   f=$(mktemp --suffix=.sh) || return 1
-  if ! "$CURL" -fsSL --max-time 60 "${AX_XRAY_INSTALLER:-https://github.com/XTLS/Xray-install/raw/main/install-release.sh}" -o "$f" || [[ ! -s $f ]]; then
+  if [[ -n ${AX_XRAY_INSTALLER:-} ]]; then
+    url=$AX_XRAY_INSTALLER
+    sha=${AX_XRAY_INSTALLER_SHA256:-}
+  else
+    # Закреплённый commit XTLS/Xray-install; обновляется вместе с проверкой хеша.
+    url="https://raw.githubusercontent.com/XTLS/Xray-install/04e6f3bd9534811ed901a48c47b2c042dd64eb3a/install-release.sh"
+    sha="934ecb26ded1089f849ac238d5170f1159fe4b6ca300d4f1e67730bd41fe58cf"
+  fi
+  if ! "$CURL" -fsSL --max-time 60 "$url" -o "$f" || [[ ! -s $f ]]; then
     rm -f "$f"; warn "Не удалось скачать установщик Xray (GitHub недоступен?)"; return 1
+  fi
+  if [[ ! $sha =~ ^[[:xdigit:]]{64}$ ]] || ! printf '%s  %s\n' "$sha" "$f" | sha256sum -c --quiet -; then
+    rm -f "$f"; warn "SHA-256 установщика Xray не задан или не совпал; выполнение остановлено."; return 1
   fi
   TERM=$term bash "$f" "$@"; rc=$?
   rm -f "$f"; return $rc
@@ -3156,8 +3167,9 @@ cmd_core() {
       if [[ $yes != 1 ]]; then read -rp "$(echo -e " ${BOLD}Продолжить? Введите yes:${NC} ")" a; [[ $a == yes ]] || die "Отменено."; fi
       local install_rc=0
       xray_installer install --version "$v" || install_rc=$?
-      [[ $(xray_version) == "$v" ]] || die "После установки ядро сообщает версию $(xray_version), а не $v. Проверьте вывод установщика выше."
       ensure_xray_runtime_access || die "Ядро $v установлено, но не удалось настроить права для службы xray. Проверьте владельца и режимы /usr/local/etc/xray и /var/lib/xray/cert."
+      ensure_xray_logs
+      [[ $(xray_version) == "$v" ]] || die "После установки ядро сообщает версию $(xray_version), а не $v. Проверьте вывод установщика выше."
       local runtime_user; runtime_user=$(xray_runtime_user) || die "Не удалось определить пользователя службы xray."
       if ! runuser -u "$runtime_user" -- /usr/local/bin/xray run -test -c "$XRAY_CFG" >/dev/null 2>&1; then
         warn "Текущий конфиг не проходит проверку на $v. Возвращаю $prev."
@@ -3212,7 +3224,7 @@ cmd_migrate() {
 SNAP_DIR="${AX_SNAP_DIR:-/var/lib/autoxray/snapshots}"
 AX_BIN="${AX_BIN:-/usr/local/bin/autoxray}"
 RELEASE_FILES=(autoxray templates/sub.html templates/nginx.conf templates/report.html templates/gen_page.sh
-               components/telegram/install.sh components/telegram/update.sh components/telegram/uninstall.sh)
+               components/telegram/install.sh components/telegram/update.sh components/telegram/uninstall.sh components/telegram/artifacts.sh)
 
 # Снимок всего, что меняет обновление: скрипт, шаблоны, настройки, конфиги Xray и nginx, расписание
 snapshot_create() {
