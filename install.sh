@@ -17,12 +17,12 @@ BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
 
-AX_RELEASE="3.14.0"
+AX_RELEASE="3.14.1"
 AX_REF_DEFAULT="main"   # при выпуске релиза заменяется на тег (см. .github/workflows/release.yml)
 AX_REF="${AUTOXRAY_REF:-$AX_REF_DEFAULT}"
 RAW="${AUTOXRAY_RAW:-https://raw.githubusercontent.com/cergo666/autoXRAY}/$AX_REF"
 SUMS_URL="${AX_SUMS_BASE:-https://github.com/cergo666/autoXRAY/releases/download}/$AX_REF/FILES.sha256"
-XRAY_VERSION="${AX_XRAY_VERSION:-v26.10.21}"
+XRAY_VERSION="${AX_XRAY_VERSION:-v26.10.31}"
 
 echo -e "${GRN}autoXRAY $AX_RELEASE (источник: $AX_REF) ${NC}"
 sleep 1

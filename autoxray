@@ -9,9 +9,9 @@ set -uo pipefail
 # bash >= 5.2: '&' в замене ${var//a/b} — спецсимвол; ссылки содержат '&'
 shopt -u patsub_replacement 2>/dev/null || true
 
-AX_VERSION="3.14.0"
+AX_VERSION="3.14.1"
 AX_REPO="cergo666/autoXRAY"
-XRAY_TESTED="v26.10.21"          # версия ядра, с которой этот релиз проверен тестами
+XRAY_TESTED="v26.10.31"          # версия ядра, с которой этот релиз проверен тестами
 API="${AX_API:-https://api.github.com}"
 AX_ETC="${AX_ETC:-/etc/autoxray}"
 STATE="$AX_ETC/state.json"
@@ -442,11 +442,61 @@ render_xray_json() {
     --argjson geomiss "$(geo_missing)" --arg dummy_id "${h:0:8}-${h:8:4}-4${h:13:3}-8${h:17:3}-${h:20:12}" --arg dummy_auth "${h:32:16}" "$prog"
 }
 
+# Учётная запись службы xray. Установщик XTLS ставит User=xray; в контейнере тестов systemctl может ответить root.
+xray_runtime_user() {
+  local u
+  u=$(systemctl show xray -p User --value 2>/dev/null || true)
+  u=${u//[[:space:]]/}
+  if [[ -z $u || $u == "-" ]]; then
+    if id xray >/dev/null 2>&1; then u=xray; else u=nobody; fi
+  fi
+  id "$u" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$u"
+}
 xray_group() {
-  local u g
-  u=$(systemctl show xray -p User --value 2>/dev/null); u=${u:-nobody}
-  g=$(id -gn "$u" 2>/dev/null) || g=""
-  echo "$g"
+  local u; u=$(xray_runtime_user) || { echo ""; return 0; }
+  id -gn "$u" 2>/dev/null || echo ""
+}
+
+# Журналы обязан открывать пользователь службы, не root.
+# Обнуление из cron (`: > файл`) создаёт файл от root. При маске 077 он получается 600,
+# и включение журнала доступа (отчёт, лимит IP, торренты, debug) роняет Xray:
+# open /var/log/xray/access.log: permission denied. Код выхода 23 systemd не перезапускает.
+ensure_xray_logs() {
+  local dir u g f
+  dir=$(dirname "$ACCESS_LOG")
+  mkdir -p "$dir" 2>/dev/null || return 0
+  u=$(xray_runtime_user 2>/dev/null || true)
+  g=""; [[ -n $u ]] && g=$(id -gn "$u" 2>/dev/null || true)
+  if [[ -n $u && -n $g ]]; then
+    chown "$u:$g" "$dir" 2>/dev/null || true
+    chmod 700 "$dir" 2>/dev/null || true
+  fi
+  for f in "$ACCESS_LOG" "$dir/error.log"; do
+    if [[ ! -e $f ]]; then (umask 077; : >"$f") || continue; fi
+    [[ -f $f ]] || continue
+    if [[ -n $u && -n $g ]]; then chown "$u:$g" "$f" 2>/dev/null || true; fi
+    chmod 600 "$f" 2>/dev/null || true
+  done
+}
+
+# Починить владельца и, если Xray из-за этого уже лежит, поднять его.
+# Чужие причины падения (код 23 при кривом конфиге) не трогаем: перезапуск только когда владелец был чужой.
+heal_xray_logs() {
+  [[ $DRY == 1 ]] && return 0
+  local u dir f own mismatch=0
+  u=$(xray_runtime_user 2>/dev/null || true)
+  dir=$(dirname "$ACCESS_LOG")
+  if [[ -n $u ]]; then
+    for f in "$dir" "$ACCESS_LOG" "$dir/error.log"; do
+      [[ -e $f ]] || continue
+      own=$(stat -c %U "$f" 2>/dev/null || true)
+      [[ -n $own && $own != "$u" ]] && mismatch=1
+    done
+  fi
+  ensure_xray_logs
+  [[ $mismatch == 1 && $(systemctl is-failed xray 2>/dev/null || true) == failed ]] || return 0
+  svc restart xray
 }
 
 # Применяет config.json: проверка через `xray run -test`, откат при ошибке,
@@ -455,7 +505,7 @@ apply_xray() {
   local new rc=0 grp
   new=$(mktemp --suffix=.json) || die "mktemp"
   render_xray_json >"$new" || { rm -f "$new"; die "Не удалось собрать config.json"; }
-  if [[ -f $XRAY_CFG ]] && cmp -s "$new" "$XRAY_CFG"; then rm -f "$new"; return 0; fi
+  if [[ -f $XRAY_CFG ]] && cmp -s "$new" "$XRAY_CFG"; then rm -f "$new"; heal_xray_logs; return 0; fi
   if command -v xray >/dev/null 2>&1; then
     if ! xray run -test -c "$new" >/tmp/autoxray-test.log 2>&1; then
       warn "Xray отклонил новый конфиг, изменения НЕ применены. Лог: /tmp/autoxray-test.log"
@@ -466,6 +516,7 @@ apply_xray() {
   [[ -f $XRAY_CFG ]] && cp -p "$XRAY_CFG" "$XRAY_CFG.bak"
   mkdir -p "$(dirname "$XRAY_CFG")"
   cat "$new" >"$XRAY_CFG"; rm -f "$new"
+  [[ $DRY != 1 ]] && ensure_xray_logs
   grp=$([[ $DRY == 1 ]] && echo "" || xray_group)
   if [[ -n $grp ]]; then chown "root:$grp" "$XRAY_CFG"; chmod 640 "$XRAY_CFG"; else chmod 644 "$XRAY_CFG"; fi
   svc restart xray || rc=1
@@ -1298,6 +1349,7 @@ ips_count() { jq -r --arg n "$1" --argjson now "$(now)" '((.[$n] // {}) | [to_en
 # Логи Xray не должны расти и храниться: при отсутствии лимитов IP они очищаются, иначе ограничиваются по размеру.
 trim_logs() {
   local f max=${AX_LOG_MAX:-20971520} limited=0
+  heal_xray_logs
   jq -e --argjson now "$(now)" '(.debug.until // 0) > $now or (.torrent.alert == true) or any(.users[]; .enabled and (((.ip_limit // 0) > 0) or (.report == true)))' "$STATE" >/dev/null 2>&1 && limited=1
   for f in "$ACCESS_LOG" "$(dirname "$ACCESS_LOG")/error.log"; do
     [[ -f $f ]] || continue
@@ -2369,7 +2421,7 @@ cmd_debug() {
       st_edit --argjson u "$(( $(now) + m * 60 ))" '.debug = {until: $u}'; apply_or_die
       ok "✅ Подробный лог включён на $m мин. Воспроизведите проблему, затем: autoxray debug show [сайт]"
       warn "В логе видны адреса, на которые ходят пользователи, и их IP. Выключится само, выключить сразу: autoxray debug off" ;;
-    off) st_edit 'del(.debug)'; apply_or_die; : >"$ACCESS_LOG" 2>/dev/null; : >"$err" 2>/dev/null; ok "✅ Подробный лог выключен, файлы очищены" ;;
+    off) st_edit 'del(.debug)'; apply_or_die; : >"$ACCESS_LOG" 2>/dev/null; : >"$err" 2>/dev/null; ensure_xray_logs; ok "✅ Подробный лог выключен, файлы очищены" ;;
     show)
       pat=${1:-}; n=${2:-80}
       { cat "$err" "$ACCESS_LOG" 2>/dev/null | grep -aE 'wireguard|handshake|keepalive|[Dd][Nn][Ss]|>> warp|\[Warning\]|\[Error\]|failed|timeout|dial'
@@ -3014,6 +3066,14 @@ core_warning() {
   echo -e " ${DIM}Этот релиз autoXRAY проверен с ${NC}${BOLD}$XRAY_TESTED${NC}${DIM}. Обновляйтесь, если нужна конкретная возможность или исправление.${NC}"
 }
 
+# Go 1.24+ включает MPTCP на listen. До v26.10.31 Xray этому не мешал, а в ядре Linux IPv4 MPTCP давал удалённый root.
+core_mptcp_note() {
+  local cur; cur=$(xray_version)
+  [[ -n $cur ]] || return 0
+  ver_gt "26.10.31" "${cur#v}" || return 0
+  echo -e " ${BOLD}${YEL}Безопасность:${NC} $cur слушает MPTCP. В ядре Linux через IPv4 MPTCP можно было удалённо получить root. С v26.10.31 Xray его выключает: ${CYAN}autoxray core update${NC}"
+}
+
 cmd_core() {
   need_state
   local sub=${1:-list}; shift || true
@@ -3030,6 +3090,7 @@ cmd_core() {
           if [[ $pre == true ]]; then echo -e "    ${YEL}•${NC} $t  ${YEL}пререлиз${NC}"; else echo -e "    ${CYAN}•${NC} $t"; fi
         done <<<"$newer"
       else echo -e " ${DIM}Новее установленной версий нет (или GitHub недоступен).${NC}"; fi
+      core_mptcp_note
       core_warning ;;
     update)
       need_root
@@ -3242,6 +3303,7 @@ cmd_doctor() {
   fail_() { printf '  %b✘%b %s %b— %s%b\n' "$RED" "$NC" "$1" "$DIM" "$2" "$NC"; bad=$((bad + 1)); }
   section "🩺 Диагностика"
 
+  heal_xray_logs || true
   echo -e "\n ${BOLD}Службы${NC}"
   for k in xray nginx; do
     systemctl is-active --quiet "$k" 2>/dev/null && pass_ "$k запущен" || fail_ "$k не запущен" "systemctl status $k; journalctl -u $k -e"
@@ -3290,6 +3352,13 @@ cmd_doctor() {
   if [[ $(st '.bot.enabled // false') == true ]]; then
     systemctl is-active --quiet autoxray-bot 2>/dev/null && pass_ "Telegram-бот работает" || warn_ "Telegram-бот включён, но служба не запущена" "systemctl status autoxray-bot; autoxray bot on"
   fi
+  local lu lg
+  lu=$(xray_runtime_user 2>/dev/null || true)
+  if [[ -n $lu && -f $ACCESS_LOG ]]; then
+    lg=$(stat -c '%U:%a' "$ACCESS_LOG" 2>/dev/null || true)
+    [[ $lg == "$lu:600" ]] && pass_ "журнал доступа: владелец $lu, права 600" || fail_ "журнал доступа $lg" "нужен владелец $lu и права 600, иначе Xray не запустится с отчётом"
+  fi
+  core_mptcp_note
   local lsz; lsz=$(stat -c %s "$ACCESS_LOG" 2>/dev/null || echo 0)
   if [[ $lsz -gt 5242880 ]]; then warn_ "лог доступа $(hbytes "$lsz")" "должен очищаться раз в минуту: проверьте cron (/etc/cron.d/autoxray), autoxray ipwatch"
   elif [[ $lsz -gt 0 ]] && ! jq -e 'any(.users[]; .enabled and ((.ip_limit // 0) > 0))' "$STATE" >/dev/null 2>&1; then

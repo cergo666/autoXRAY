@@ -1,7 +1,7 @@
 # Минимальное окружение для e2e-проверки autoXRAY: настоящие nginx и Xray, без systemd.
 FROM nginx:1.28
 
-ARG XRAY_VERSION=v26.10.21
+ARG XRAY_VERSION=v26.10.31
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends jq curl openssl ca-certificates unzip qrencode iproute2 procps python3 util-linux nftables \

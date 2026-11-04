@@ -18,7 +18,7 @@ mkdir -p "$WEB"
 AX_AUTH=/auth/session
 bash /opt/autoxray/templates/gen_page.sh "$WEB" "$AX_AUTH" >/dev/null
 check "gen_page создал index.html" test -s "$WEB/index.html"
-autoxray init --domain "$DOMAIN" --fp chrome --xhttp-path xh7k2m --auth-path "$AX_AUTH" --web "$WEB" --user alice --xray-version v26.10.21 \
+autoxray init --domain "$DOMAIN" --fp chrome --xhttp-path xh7k2m --auth-path "$AX_AUTH" --web "$WEB" --user alice --xray-version v26.10.31 \
     || fail "init"
 autoxray user add bob --limit 0.000001 || fail "user add bob"
 check "render без ошибок" autoxray render
@@ -236,6 +236,18 @@ client_start /tmp/client-w.json && via_proxy ok.txt >/dev/null && pass "траф
 client_stop
 autoxray warp ru off >/dev/null && check "warp ru off + xray -test" xray run -test -c /usr/local/etc/xray/config.json
 autoxray warp off >/dev/null && check "warp off + xray -test" xray run -test -c /usr/local/etc/xray/config.json
+
+step "Журналы принадлежат пользователю службы, а не root"
+mkdir -p /var/log/xray
+(umask 077; : > /var/log/xray/access.log; : > /var/log/xray/error.log)
+chown root:root /var/log/xray /var/log/xray/access.log /var/log/xray/error.log
+chmod 700 /var/log/xray; chmod 600 /var/log/xray/access.log /var/log/xray/error.log
+id nobody >/dev/null 2>&1 || fail "в образе нет пользователя nobody"
+AX_XRAY_USER=nobody autoxray ipwatch >/dev/null
+oa=$(stat -c '%U:%a' /var/log/xray/access.log); oe=$(stat -c '%U:%a' /var/log/xray/error.log); od=$(stat -c '%U:%a' /var/log/xray)
+[[ $oa == nobody:600 && $oe == nobody:600 && $od == nobody:700 ]] && pass "журналы отданы пользователю службы (600), каталог 700" || fail "права журналов: dir=$od access=$oa error=$oe"
+AX_XRAY_USER=root autoxray ipwatch >/dev/null
+[[ $(stat -c %U /var/log/xray/access.log) == root ]] && pass "в контейнере (Xray от root) владелец возвращается root" || fail "владелец не вернулся"
 
 step "Логи: без лимитов очищаются, при превышении размера обнуляются"
 echo junk > /var/log/xray/access.log; echo junk > /var/log/xray/error.log
