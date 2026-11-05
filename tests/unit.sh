@@ -63,8 +63,8 @@ h32=$(ip62hexa "2001:db8:85a3::8a2e:370:7334"); [[ ${#h32} -eq 32 ]] && ok_test 
 # -------------------------------------------------------- ip_in
 echo "== ip_in: IPv4 и IPv6 в списках =="
 
-check_ipin() { local desc="$1" ip="$2" list="$3"; if ip_in "$ip" "$list"; then ok_test "$desc"; else fail_test "$desc"; fi; }
-check_ipin_fail() { local desc="$1" ip="$2" list="$3"; if ip_in "$ip" "$list" 2>/dev/null; then fail_test "$desc не должен совпадать"; else ok_test "$desc → не в списке"; fi; }
+check_ipin() { local desc="$1" ip="$2" ip_list="$3"; if ip_in "$ip" "$ip_list"; then ok_test "$desc"; else fail_test "$desc"; fi; }
+check_ipin_fail() { local desc="$1" ip="$2" ip_list="$3"; if ip_in "$ip" "$ip_list" 2>/dev/null; then fail_test "$desc не должен совпадать"; else ok_test "$desc → не в списке"; fi; }
 
 check_ipin "IPv4 в сети /8" "10.0.0.5" "10.0.0.0/8 192.168.0.0/16"
 check_ipin_fail "IPv4 не в сети" "192.168.1.1" "10.0.0.0/8"

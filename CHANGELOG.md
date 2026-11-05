@@ -6,6 +6,22 @@
 
 ## [Unreleased]
 
+## [3.14.4] — 2026-11-05
+
+### Added
+- **IPv6**: полная поддержка IPv6/CIDR в правилах маршрутизации (`route add direct 2001:db8::/32`), доверенных IP (`user set --trust 2001:db8::/32`) и лимитах IP (`ip_in` с IPv6). Новые функции: `ip62hexa` (разворачивание `::` в 32 hex-цифры), `valid_trust` для IPv6/128.
+- **Export/Import пользователей**: `autoxray user export <имя|all> [файл] [--with-traffic] [--with-devices]` и `autoxray user import <файл> [--force]`. Экспорт включает трафик (`traffic.json`) и устройства (`devices.json`) по флагам; импорт создаёт недостающие поля, пропускает существующие без `--force`, работает с пустым/неполным `state.json`.
+- **Расширенный `doctor`**: проверка версии autoXRAY (сравнение с GitHub), валидность `state.json` (JSON + структура), наличие `traffic.json`, cron autoxray, внешняя сеть (`api.github.com`, `api.telegram.org` если бот включён), Xray runtime (права приватного ключа сертификата, сокет nginx `/dev/shm/nginx.sock`).
+- **Юнит-тесты**: `tests/unit.sh` — 47 тестов (`route_norm`, `valid_trust`, `ip62hexa`, `ip_in`, `ver_gt`, `days_left`, `parse_vless`, `urldecode`, `next_reset_ts`). Интеграция в `tests/run.sh unit` и `all`. `shellcheck -S error` без ошибок.
+
+### Changed
+- **install.sh**: проверка манифеста релиза на наличие уникальной суммы для каждого файла из `RELEASE_FILES`; проверка группы Xray перед `chmod` сертификатов — если группа не определена, установка останавливается с понятной ошибкой.
+- **Telegram компонент**: безопасные временные директории (`mktemp -d`) вместо `/opt/go` и `/tmp/tproxy-source`; атомарная замена сервисов (`replace_service`) с бэкапом и автоматическим откатом при отказе новой версии.
+- **Supply-chain тесты**: проверка rollback `core update` при неверной версии/отказе запуска; проверка `install.sh` на полноту манифеста и подмену файлов; тест rollback Telegram сервиса.
+
+### Fixed
+- **`cmd_export_import`**: корректная работа `--with-traffic` / `--with-devices` (использование `--slurpfile` без флага `-n`), инициализация `state.json` перед `need_state` в import.
+
 ## [3.14.3] — 2026-11-04
 
 ### Security

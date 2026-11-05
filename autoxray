@@ -1587,9 +1587,9 @@ ip_in() {
         # IPv6: сравниваем первые len бит через 32 шестнадцатеричных цифры
         [[ $len -ge 1 && $len -le 128 ]] || continue
         h_ip=$(ip62hexa "$ip"); h_net=$(ip62hexa "$net")
-        [[ ${h_ip:0:$((len / 4))} == ${h_net:0:$((len / 4))} ]] && [[ ${len} -le 32 || ${h_ip:$((len / 4)):1} == ${h_net:$((len / 4)):1} ]] && return 0
+        [[ ${h_ip:0:$((len / 4))} == "${h_net:0:$((len / 4))}" ]] && [[ ${len} -le 32 || ${h_ip:$((len / 4)):1} == "${h_net:$((len / 4)):1}" ]] && return 0
         # простое правило: совпадение первых ceil(len/4) hex-цифр достаточно для кратных 4
-        [[ $((len % 4)) -eq 0 && ${h_ip:0:$((len / 4))} == ${h_net:0:$((len / 4))} ]] && return 0
+        [[ $((len % 4)) -eq 0 && ${h_ip:0:$((len / 4))} == "${h_net:0:$((len / 4))}" ]] && return 0
       else
         m=$(( (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
         (( ($(ip2int "$ip") & m) == ($(ip2int "$net") & m) )) && return 0
