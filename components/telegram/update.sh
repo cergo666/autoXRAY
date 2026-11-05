@@ -16,25 +16,41 @@ echo -e "${GRN}=== Обновление TeleMT и Telegram Web Proxy ===${NC}\n"
 # Создаем временные каталоги с гарантированной очисткой при выходе
 TMP_DIR=$(mktemp -d)
 TMP_SRC=$(mktemp -d)
-CLEAN_OPT_GO=false
-
-cleanup() {
-    rm -rf "$TMP_DIR" "$TMP_SRC" /tmp/go.tgz
-    if [ "$CLEAN_OPT_GO" = true ]; then
-        rm -rf /opt/go
-    fi
-}
+cleanup() { rm -rf "$TMP_DIR" "$TMP_SRC"; }
 trap cleanup EXIT
+
+replace_service() {
+    local service=$1 candidate=$2 target="/usr/local/bin/$1" backup="/usr/local/bin/.$1.autoxray-backup"
+    if [[ -e $target ]]; then
+        cp -p "$target" "$backup" || { echo "Не удалось сохранить $target" >&2; return 1; }
+    else
+        rm -f "$backup" || return 1
+    fi
+    systemctl stop "$service" 2>/dev/null || true
+    if install -m 755 "$candidate" "$target" && systemctl start "$service" && sleep 2 && systemctl is-active --quiet "$service"; then
+        rm -f "$backup"
+        return 0
+    fi
+    echo -e "${RED}Ошибка запуска $service, восстанавливаем прежнюю версию${NC}" >&2
+    systemctl stop "$service" 2>/dev/null || true
+    if [[ -e $backup ]]; then
+        if cp -p "$backup" "$target" && systemctl start "$service" && systemctl is-active --quiet "$service"; then
+            rm -f "$backup"
+        else
+            echo "Не удалось восстановить $service; копия: $backup" >&2
+        fi
+    else
+        rm -f "$target"
+    fi
+    return 1
+}
 
 # --- 1. ОБНОВЛЕНИЕ TELEMT ---
 echo -e "${GRN}[1/2] Обновление TeleMT...${NC}"
 echo "Скачивание TeleMT $TELEMT_VERSION и проверка SHA-256..."
 telegram_install_telemt "$TMP_DIR/telemt" || { echo -e "${RED}❌ Проверка/скачивание TeleMT не прошла${NC}"; exit 1; }
 
-systemctl stop telemt 2>/dev/null || true
-mv -f "$TMP_DIR/telemt" /usr/local/bin/telemt
-
-systemctl start telemt
+replace_service telemt "$TMP_DIR/telemt" || exit 1
 echo -e "${YEL}TeleMT обновлен и запущен.${NC}\n"
 
 
@@ -64,21 +80,20 @@ if [ -z "$GO_BIN" ]; then
         *) echo -e "${RED}❌ Неподдерживаемая архитектура: $GO_ARCH${NC}"; exit 1 ;;
     esac
 
-    mkdir -p /opt/go
-    CLEAN_OPT_GO=true
+    mkdir -p "$TMP_DIR/go"
 
     for url in "https://go.dev/dl/$GO_TGZ" "https://mirrors.aliyun.com/golang/$GO_TGZ"; do
-        if curl -fsSL --retry 2 "$url" -o /tmp/go.tgz && \
-           echo "$GO_SHA256  /tmp/go.tgz" | sha256sum -c --quiet - && \
-           tar -C /opt/go --strip-components=1 -xzf /tmp/go.tgz; then
+        if curl -fsSL --retry 2 "$url" -o "$TMP_DIR/go.tgz" && \
+           printf '%s  %s\n' "$GO_SHA256" "$TMP_DIR/go.tgz" | sha256sum -c --quiet - && \
+           tar -C "$TMP_DIR/go" --strip-components=1 -xzf "$TMP_DIR/go.tgz"; then
             break
         fi
         echo -e "${YEL}Не удалось скачать Go с $url, пробую зеркало...${NC}"
     done
-    rm -f /tmp/go.tgz
+    rm -f "$TMP_DIR/go.tgz"
 
-    [ -x /opt/go/bin/go ] || { echo -e "${RED}❌ Не удалось развернуть Go тулчейн${NC}"; exit 1; }
-    GO_BIN="/opt/go/bin/go"
+    [ -x "$TMP_DIR/go"/bin/go ] || { echo -e "${RED}❌ Не удалось развернуть Go тулчейн${NC}"; exit 1; }
+    GO_BIN="$TMP_DIR/go/bin/go"
 fi
 
 # Скачивание закреплённого commit tproxy-server и проверка SHA-256
@@ -90,11 +105,8 @@ cd "$TMP_SRC"
 CGO_ENABLED=0 "$GO_BIN" build -trimpath -ldflags="-s -w" -o "$TMP_SRC/tproxy-server.new" ./cmd/tproxy-server \
     || { echo -e "${RED}❌ Ошибка сборки tproxy-server${NC}"; exit 1; }
 
-systemctl stop tproxy-server 2>/dev/null || true
-install -m 755 "$TMP_SRC/tproxy-server.new" /usr/local/bin/tproxy-server
+replace_service tproxy-server "$TMP_SRC/tproxy-server.new" || exit 1
 cd /root
-
-systemctl start tproxy-server
 echo -e "${YEL}tproxy-server успешно пересобран и запущен.${NC}\n"
 
 
@@ -117,4 +129,5 @@ else
     echo -e "tproxy-server: [ ${RED}FAILED${NC} ] (журнал: journalctl -u tproxy-server -e)"
 fi
 
+[[ $telemt_status == active && $tproxy_status == active ]] || exit 1
 echo -e "\n${GRN}Готово! Все настройки, секреты и файлы сохранены.${NC}"

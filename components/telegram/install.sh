@@ -94,36 +94,36 @@ case "$GO_ARCH" in
     *) echo -e "${RED}❌ Неподдерживаемая архитектура: $GO_ARCH${NC}"; exit 1 ;;
 esac
 
-rm -rf /opt/go /tmp/go.tgz /tmp/tproxy-source
-mkdir -p /opt/go /tmp/tproxy-source
+TELEGRAM_BUILD_TMP=$(mktemp -d) || exit 1
+mkdir -p "$TELEGRAM_BUILD_TMP/go" "$TELEGRAM_BUILD_TMP/source"
 
 # Скачивание Go: пробуем go.dev, при сбое — зеркало aliyun
 for url in "https://go.dev/dl/$GO_TGZ" "https://mirrors.aliyun.com/golang/$GO_TGZ"; do
-    if curl -fsSL --retry 2 "$url" -o /tmp/go.tgz && \
-       echo "$GO_SHA256  /tmp/go.tgz" | sha256sum -c --quiet - && \
-       tar -C /opt/go --strip-components=1 -xzf /tmp/go.tgz; then
+    if curl -fsSL --retry 2 "$url" -o "$TELEGRAM_BUILD_TMP/go.tgz" && \
+       printf '%s  %s\n' "$GO_SHA256" "$TELEGRAM_BUILD_TMP/go.tgz" | sha256sum -c --quiet - && \
+       tar -C "$TELEGRAM_BUILD_TMP/go" --strip-components=1 -xzf "$TELEGRAM_BUILD_TMP/go.tgz"; then
         break
     fi
     echo -e "${YEL}Не удалось скачать Go с $url, пробую зеркало...${NC}"
 done
-rm -f /tmp/go.tgz
+rm -f "$TELEGRAM_BUILD_TMP/go.tgz"
 
-[ -x /opt/go/bin/go ] || { echo -e "${RED}❌ Не удалось развернуть Go тулчейн${NC}"; exit 1; }
+[ -x "$TELEGRAM_BUILD_TMP/go"/bin/go ] || { echo -e "${RED}❌ Не удалось развернуть Go тулчейн${NC}"; exit 1; }
 
 # Скачивание закреплённого commit tproxy-server с проверкой SHA-256
-telegram_extract_tproxy_source /tmp/tproxy-source \
+telegram_extract_tproxy_source "$TELEGRAM_BUILD_TMP/source" \
     || { echo -e "${RED}❌ Проверка/распаковка исходников tproxy-server не прошла${NC}"; exit 1; }
 
 # Статическая компиляция
-cd /tmp/tproxy-source || exit 1
-CGO_ENABLED=0 /opt/go/bin/go build -trimpath -ldflags="-s -w" -o /tmp/tproxy-source/tproxy-server.new ./cmd/tproxy-server \
+cd "$TELEGRAM_BUILD_TMP/source" || exit 1
+CGO_ENABLED=0 "$TELEGRAM_BUILD_TMP/go"/bin/go build -trimpath -ldflags="-s -w" -o "$TELEGRAM_BUILD_TMP/source"/tproxy-server.new ./cmd/tproxy-server \
     || { echo -e "${RED}❌ Ошибка сборки tproxy-server${NC}"; exit 1; }
 
 systemctl stop tproxy-server 2>/dev/null || true
-install -m 755 /tmp/tproxy-source/tproxy-server.new /usr/local/bin/tproxy-server
+install -m 755 "$TELEGRAM_BUILD_TMP/source"/tproxy-server.new /usr/local/bin/tproxy-server
 
 # Чистим временные файлы компиляции
-rm -rf /tmp/tproxy-source /opt/go
+rm -rf "$TELEGRAM_BUILD_TMP"
 cd /root || exit 1
 
 # 3. Конфигурация tproxy-server
@@ -237,5 +237,6 @@ if systemctl is-active --quiet telemt && systemctl is-active --quiet tproxy-serv
     echo -e "${GRN}✅ TeleMT (9000) и tproxy-server (8080) успешно запущены! (${DOMAIN})${NC}"
 else
     echo -e "${RED}⚠️ Ошибка запуска! Проверьте логи: journalctl -u telemt -u tproxy-server -e${NC}"
+    exit 1
 fi
 sleep 1

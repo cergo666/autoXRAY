@@ -20,8 +20,6 @@ echo "4. Удаление конфигураций..."
 rm -rf /etc/tproxy-server
 rm -rf /etc/telemt
 rm -rf /opt/telemt
-rm -rf /opt/go
-rm -rf /tmp/tproxy-source
 rm -rf /srv/tproxy-site
 
 echo "5. Удаление пользователя telemt..."

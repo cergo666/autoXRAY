@@ -17,7 +17,7 @@ BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
 
-AX_RELEASE="3.14.3"
+AX_RELEASE="3.14.4"
 AX_REF_DEFAULT="main"   # при выпуске релиза заменяется на тег (см. .github/workflows/release.yml)
 AX_REF="${AUTOXRAY_REF:-$AX_REF_DEFAULT}"
 RAW="${AUTOXRAY_RAW:-https://raw.githubusercontent.com/cergo666/autoXRAY}/$AX_REF"
@@ -221,6 +221,9 @@ done
 # Релиз с тегом (vX.Y.Z) сверяется с контрольными суммами, опубликованными вместе с ним. Источник main и локальная копия не проверяются.
 if [[ -z "$AUTOXRAY_SRC" && "$AX_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     SUMS=$(curl -fsSL --retry 2 "$SUMS_URL") || die "Не удалось получить контрольные суммы релиза ($SUMS_URL). Файлы не установлены."
+    for t in "${RELEASE_FILES[@]}"; do
+        [[ $(printf '%s\n' "$SUMS" | awk -v f="$t" '$2 == f || $2 == "*" f {n++} END {print n+0}') == 1 ]] || die "Манифест релиза не содержит единственную сумму $t."
+    done
     (cd "$STAGE" && printf '%s\n' "$SUMS" | sha256sum -c --quiet) \
         || die "Контрольные суммы файлов релиза $AX_REF не совпали: установка остановлена."
     echo -e "${GRN}Контрольные суммы релиза $AX_REF совпали${NC}"
@@ -361,7 +364,7 @@ XRAY_GROUP=$(id -gn "$XRAY_USER" 2>/dev/null)
 if [ -n "$XRAY_GROUP" ]; then
     CERT_FIX="chown root:$XRAY_GROUP /var/lib/xray/cert/privkey.pem /var/lib/xray/cert/fullchain.pem; chmod 640 /var/lib/xray/cert/privkey.pem; chmod 644 /var/lib/xray/cert/fullchain.pem"
 else
-    CERT_FIX="chmod 644 /var/lib/xray/cert/privkey.pem /var/lib/xray/cert/fullchain.pem"
+    die "Не удалось определить группу службы Xray; права закрытого ключа не изменены."
 fi
 
 "$ACME_BIN" --install-cert -d "$DOMAIN" --ecc \

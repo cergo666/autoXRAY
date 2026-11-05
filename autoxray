@@ -9,7 +9,7 @@ set -uo pipefail
 # bash >= 5.2: '&' в замене ${var//a/b} — спецсимвол; ссылки содержат '&'
 shopt -u patsub_replacement 2>/dev/null || true
 
-AX_VERSION="3.14.3"
+AX_VERSION="3.14.4"
 AX_REPO="cergo666/autoXRAY"
 XRAY_TESTED="v26.10.31"          # версия ядра, с которой этот релиз проверен тестами
 API="${AX_API:-https://api.github.com}"
@@ -550,7 +550,8 @@ heal_xray_logs() {
 # Применяет config.json: проверка через `xray run -test`, откат при ошибке,
 # перезапуск только если файл действительно изменился.
 apply_xray() {
-  local new rc=0 grp
+  local new rc=0 grp had_old=0
+  [[ -f $XRAY_CFG ]] && had_old=1
   new=$(mktemp --suffix=.json) || die "mktemp"
   render_xray_json >"$new" || { rm -f "$new"; die "Не удалось собрать config.json"; }
   if [[ -f $XRAY_CFG ]] && cmp -s "$new" "$XRAY_CFG"; then rm -f "$new"; heal_xray_logs; return 0; fi
@@ -561,16 +562,28 @@ apply_xray() {
       rm -f "$new"; return 1
     fi
   fi
-  [[ -f $XRAY_CFG ]] && cp -p "$XRAY_CFG" "$XRAY_CFG.bak"
+  if [[ $had_old == 1 ]] && ! cp -p "$XRAY_CFG" "$XRAY_CFG.bak"; then
+    rm -f "$new"; warn "Не удалось сохранить прежний конфиг Xray."; return 1
+  fi
   mkdir -p "$(dirname "$XRAY_CFG")"
-  cat "$new" >"$XRAY_CFG"; rm -f "$new"
+  cat "$new" >"$XRAY_CFG" || rc=1
+  rm -f "$new"
   if [[ $DRY != 1 ]]; then
     ensure_xray_logs
     ensure_xray_runtime_access || rc=1
   fi
   grp=$([[ $DRY == 1 ]] && echo "" || xray_group)
-  if [[ -n $grp ]]; then chown "root:$grp" "$XRAY_CFG"; chmod 640 "$XRAY_CFG"; else chmod 644 "$XRAY_CFG"; fi
-  svc restart xray || rc=1
+  if [[ -n $grp ]]; then chown "root:$grp" "$XRAY_CFG" && chmod 640 "$XRAY_CFG" || rc=1; else chmod 600 "$XRAY_CFG" || rc=1; [[ $DRY == 1 ]] || rc=1; fi
+  [[ $rc != 0 ]] || svc restart xray || rc=1
+  if [[ $rc != 0 ]]; then
+    warn "Не удалось применить конфигурацию; восстанавливаю предыдущую."
+    if [[ $had_old == 1 ]]; then
+      cp -p "$XRAY_CFG.bak" "$XRAY_CFG" && svc restart xray || warn "Не удалось восстановить Xray; проверьте журнал службы."
+    else
+      rm -f "$XRAY_CFG"
+    fi
+    return 1
+  fi
   # устройство WireGuard создаётся при первом запросе: прогреваем сразу после перезапуска
   if [[ $DRY != 1 && $(st '.warp.enabled // false') == true ]]; then ( sleep 3; warp_warm ) >/dev/null 2>&1 9>&- & fi
   return $rc
@@ -1214,6 +1227,107 @@ cmd_user_unlink() {
   ok "✅ Telegram отвязан от «$name», приглашение отозвано"
 }
 
+# --------------------------------------------------------------- export / import
+
+# autoxray export <имя|all> [файл] — выгружает пользователей (и их настройки) в JSON.
+# ohne трафика и устройств по умолчанию; с --with-traffic / --with-devices включает их.
+cmd_export_import() {
+  # Для import: допускаем пустой/неполный state.json, исправим его до need_state
+  if [[ ${1:-} == import ]]; then
+    [[ -f $STATE ]] || { mkdir -p "$AX_ETC"; echo '{"users":[]}' >"$STATE"; chmod 600 "$STATE"; }
+    jq -e '.users | type == "array"' "$STATE" >/dev/null 2>&1 || { echo '{"users":[]}' >"$STATE"; }
+  fi
+  need_state
+  local sub=${1:-export}; shift || true
+  case $sub in
+    export)
+      local name="all" out="" force=0 with_traffic=0 with_devices=0
+      # Парсим аргументы: export <имя|all> [файл] [--with-traffic] [--with-devices] [--force]
+      while (($#)); do
+        case "$1" in
+          --with-traffic) with_traffic=1 ;;
+          --with-devices) with_devices=1 ;;
+          --force) force=1 ;;
+          *) if [[ -z $name || $name == "all" ]]; then name=$1; elif [[ -z $out ]]; then out=$1; fi ;;
+        esac
+        shift
+      done
+      [[ -z $name ]] && name=all
+      local filter='.users'
+      if [[ $name != all ]]; then
+        user_must "$name" >/dev/null
+        filter=".users | map(select(.name == \"$name\"))"
+      fi
+      local jqprog="$filter | {
+        version: 3,
+        exported: \$now,
+        users: map({
+          name, uuid, hy2, token, created, first_seen, expire, limit, enabled,
+          reset, next_reset, ru, ip_limit, report,
+          ip_trust: (.ip_trust // []), devices: (.devices // 0),
+          hide: (.hide // []), note: (.note // \"\"), tags: (.tags // [])
+        })
+      }"
+      if [[ $with_traffic -eq 1 && -f $TRAFFIC ]]; then
+        jqprog="${jqprog} | . + {traffic: \$t[0]}"
+      fi
+      if [[ $with_devices -eq 1 && -f $DEVICES ]]; then
+        jqprog="${jqprog} | . + {devices: \$d[0]}"
+      fi
+      local result
+      if [[ $with_traffic -eq 1 || $with_devices -eq 1 ]]; then
+        result=$(jq --slurpfile t "$TRAFFIC" --slurpfile d "$DEVICES" --argjson now "$(now)" "$jqprog" "$STATE" 2>/dev/null) || die "Не удалось собрать экспорт"
+      else
+        result=$(jq --argjson now "$(now)" "$jqprog" "$STATE") || die "Не удалось собрать экспорт"
+      fi
+      if [[ -n $out ]]; then
+        printf '%s\n' "$result" >"$out" || die "Не удалось записать $out"
+        ok "✅ Экспорт сохранён: $out"
+      else
+        printf '%s\n' "$result"
+      fi ;;
+    import)
+      local f=${1:-} force=0
+      [[ -n $f && -f $f ]] || die "import <файл.json> [--force]"
+      shift
+      [[ ${1:-} == --force ]] && force=1
+      local data; data=$(jq -e '.users | type == "array"' "$f" >/dev/null 2>&1 && jq . "$f" || die "Файл не похож на экспорт autoXRAY (нет массива users)")
+      local count=0 skipped=0 name
+      while read -r name; do
+        [[ -n $name ]] || continue
+        if [[ $force -eq 0 && -n $(user_get "$name") ]]; then
+          skipped=$((skipped + 1))
+          echo " ${DIM}пропущен (уже есть): $name${NC}"
+          continue
+        fi
+        local uj; uj=$(jq -c --arg n "$name" '.users[] | select(.name == $n)' <<<"$data")
+        [[ -n $uj ]] || continue
+        # сохраняем поля, которых может не быть в старом экспорте, значениями по умолчанию
+        st_edit --argjson u "$uj" '
+          .users += [$u |
+            .first_seen //= 0 |
+            .expire //= 0 |
+            .limit //= 0 |
+            .enabled //= true |
+            .reset //= "never" |
+            .next_reset //= 0 |
+            .ru //= "direct" |
+            .ip_limit //= 0 |
+            .report //= false |
+            .ip_trust //= [] |
+            .devices //= 0 |
+            .hide //= [] |
+            .note //= "" |
+            .tags //= []
+          ]' || die "Не удалось добавить пользователя $name"
+        count=$((count + 1))
+      done < <(jq -r '.users[].name' <<<"$data")
+      apply_or_die
+      ok "✅ Импортировано пользователей: $count, пропущено: $skipped" ;;
+    *) die "export|import <аргументы>" ;;
+  esac
+}
+
 cmd_user_rotate() {
   need_root; need_state
   local name=${1:-}; user_must "$name" >/dev/null
@@ -1290,18 +1404,31 @@ cmd_users() {
     link|show) if [[ ${2:-} == --plain ]]; then need_state; user_must "${1:-}" >/dev/null; user_links "$1"; else show_user "${1:-}"; fi ;;
     qr)     cmd_user_qr "$@" ;;
     devices|dev) cmd_user_devices "$@" ;;
-    *) die "user: add | del | set | rotate | invite | unlink | list [--tag метка|--find текст] | find <текст> | link | qr | devices" ;;
+    export|import) cmd_export_import "$@" ;;
+    *) die "user: add | del | set | rotate | invite | unlink | list [--tag метка|--find текст] | find <текст> | link | qr | devices | export <имя|all> [файл] [--with-traffic] [--with-devices] | import <файл> [--force]" ;;
   esac
 }
 
 # --------------------------------------------- свои правила маршрутов и строка статуса
 
-# Нормализует домен или IPv4-сеть для правил; код 1, если ввод неверный
+# Нормализует домен или IPv4/IPv6-сеть для правил; код 1, если ввод неверный
 route_norm() {
   local v=${1,,}
+  v=${v#"${v%%[![:space:]]*}"}   # убрать ведущие пробелы
+  v=${v%"${v##*[![:space:]]}"}   # убрать завершающие пробелы
+  v=${v#http://}; v=${v#https://} # убрать протокол
+  v=${v#"${v%%[![:space:]]*}"}   # снова убрать ведущие пробелы (после протокола)
   if [[ $v =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then valid_trust "$v" && [[ $v != */* || ${v#*/} -ge 8 ]] && { echo "$v"; return 0; }; return 1; fi
-  v=${v#http://}; v=${v#https://}; v=${v%%/*}; v=${v#domain:}; v=${v#\*.}; v=${v%.}
-  [[ $v =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9-]{2,}$ ]] || return 1
+  if [[ $v == *:* ]]; then
+    # IPv6-адрес или сеть (например, 2001:db8::1 или 2001:db8::/32)
+    valid_trust "$v" || return 1
+    echo "$v"; return 0
+  fi
+  v=${v%%/*}; v=${v#domain:}; v=${v#\*.}; v=${v%.}
+  v=${v#"${v%%[![:space:]]*}"}   # убрать ведущие пробелы
+  v=${v%"${v##*[![:space:]]}"}   # убрать завершающие пробелы
+  # допускаем домены без точки (xn--p1ai, localhost) и с точкой
+  [[ $v =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || return 1
   echo "$v"
 }
 
@@ -1420,21 +1547,53 @@ ipwatch_parse() {
 # Доверенные адреса пользователя (ip_trust: список IP и сетей IPv4 вида 10.0.0.0/24) не считаются «лишними»:
 # домашний IP или сеть мобильного оператора, которые не нужно ни занимать слотом, ни блокировать.
 ip2int() { local a b c d; IFS=. read -r a b c d <<<"$1"; echo $(( (a << 24) + (b << 16) + (c << 8) + d )); }
-valid_trust() { # IP или сеть: 1.2.3.4, 1.2.3.0/24, 2001:db8::1
+# ip62hexa <ipv6> — IPv6 в 32 шестнадцатеричных цифры (без сокращений ::) для сравнения подсетей
+ip62hexa() {
+  local ip=$1 a b c d e f g h
+  if [[ $ip == *::* ]]; then
+    local left=${ip%%::*} right=${ip##*::} lc=0 rc=0 miss mid=""
+    [[ -n $left ]] && lc=$(($(tr -cd ':' <<<"$left" | wc -c) + 1))
+    [[ -n $right ]] && rc=$(($(tr -cd ':' <<<"$right" | wc -c) + 1))
+    miss=$((8 - lc - rc))
+    for ((i=0;i<miss;i++)); do mid+="0000:"; done
+    ip="${left}:${mid}${right}"
+  fi
+  ip=${ip#:}; ip=${ip%:}
+  IFS=: read -r a b c d e f g h <<<"$ip"
+  printf '%04x%04x%04x%04x%04x%04x%04x%04x' \
+    "$((16#${a:-0}))" "$((16#${b:-0}))" "$((16#${c:-0}))" "$((16#${d:-0}))" \
+    "$((16#${e:-0}))" "$((16#${f:-0}))" "$((16#${g:-0}))" "$((16#${h:-0}))"
+}
+valid_trust() { # IP или сеть: 1.2.3.4, 1.2.3.0/24, 2001:db8::1, 2001:db8::/32
   local v=$1 ip=${1%%/*} len=""
   [[ $v == */* ]] && len=${v#*/}
   if [[ $ip =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
     [[ ${BASH_REMATCH[1]} -le 255 && ${BASH_REMATCH[2]} -le 255 && ${BASH_REMATCH[3]} -le 255 && ${BASH_REMATCH[4]} -le 255 ]] || return 1
     [[ -z $len || ( $len =~ ^[0-9]+$ && $len -ge 8 && $len -le 32 ) ]]
-  else [[ $ip =~ ^[0-9a-fA-F:]+$ && $ip == *:* && -z $len ]]; fi
+  elif [[ $ip =~ ^[0-9a-fA-F:]+$ && $ip == *:* ]]; then
+    [[ -z $len || ( $len =~ ^[0-9]+$ && $len -ge 8 && $len -le 128 ) ]]
+  else
+    return 1
+  fi
 }
-ip_in() { # адрес список-доверенных(через пробел)
-  local ip=$1 t net len m
+# ip_in <адрес> <список через пробел> — IPv4 и IPv6, с поддержкой сетей (CIDR)
+ip_in() {
+  local ip=$1 t net len m h_ip h_net
   for t in $2; do
-    if [[ $t == "$ip" ]]; then return 0; fi
-    if [[ $t == */* && $ip != *:* ]]; then
-      net=${t%/*}; len=${t#*/}; m=$(( (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
-      (( ($(ip2int "$ip") & m) == ($(ip2int "$net") & m) )) && return 0
+    [[ $t == "$ip" ]] && return 0
+    if [[ $t == */* ]]; then
+      net=${t%/*}; len=${t#*/}
+      if [[ $ip == *:* ]]; then
+        # IPv6: сравниваем первые len бит через 32 шестнадцатеричных цифры
+        [[ $len -ge 1 && $len -le 128 ]] || continue
+        h_ip=$(ip62hexa "$ip"); h_net=$(ip62hexa "$net")
+        [[ ${h_ip:0:$((len / 4))} == ${h_net:0:$((len / 4))} ]] && [[ ${len} -le 32 || ${h_ip:$((len / 4)):1} == ${h_net:$((len / 4)):1} ]] && return 0
+        # простое правило: совпадение первых ceil(len/4) hex-цифр достаточно для кратных 4
+        [[ $((len % 4)) -eq 0 && ${h_ip:0:$((len / 4))} == ${h_net:0:$((len / 4))} ]] && return 0
+      else
+        m=$(( (0xFFFFFFFF << (32 - len)) & 0xFFFFFFFF ))
+        (( ($(ip2int "$ip") & m) == ($(ip2int "$net") & m) )) && return 0
+      fi
     fi
   done
   return 1
@@ -3165,20 +3324,29 @@ cmd_core() {
       core_is_pre "$v" && echo -e "\n ${BOLD}${RED}🧪 $v это пререлиз.${NC} ${DIM}Он может содержать ошибки и менять поведение. Для постоянной работы выбирайте стабильные версии.${NC}"
       echo -e "\n Сейчас: ${BOLD}${prev:-?}${NC}  →  будет установлена: ${BOLD}$v${NC}"
       if [[ $yes != 1 ]]; then read -rp "$(echo -e " ${BOLD}Продолжить? Введите yes:${NC} ")" a; [[ $a == yes ]] || die "Отменено."; fi
-      local install_rc=0
+      local install_rc=0 saved_core
+      saved_core=$(mktemp -d) || die "Не удалось сохранить прежнее ядро."
+      cp -p /usr/local/bin/xray "$saved_core/xray" || { rm -rf "$saved_core"; die "Не удалось сохранить прежнее ядро."; }
+      core_restore() {
+        warn "Восстанавливаю прежнее ядро $prev."
+        svc stop xray || return 1
+        cp -p "$saved_core/xray" /usr/local/bin/xray && ensure_xray_runtime_access && ensure_xray_logs && svc restart xray
+      }
       xray_installer install --version "$v" || install_rc=$?
-      ensure_xray_runtime_access || die "Ядро $v установлено, но не удалось настроить права для службы xray. Проверьте владельца и режимы /usr/local/etc/xray и /var/lib/xray/cert."
-      ensure_xray_logs
-      [[ $(xray_version) == "$v" ]] || die "После установки ядро сообщает версию $(xray_version), а не $v. Проверьте вывод установщика выше."
-      local runtime_user; runtime_user=$(xray_runtime_user) || die "Не удалось определить пользователя службы xray."
-      if ! runuser -u "$runtime_user" -- /usr/local/bin/xray run -test -c "$XRAY_CFG" >/dev/null 2>&1; then
-        warn "Текущий конфиг не проходит проверку на $v. Возвращаю $prev."
-        [[ -n $prev ]] && xray_installer install --version "$prev"
-        ensure_xray_runtime_access || true
-        svc restart xray; die "Обновление отменено: $v несовместима с вашим конфигом."
+      local runtime_user
+      if ! ensure_xray_runtime_access || ! ensure_xray_logs || [[ $(xray_version) != "$v" ]] ||
+         ! runtime_user=$(xray_runtime_user) ||
+         ! runuser -u "$runtime_user" -- /usr/local/bin/xray run -test -c "$XRAY_CFG" >/dev/null 2>&1 ||
+         ! svc restart xray; then
+        if core_restore; then
+          rm -rf "$saved_core"
+          die "Обновление не удалось; прежнее ядро восстановлено."
+        fi
+        warn "Не удалось восстановить службу. Копия прежнего ядра: $saved_core/xray"
+        die "Проверьте journalctl -u xray -n 30 --no-pager"
       fi
+      rm -rf "$saved_core"
       st_edit --arg v "$v" '.xray_version = $v'
-      svc restart xray || die "Ядро $v установлено, но Xray не запустился после исправления прав. Проверьте: journalctl -u xray -n 30 --no-pager"
       [[ $install_rc == 0 ]] || warn "Установщик сообщил об ошибке запуска до исправления прав; ядро $v проверено и служба запущена успешно."
       ok "✅ Ядро обновлено: $prev → $v" ;;
     *) die "core: list | update [версия] [--yes]" ;;
@@ -3249,7 +3417,9 @@ restart_bot_if_active() {
 
 snapshot_restore() { # файл
   tar -C / -xzf "$1" || return 1
-  svc daemon-reload; svc restart xray; svc reload nginx 2>/dev/null
+  svc daemon-reload || return 1
+  svc restart xray || return 1
+  svc reload nginx 2>/dev/null || return 1
   restart_bot_if_active
   return 0
 }
@@ -3316,6 +3486,7 @@ cmd_self_update() {
   local files=()
   mapfile -t files < <(sed -n '/^RELEASE_FILES=(/,/)/p' "$tmp/autoxray" | tr -d '()' | sed 's/^RELEASE_FILES=//' | tr ' ' '\n' | grep -E '^[A-Za-z0-9_./-]+$' | grep -v '\.\.')
   [[ ${#files[@]} -gt 0 ]] || files=("${RELEASE_FILES[@]}")
+  [[ " ${files[*]} " == *" autoxray "* ]] || files+=(autoxray)
   for f in "${files[@]}"; do
     [[ $f == autoxray ]] && continue
     mkdir -p "$tmp/$(dirname "$f")"
@@ -3324,6 +3495,9 @@ cmd_self_update() {
   # Файлы релиза сверяются с контрольными суммами, опубликованными вместе с ним (FILES.sha256). Релизы до 3.13 их не имеют.
   local sums sums_url="${AX_SUMS_BASE:-https://github.com/$AX_REPO/releases/download}/$tag/FILES.sha256"
   if sums=$("$CURL" -fsSL --max-time 30 "$sums_url" 2>/dev/null) && [[ -n $sums ]]; then
+    for f in "${files[@]}"; do
+      [[ $(printf '%s\n' "$sums" | awk -v f="$f" '$2 == f || $2 == "*" f {n++} END {print n+0}') == 1 ]] || { rm -rf "$tmp"; die "Манифест релиза не содержит единственную сумму $f."; }
+    done
     (cd "$tmp" && printf '%s\n' "$sums" | sha256sum -c --quiet >/dev/null 2>&1) \
       || { rm -rf "${tmp:?}"; die "Контрольные суммы файлов релиза $tag не совпали: обновление остановлено, ничего не изменено."; }
     echo -e " 🔏 ${DIM}Контрольные суммы релиза $tag совпали${NC}"
@@ -3444,6 +3618,34 @@ cmd_doctor() {
     echo -e "\n ${BOLD}WARP${NC}"
     (cmd_warp check >/dev/null 2>&1) && pass_ "WARP отвечает (warp=on)" || fail_ "WARP не отвечает" "autoxray warp check; autoxray warp register"
   fi
+
+  echo -e "\n ${BOLD}autoXRAY${NC}"
+  local latest; latest=$(latest_ax)
+  if [[ -n $latest ]]; then
+    if ver_gt "$latest" "$AX_VERSION"; then
+      warn_ "автоxray не última версия ($AX_VERSION, есть $latest)" "autoxray self-update"
+    else pass_ "автоxray $AX_VERSION — последняя версия"; fi
+  else warn_ "не удалось проверить версию автоxray" "GitHub API недоступен"; fi
+  [[ -f $STATE ]] && pass_ "state.json существует" || fail_ "state.json не найден" "автоxray не инициализирован"
+  if [[ -f $STATE ]]; then
+    jq empty "$STATE" >/dev/null 2>&1 && pass_ "state.json валидный JSON" || fail_ "state.json повреждён" "восстановите из бэкапа"
+  fi
+  [[ -f /etc/cron.d/autoxray ]] && pass_ "cron автоxray настроен" || warn_ "cron автоxray не найден" "autoxray setup-cron"
+  [[ -f $TRAFFIC ]] && pass_ "traffic.json существует" || warn_ "traffic.json не найден" "будет создан при первом collect"
+
+  echo -e "\n ${BOLD}Сеть (внешняя)${NC}"
+  if "$CURL" -fsS --max-time 5 https://api.github.com >/dev/null 2>&1; then pass_ "api.github.com доступен" ; else warn_ "api.github.com недоступен" "обновления и установка Xray не будут работать"; fi
+  if [[ $(st '.bot.enabled // false') == true ]]; then
+    if "$CURL" -fsS --max-time 5 https://api.telegram.org >/dev/null 2>&1; then pass_ "api.telegram.org доступен" ; else warn_ "api.telegram.org недоступен" "Telegram-бот не будет работать (укажите прокси: autoxray bot proxy)"; fi
+  fi
+
+  echo -e "\n ${BOLD}Xray runtime${NC}"
+  if [[ -r /var/lib/xray/cert/privkey.pem ]]; then
+    local pkm; pkm=$(stat -c '%a' /var/lib/xray/cert/privkey.pem)
+    [[ $pkm == 640 || $pkm == 600 ]] && pass_ "приватный ключ сертификата: права $pkm" || fail_ "приватный ключ сертификата: права $pkm" "нужно 600 или 640"
+  fi
+  if [[ -S /dev/shm/nginx.sock ]] || [[ -e /dev/shm/nginx.sock ]]; then pass_ "сокет nginx (/dev/shm/nginx.sock) существует"; else warn_ "сокет nginx не найден" "Xray не сможет переключаться на веб (fallback)"; fi
+
   echo; rule
   if [[ $bad -eq 0 ]]; then echo -e " 🎉 ${GRN}Критичных проблем не найдено${NC}"; else echo -e " 🚨 ${RED}Критичных проблем: $bad${NC}"; return 1; fi
 }
@@ -4524,6 +4726,8 @@ usage() {
   echo -e "  ${C}autoxray report${N} list|build [имя]|url <имя>|purge <имя>|keep <дней>   ${D}html-отчёты о посещениях (user set --report on)${N}"
   echo -e "  ${C}autoxray user find${N} <текст>  ${C}user list${N} --tag метка   ${D}поиск по имени, заметке и меткам${N}"
   echo -e "  ${C}autoxray route${N} list|add direct|proxy|block <домен|сеть>|del|preset push on|off   ${D}свои правила маршрутов в подписках${N}"
+  echo -e "  ${C}autoxray user export${N} <имя|all> [файл] [--with-traffic] [--with-devices]  ${D}экспорт пользователей в JSON${N}"
+  echo -e "  ${C}autoxray user import${N} <файл> [--force]                ${D}импорт пользователей из JSON${N}"
   echo -e "  ${C}autoxray torrent${N} alert on|off   ${D}уведомление в бот о попытках торрента через сервер${N}"
   echo -e "  ${C}autoxray sub statusnode${N} on|off   ${D}строка «осталось ... до ...» в подписках${N}"
   echo -e "  ${C}autoxray sub announce${N} \"текст\"|off  ${C}sub warn${N} on|off  ${C}sub support${N} @имя|URL|off   ${D}объявление, предупреждения и кнопка поддержки в Happ${N}"
@@ -4586,6 +4790,8 @@ main() {
     sub)          cmd_sub "$@" ;;
     ips)          cmd_ips "$@" ;;
     unban)        cmd_unban "$@" ;;
+    export)       cmd_export_import export "$@" ;;
+    import)       cmd_export_import import "$@" ;;
     setup-cron)   cmd_setup_cron ;;
     doctor)       cmd_doctor ;;
     geo-update)   need_root; cmd_geo_update "$@" ;;
@@ -4597,4 +4803,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ ${AX_UNIT_TEST:-0} != 1 ]]; then
+  main "$@"
+fi

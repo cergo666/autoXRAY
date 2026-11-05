@@ -17,6 +17,11 @@ if [ "$scenario" = verify ]; then
     export PATH=/opt/autoxray/tests/stubs:$PATH
     rm -rf /tmp/rel/v9.9.9; mkdir -p /tmp/rel/v9.9.9; cp -r /opt/autoxray/autoxray /opt/autoxray/templates /opt/autoxray/components /tmp/rel/v9.9.9/
     (cd /tmp/rel/v9.9.9 && files=$(sed -n '/^RELEASE_FILES=(/,/)/p' autoxray | tr -d '()' | sed 's/^RELEASE_FILES=//' | tr ' ' '\n' | grep -E '^[A-Za-z0-9_./-]+$') && sha256sum $files > FILES.sha256)
+    sed -i '/templates\/sub.html/d' /tmp/rel/v9.9.9/FILES.sha256
+    AX_TG=n AX_FP=2 AX_USER=anna AX_WARP=n AUTOXRAY_REF=v9.9.9 AUTOXRAY_RAW=file:///tmp/rel AX_SUMS_BASE=file:///tmp/rel \
+        bash /opt/autoxray/install.sh vpn.test </dev/null >/tmp/install-missing-sum.log 2>&1 \
+        && fail "неполный манифест принят" || { grep -q 'Манифест релиза' /tmp/install-missing-sum.log && pass "неполный манифест отклонён" || fail "неполный манифест: другая ошибка"; }
+    (cd /tmp/rel/v9.9.9 && files=$(sed -n '/^RELEASE_FILES=(/,/)/p' autoxray | tr -d '()' | sed 's/^RELEASE_FILES=//' | tr ' ' '\n' | grep -E '^[A-Za-z0-9_./-]+$') && sha256sum $files > FILES.sha256)
     echo '<!-- подмена -->' >> /tmp/rel/v9.9.9/templates/sub.html
     AX_TG=n AX_FP=2 AX_USER=anna AX_WARP=n AUTOXRAY_REF=v9.9.9 AUTOXRAY_RAW=file:///tmp/rel AX_SUMS_BASE=file:///tmp/rel \
         bash /opt/autoxray/install.sh vpn.test </dev/null >/tmp/install-tamper.log 2>&1 && fail "install.sh принял подменённый файл" \

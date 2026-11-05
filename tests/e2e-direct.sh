@@ -432,6 +432,17 @@ else
     fail "core update не восстановил службу после отказа первого запуска"
     tail -n 20 /tmp/core-update-permissions.log
 fi
+# Несовпадение версии после работы установщика должно вернуть сохранённый бинарник и запустить службу.
+core_before=$(sha256sum /usr/local/bin/xray | cut -d' ' -f1)
+if AX_XRAY_USER=xray AX_API=file:///tmp/ax-api AX_XRAY_INSTALLER=file:///tmp/xray-installer-permissions-test.sh AX_XRAY_INSTALLER_SHA256="$fake_installer_sha" \
+    autoxray core update v1.2.3 --yes >/tmp/core-update-rollback.log 2>&1; then
+    fail "core update принял неверную версию"
+elif [ "$(sha256sum /usr/local/bin/xray | cut -d' ' -f1)" = "$core_before" ] && ss -ltn | grep -q ':443 '; then
+    pass "неудачное core update восстановило локальную копию и запустило Xray"
+else
+    fail "не удалось восстановить ядро после ошибки установки"
+    tail -n 10 /tmp/core-update-rollback.log
+fi
 rm -f /tmp/xray-installer-permissions-test.sh
 
 step "Выбор пользователя без терминала (нумерованный список)"
@@ -667,6 +678,8 @@ ls /var/lib/autoxray/snapshots/*-v$ORIG_VER.tar.gz >/dev/null 2>&1 && pass "пе
 # подмена файла в релизе: суммы не сходятся, обновление отклоняется до любых изменений
 mk_release 9.9.7; sums_for 9.9.7; echo '<!-- подмена -->' >> /tmp/rel/v9.9.7/templates/sub.html
 AX_RAW_BASE=file:///tmp/rel autoxray self-update v9.9.7 >/tmp/upd-tamper.out 2>&1 && fail "обновление с подменённым файлом прошло" || { grep -q 'не совпали' /tmp/upd-tamper.out && [ "$(autoxray version | awk '{print $2}')" = 9.9.9 ] && pass "подменённый файл релиза: обновление отклонено, версия не изменилась" || fail "подмена: $(tail -n 3 /tmp/upd-tamper.out)"; }
+mk_release 9.9.5; sums_for 9.9.5; sed -i '/templates\/sub.html/d' /tmp/rel/v9.9.5/FILES.sha256
+AX_RAW_BASE=file:///tmp/rel autoxray self-update v9.9.5 >/tmp/upd-incomplete.out 2>&1 && fail "неполный манифест принят" || { grep -q 'Манифест релиза' /tmp/upd-incomplete.out && pass "неполный манифест обновления отклонён" || fail "неполный манифест: другая ошибка"; }
 mk_release 9.9.6; rm -f /tmp/rel/v9.9.6/FILES.sha256
 AX_RAW_BASE=file:///tmp/rel autoxray self-update v9.9.6 >/tmp/upd-nosum.out 2>&1 && fail "обновление без контрольных сумм прошло" || { grep -q 'контрольные суммы' /tmp/upd-nosum.out && pass "релиз новее 3.13 без контрольных сумм не ставится" || fail "без сумм: $(tail -n 3 /tmp/upd-nosum.out)"; }
 mk_release 9.9.8 'post_update_check() { return 1; }'; sums_for 9.9.8

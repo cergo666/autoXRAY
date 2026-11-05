@@ -19,6 +19,7 @@ suite() { # имя -> запуск набора
     migrate) run "e2e-install.sh migrate" ;;
     verify)  run "e2e-install.sh verify" ;;
     supply-chain) run e2e-supply-chain.sh ;;
+    unit)    bash "$(dirname "$0")/unit.sh" ;;
   esac
 }
 
@@ -27,8 +28,9 @@ case "${1:-all}" in
   bridge)  suites=(bridge) ;;
   install) suites=(fresh migrate verify) ;;
   supply-chain) suites=(supply-chain) ;;
-  all)     suites=(direct bridge fresh migrate verify supply-chain) ;;
-  *) echo "usage: $0 [direct|bridge|install|supply-chain|all]"; exit 2 ;;
+  unit)    suites=(unit) ;;
+  all)     suites=(direct bridge fresh migrate verify supply-chain unit) ;;
+  *) echo "usage: $0 [direct|bridge|install|supply-chain|unit|all]"; exit 2 ;;
 esac
 
 if [[ ${AX_SERIAL:-0} == 1 || ${#suites[@]} -eq 1 ]]; then
