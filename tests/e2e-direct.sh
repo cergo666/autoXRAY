@@ -664,7 +664,7 @@ ORIG_VER=$(autoxray version | awk '{print $2}')
 mk_release() { # версия [постфикс-код]
   rm -rf "/tmp/rel/v$1"; mkdir -p "/tmp/rel/v$1"; cp -r /opt/autoxray/templates /opt/autoxray/components "/tmp/rel/v$1/"
   sed "s/^AX_VERSION=\".*\"/AX_VERSION=\"$1\"/" /opt/autoxray/autoxray > "/tmp/rel/v$1/autoxray"
-  [ -n "${2:-}" ] && sed -i "s|^main \"\$@\"\$|$2\nmain \"\$@\"|" "/tmp/rel/v$1/autoxray"
+  [ -n "${2:-}" ] && sed -i "s|^[[:space:]]*main \"\$@\"\$|$2\nmain \"\$@\"|" "/tmp/rel/v$1/autoxray"
   return 0
 }
 export AX_SUMS_BASE=file:///tmp/rel
