@@ -2308,7 +2308,7 @@ parse_vless() {
 
 cmd_node() {
   need_state
-  [[ $(mode) == bridge ]] || die "Узлы есть только в режиме моста (установка: autoXRAY3.sh домен vless://...)."
+  [[ $(mode) == bridge ]] || die "Эта установка работает в прямом режиме. Для моста на RU-сервере без существующей установки autoXRAY запустите install.sh с доменом RU-сервера и хотя бы одной vless:// ссылкой EU-узла. Инструкция: https://github.com/cergo666/autoXRAY#мост-ru--eu"
   local sub=${1:-list}; shift || true
   case $sub in
     add) need_root
