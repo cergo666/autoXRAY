@@ -2221,10 +2221,10 @@ bot_watch() {
   bot_enabled || return 0
   [[ $DRY == 1 ]] && return 0
   local latest today days svc_ last
-  latest=$(latest_ax)
-  if ver_gt "$latest" "$AX_VERSION" && [[ $(cat "$AX_ETC/.notified-version" 2>/dev/null) != "$latest" ]]; then
+  latest=$(bot_available_update)
+  if [[ -n $latest && $(cat "$AX_ETC/.notified-version" 2>/dev/null) != "$latest" ]]; then
     printf '%s\n' "$latest" >"$AX_ETC/.notified-version"
-    bot_notify "🆕 Доступна версия autoXRAY <b>$latest</b> (у вас $AX_VERSION). На сервере: <code>autoxray self-update</code>"
+    bot_notify "🆕 Доступна версия autoXRAY <b>$latest</b> (у вас $AX_VERSION)." "$(bot_update_notice_kb "$latest")"
   fi
   if [[ $(st '.bot.backup_weekly // false') == true && -s $BACKUP_PASS_FILE ]] \
      && [[ $(( $(now) - $(stat -c %Y "$AX_ETC/.backup-sent" 2>/dev/null || echo 0) )) -gt 604800 ]]; then
@@ -3853,17 +3853,129 @@ bot_is_admin() { jq -e --argjson i "$1" '(.bot.admins // []) | index($i) != null
 # Уведомление всем администраторам (не мешает работе, если Telegram недоступен)
 bot_notify() {
   bot_enabled || return 0
-  local a; for a in $(bot_admins); do tg_send "$a" "$1" "" 8 || true; done
+  local a; for a in $(bot_admins); do tg_send "$a" "$1" "${2:-}" 8 || true; done
   return 0
 }
 
 BOT_MAIN_KB='{"inline_keyboard":[[{"text":"📊 Статус","callback_data":"status"},{"text":"👥 Пользователи","callback_data":"list"}],[{"text":"🩺 Диагностика","callback_data":"doctor"},{"text":"🌍 WARP","callback_data":"warp"}]]}'
+
+# Кнопка обновления появляется только для релиза с корректным номером выше установленного.
+# Версию дополнительно проверяет независимый процесс непосредственно перед обновлением.
+bot_available_update() {
+  local latest
+  latest=$(latest_ax)
+  if [[ $latest =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && ver_gt "$latest" "$AX_VERSION"; then
+    printf '%s\n' "$latest"
+  fi
+  return 0
+}
+
+bot_update_notice_kb() { # version
+  jq -nc --arg ver "$1" '{inline_keyboard: [[{text: ("⬆️ Обновить до " + $ver), callback_data: ("upd:ask:" + $ver)}]]}'
+}
+
+bot_status_kb() {
+  local latest
+  latest=$(bot_available_update)
+  if [[ -n $latest ]]; then
+    jq -c --arg ver "$latest" '.inline_keyboard += [[{text: ("⬆️ Обновить до " + $ver), callback_data: ("upd:ask:" + $ver)}]]' <<<"$BOT_MAIN_KB"
+  else
+    printf '%s\n' "$BOT_MAIN_KB"
+  fi
+}
+
+bot_update_prompt() { # chat version
+  local chat=$1 requested=$2 latest message
+  latest=$(bot_available_update)
+  if [[ -z $latest || $requested != "$latest" ]]; then
+    tg_send "$chat" 'ℹ️ Доступная версия изменилась или обновление уже установлено. Откройте /status.' "$(bot_status_kb)"
+    return 0
+  fi
+  message=$(printf '⬆️ <b>Обновление autoXRAY</b>\n\nТекущая: <b>%s</b>\nНовая: <b>%s</b>\n\nСистема создаст резервную копию, проверит SHA256 и выполнит selfcheck. При ошибке установки предусмотрен откат.\n\n⚠️ Ручные изменения скрипта могут быть потеряны. Убедитесь, что ваши модули совместимы с новым релизом.\n\nПодтвердить обновление?' "$AX_VERSION" "$latest")
+  tg_send "$chat" "$message" "$(bot_confirm_kb "upd:do:$latest" 'status')"
+}
+
+bot_update_start() { # chat version; NEVER run self-update inside bot's polling process
+  local chat=$1 tag=$2 output message
+  [[ $tag =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ $tag == "$(bot_available_update)" ]] || {
+    tg_send "$chat" 'ℹ️ Версия изменилась. Повторно откройте /status.' "$(bot_status_kb)"
+    return 0
+  }
+  # Fixed unit name prevents starting another job while one update is still running.
+  if output=$(systemd-run --quiet --collect --no-block --unit=autoxray-bot-update \
+      --property=RuntimeMaxSec=1800 "$AX_BIN" bot-update-worker "$chat" "$tag" 2>&1); then
+    message=$(printf '⏳ Запущено обновление autoXRAY <b>%s → %s</b>.\nЭто отдельная systemd-задача. После завершения пришлю результат.' "$AX_VERSION" "$tag")
+    tg_send "$chat" "$message"
+  else
+    tg_send "$chat" '⚠️ Не удалось запустить задачу обновления. Возможно, обновление уже выполняется. Проверьте systemctl status autoxray-bot-update.'
+  fi
+}
+
+
+# Protect local modifications from silent loss. The button is intended only for
+# unmodified official installations; manual/custom builds require migration first.
+bot_update_original_is_pristine() {
+  local sums expected actual url
+  url="${AX_SUMS_BASE:-https://github.com/$AX_REPO/releases/download}/v$AX_VERSION/FILES.sha256"
+  sums=$("$CURL" -fsSL --max-time 20 "$url" 2>/dev/null) || return 1
+  expected=$(printf '%s\n' "$sums" | awk '$2 == "autoxray" || $2 == "*autoxray" {print $1}')
+  [[ $expected =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+  actual=$(sha256sum "$AX_BIN" 2>/dev/null | awk '{print $1}') || return 1
+  [[ ${actual,,} == ${expected,,} ]]
+}
+
+# Выполняется только из отдельной systemd-службы, а не из long-polling Telegram-бота.
+bot_update_worker() { # admin chat version
+  need_root
+  local chat=${1:-} tag=${2:-} live rc log installed fd
+  [[ $chat =~ ^[0-9]{1,20}$ && $tag =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'Неверные параметры обновления'
+  bot_is_admin "$chat" || die 'Обновление разрешено только Telegram-администратору'
+  # Explicit root-only update lock also protects direct CLI invocation.
+  exec {fd}>"$AX_ETC/.bot-update.lock"
+  if ! flock -n "$fd"; then
+    tg_send "$chat" '⚠️ Другое обновление уже выполняется.' || true
+    return 1
+  fi
+  if ! ver_gt "$tag" "$AX_VERSION"; then
+    tg_send "$chat" 'ℹ️ Запрошенная версия уже установлена или устарела.' || true
+    return 0
+  fi
+  # Verify pinned release against upstream again: reject forged / stale callback data.
+  live=$("$CURL" -fsS --max-time 15 "$API/repos/$AX_REPO/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null) || live=''
+  if [[ $live != "v$tag" && $live != "$tag" ]]; then
+    tg_send "$chat" '⚠️ Релиз не удалось проверить через GitHub, либо доступна другая версия. Ничего не устанавливалось.' || true
+    return 1
+  fi
+  if ! bot_update_original_is_pristine; then
+    tg_send "$chat" '🛑 Автообновление запрещено: установленный скрипт отличается от официального релиза или его контрольную сумму не удалось проверить. Возможны локальные доработки. Выполните миграцию модулей перед обновлением; никаких файлов не изменено.' || true
+    return 1
+  fi
+  local log_dir="/var/lib/autoxray/bot-updates"
+  (umask 077; mkdir -p "$log_dir") || die 'Не создать каталог журнала обновления'
+  chmod 700 "$log_dir"
+  log="$log_dir/$(date -u +%Y%m%dT%H%M%SZ)-v${AX_VERSION}-to-${tag}.log"
+  if (umask 077; "$AX_BIN" self-update "v$tag" >"$log" 2>&1); then
+    installed=$("$AX_BIN" version 2>/dev/null) || installed=''
+    if [[ $installed == "autoxray $tag" ]]; then
+      tg_send "$chat" "$(printf '✅ <b>autoXRAY обновлён до %s</b>.\nПроверка конфигурации и служб выполнена штатным selfcheck.\nЖурнал на VPS: <code>%s</code>' "$tag" "$(html_esc <<<"$log")")" || true
+      return 0
+    fi
+    tg_send "$chat" "⚠️ Обновление завершилось, но фактическая версия не соответствует $tag. Проверьте журнал на VPS: <code>$(html_esc <<<"$log")</code>" || true
+    return 1
+  else
+    rc=$?
+    tg_send "$chat" "$(printf '❌ <b>Обновление autoXRAY до %s не удалось</b> (код %s).\nШтатный установщик выполняет откат при ошибке selfcheck. Проверьте итоговое состояние и журнал: <code>%s</code>' "$tag" "$rc" "$(html_esc <<<"$log")")" || true
+    return "$rc"
+  fi
+}
+
 
 bot_help() {
   echo "<b>autoXRAY $AX_VERSION: управление сервером</b>"
   cat <<'EOF'
 
 /status — состояние
+/update — проверить обновление и запросить подтверждение
 /users — пользователи (кнопки)
 /user <code>имя</code> — карточка
 /add <code>имя [ГБ] [дней]</code> — новый пользователь
@@ -4016,7 +4128,12 @@ bot_callback() { # chat message_id callback_id data
     bc) if [[ $b == ok && -s $AX_ETC/.broadcast.txt ]]; then bot_broadcast_send "$chat"; else rm -f "$AX_ETC/.broadcast.txt"; tg_send "$chat" "Рассылка отменена."; fi ;;
     list) bot_show_list "$chat" "$mid" ;;
     new) tg_send "$chat" "Создайте пользователя: <code>/add имя [ГБ] [дней]</code>" ;;
-    status) bot_do cmd_status; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" "$BOT_MAIN_KB" ;;
+    status) bot_do cmd_status; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" "$(bot_status_kb)" ;;
+    upd)
+      case $b in
+        ask) bot_update_prompt "$chat" "$c" ;;
+        do) bot_update_start "$chat" "$c" ;;
+      esac ;;
     doctor) bot_do cmd_doctor; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" ;;
     warp) bot_do cmd_warp status; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" ;;
     u)
@@ -4057,7 +4174,11 @@ bot_command() { # chat текст
   need_name() { valid_name "$name" && [[ -n $(user_get "$name") ]] || { tg_send "$chat" "Укажите существующего пользователя: <code>$cmd имя</code>"; return 1; }; }
   case $cmd in
     /start|/help) tg_send "$chat" "$(bot_help)" "$BOT_MAIN_KB" ;;
-    /status) bot_do cmd_status; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" "$BOT_MAIN_KB" ;;
+    /status) bot_do cmd_status; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" "$(bot_status_kb)" ;;
+    /update)
+      local latest; latest=$(bot_available_update)
+      if [[ -n $latest ]]; then bot_update_prompt "$chat" "$latest"
+      else tg_send "$chat" "✅ Установлена актуальная версия autoXRAY <b>$AX_VERSION</b> (или сведения о новых релизах недоступны)."; fi ;;
     /users) bot_show_list "$chat" "" ;;
     /user) need_name && bot_show_user "$chat" "" "$name" ;;
     /add)
@@ -4777,6 +4898,7 @@ main() {
     migrate)      cmd_migrate "$@" ;;
     node|nodes)   cmd_node "$@" ;;
     self-update)  cmd_self_update "$@" ;;
+    bot-update-worker) bot_update_worker "$@" ;;
     uninstall)    cmd_uninstall ;;
     selfcheck)    post_update_check ;;
     site)         cmd_site "$@" ;;

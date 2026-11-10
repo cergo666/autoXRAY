@@ -19,7 +19,7 @@ suite() { # имя -> запуск набора
     migrate) run "e2e-install.sh migrate" ;;
     verify)  run "e2e-install.sh verify" ;;
     supply-chain) run e2e-supply-chain.sh ;;
-    unit)    bash "$(dirname "$0")/unit.sh" ;;
+    unit)    bash "$(dirname "$0")/unit.sh" && bash "$(dirname "$0")/test-bot-self-update.sh" ;;
   esac
 }
 
