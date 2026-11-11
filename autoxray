@@ -3394,8 +3394,9 @@ AX_BIN="${AX_BIN:-/usr/local/bin/autoxray}"
 RELEASE_FILES=(autoxray templates/sub.html templates/nginx.conf templates/report.html templates/gen_page.sh
                components/telegram/install.sh components/telegram/update.sh components/telegram/uninstall.sh components/telegram/artifacts.sh)
 
-# One update lock shared by SSH CLI and the detached Telegram worker.
-# Held across version lookup, download, validation, install, selfcheck and rollback.
+# One maintenance lock shared by CLI/TUI/Telegram update and manual rollback.
+# Held across version lookup, download, validation, installation, selfcheck,
+# automatic rollback on failure, and manual snapshot restoration.
 # The worker calls cmd_self_update in-process so it never tries to reacquire
 # its own lock from a child autoXRAY process.
 with_update_lock() {
@@ -4792,7 +4793,7 @@ menu_update() {
            fi
          fi; pause ;;
       2) (cmd_geo_update); pause ;;
-      3) (cmd_rollback); pause ;;
+      3) (with_update_lock cmd_rollback); pause ;;
       4) return 0 ;;
     esac
   done
@@ -4825,7 +4826,7 @@ menu_maint() {
       0) (cmd_backup); pause ;;
       1) (cmd_render); pause ;;
       2) (cmd_site regenerate); pause ;;
-      3) (cmd_rollback); pause ;;
+      3) (with_update_lock cmd_rollback); pause ;;
       4) (cmd_hop status)
          if [[ $(st '.hop.enabled // false') == true ]]; then confirm "Выключить смену портов" && (cmd_hop off)
          else
@@ -4936,7 +4937,7 @@ main() {
     site)         cmd_site "$@" ;;
     bot)          cmd_bot "$@" ;;
     debug)        cmd_debug "$@" ;;
-    rollback)     cmd_rollback "$@" ;;
+    rollback)     with_update_lock cmd_rollback "$@" ;;
     ipwatch)      need_root; locked cmd_ipwatch ;;
     report)       cmd_report "$@" ;;
     route)        cmd_route "$@" ;;

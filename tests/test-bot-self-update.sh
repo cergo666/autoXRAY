@@ -10,9 +10,10 @@ latest_ax() { printf '%s\n' "${FAKE_LATEST:-3.14.5}"; }
 assert_contains() { [[ $1 == *"$2"* ]] || { printf 'FAIL: expected substring %q\n' "$2"; exit 1; }; }
 
 # The next release must be computed from installed AX_VERSION, never pinned to
-# 3.14.5: CI also runs after the next upstream release is published.
+# the next release: CI also runs after an upstream version bump.
 IFS=. read -r version_major version_minor version_patch <<<"$AX_VERSION"
 NEXT_VERSION="$version_major.$version_minor.$((version_patch + 1))"
+FOLLOWING_VERSION="$version_major.$version_minor.$((version_patch + 2))"
 
 FAKE_LATEST=$NEXT_VERSION
 [[ $(bot_available_update) == "$NEXT_VERSION" ]]
@@ -52,7 +53,7 @@ bot_update_start 10001 '3.14.5;evil'
 [[ $(wc -l <"$LAUNCH_LOG") -eq 1 ]]
 assert_contains "$TG_MSG" 'Версия изменилась'
 
-FAKE_LATEST=3.14.6
+FAKE_LATEST=$FOLLOWING_VERSION
 bot_update_start 10001 "$NEXT_VERSION"
 [[ $(wc -l <"$LAUNCH_LOG") -eq 1 ]]
 assert_contains "$TG_MSG" 'Версия изменилась'
@@ -62,7 +63,7 @@ printf 'OK: Telegram self-update UI, confirmation, stale version, validation, de
 # All release-managed installed files must match the manifest of the current
 # official release. A modified template or Telegram component must block update.
 FIXTURE=$(mktemp -d)
-trap 'rm -rf "$FIXTURE" "$LAUNCH_LOG"' EXIT
+trap 'if [[ -n ${LOCK_HOLDER_PID:-} ]]; then kill "$LOCK_HOLDER_PID" 2>/dev/null || true; fi; rm -rf "$FIXTURE" "$LAUNCH_LOG"' EXIT
 AX_BIN="$FIXTURE/autoxray"
 TPL_DIR="$FIXTURE/share"
 AX_ETC="$FIXTURE/etc"
@@ -125,26 +126,79 @@ assert_lock_held() {
   fi
 }
 with_update_lock assert_lock_held
-# Verify that BOTH public command entry points use the same wrapper, without
-# executing an actual update or contacting systemd. The TUI path uses the same
-# wrapper in menu_update() as well.
+# Verify that CLI update and worker routes use the lock without invoking
+# real downloads, systemd or replacing any files.
 cmd_self_update() { assert_lock_held; }
 bot_update_worker() { assert_lock_held; }
 main self-update
 main bot-update-worker
-# The interactive TUI must not bypass the common lock.
+
+# Exercise the REAL cmd_rollback with a dummy snapshot and a stub restore.
+# This proves that rollback cannot get as far as restoring files when an
+# update holds the same lock, without writing to the host filesystem.
+: >"$SNAP_DIR/fixture.tar.gz"
+RESTORE_LOG="$FIXTURE/restore.log"
+: >"$RESTORE_LOG"
+confirm() { return 0; }
+snapshot_restore() {
+  assert_lock_held || return 1
+  printf '%s\n' "$1" >>"$RESTORE_LOG"
+}
+main rollback 1
+[[ $(wc -l <"$RESTORE_LOG") -eq 1 ]] || {
+  echo 'FAIL: unlocked rollback did not restore the fixture'; exit 1
+}
+
+# Check BOTH TUI rollback entry points and its update entry point.
 grep -Fq '0) (with_update_lock cmd_self_update); pause ;;' "$ROOT/autoxray" || {
   echo 'FAIL: TUI bypasses update lock'; exit 1
 }
-flock -n "$SNAP_DIR/.update.lock" -c true || {
-  echo 'FAIL: update lock was not released'; exit 1
+[[ $(grep -Fc '3) (with_update_lock cmd_rollback); pause ;;' "$ROOT/autoxray") -eq 2 ]] || {
+  echo 'FAIL: a TUI rollback path bypasses the lock'; exit 1
 }
-# Another CLI update cannot acquire the same lock while the first holds it.
+flock -n "$SNAP_DIR/.update.lock" -c true || {
+  echo 'FAIL: maintenance lock was not released'; exit 1
+}
+
+# Hold the lock in ANOTHER process, with explicit synchronization rather
+# than timing-based sleeps. CLI update and manual rollback must both refuse
+# to run while that process holds it.
+LOCK_READY="$FIXTURE/lock-ready"
+LOCK_RELEASE="$FIXTURE/lock-release.fifo"
+mkfifo "$LOCK_RELEASE"
 (
   exec 55>"$SNAP_DIR/.update.lock"
-  flock -n 55
-  if (with_update_lock true >/dev/null 2>&1); then
-    echo 'FAIL: concurrent update was accepted'; exit 1
-  fi
-)
-printf 'OK: shared CLI/Telegram update lock serializes updates\n'
+  flock -n 55 || exit 1
+  : >"$LOCK_READY"
+  IFS= read -r _ <"$LOCK_RELEASE"
+) &
+LOCK_HOLDER_PID=$!
+for ((tries=0; tries<200; tries++)); do
+  [[ -f $LOCK_READY ]] && break
+  sleep 0.02
+done
+[[ -f $LOCK_READY ]] || { echo 'FAIL: competing lock holder did not start'; exit 1; }
+if (main self-update >/dev/null 2>&1); then
+  echo 'FAIL: concurrent CLI update was accepted'; exit 1
+fi
+if (main bot-update-worker 10001 >/dev/null 2>&1); then
+  echo 'FAIL: concurrent Telegram update was accepted'; exit 1
+fi
+if (main rollback 1 >/dev/null 2>&1); then
+  echo 'FAIL: concurrent CLI rollback was accepted'; exit 1
+fi
+[[ $(wc -l <"$RESTORE_LOG") -eq 1 ]] || {
+  echo 'FAIL: rollback restored files while maintenance lock was busy'; exit 1
+}
+printf 'release\n' >"$LOCK_RELEASE"
+wait "$LOCK_HOLDER_PID"
+LOCK_HOLDER_PID=''
+# Lock must become available again after competing update/rollback exits.
+main rollback 1
+[[ $(wc -l <"$RESTORE_LOG") -eq 2 ]] || {
+  echo 'FAIL: rollback did not recover after lock became free'; exit 1
+}
+flock -n "$SNAP_DIR/.update.lock" -c true || {
+  echo 'FAIL: maintenance lock leaked after rollback'; exit 1
+}
+printf 'OK: CLI/Telegram updates and both TUI/CLI rollback paths share maintenance lock\n'
