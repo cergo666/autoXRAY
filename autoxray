@@ -3394,6 +3394,30 @@ AX_BIN="${AX_BIN:-/usr/local/bin/autoxray}"
 RELEASE_FILES=(autoxray templates/sub.html templates/nginx.conf templates/report.html templates/gen_page.sh
                components/telegram/install.sh components/telegram/update.sh components/telegram/uninstall.sh components/telegram/artifacts.sh)
 
+# One update lock shared by SSH CLI and the detached Telegram worker.
+# Held across version lookup, download, validation, install, selfcheck and rollback.
+# The worker calls cmd_self_update in-process so it never tries to reacquire
+# its own lock from a child autoXRAY process.
+with_update_lock() {
+  need_root
+  local update_fd update_rc=0
+  # This file must live OUTSIDE $AX_ETC: snapshot_restore replaces files in
+  # $AX_ETC, which could otherwise replace the locked inode mid-rollback.
+  mkdir -p "$SNAP_DIR" || die "Не удалось создать $SNAP_DIR"
+  chmod 700 "$SNAP_DIR" || die "Не удалось защитить $SNAP_DIR"
+  exec {update_fd}>"$SNAP_DIR/.update.lock" || die "Не удалось открыть lock обновления"
+  if ! flock -n "$update_fd"; then
+    if [[ ${1:-} == bot_update_worker && ${2:-} =~ ^[0-9]{1,20}$ ]]; then
+      tg_send "$2" '⚠️ Обновление autoXRAY уже выполняется (через Telegram или SSH).' || true
+    fi
+    exec {update_fd}>&-
+    die 'Обновление autoXRAY уже выполняется (через Telegram или SSH).'
+  fi
+  "$@" || update_rc=$?
+  exec {update_fd}>&-
+  return "$update_rc"
+}
+
 # Снимок всего, что меняет обновление: скрипт, шаблоны, настройки, конфиги Xray и nginx, расписание
 snapshot_create() {
   local f p paths=()
@@ -3896,14 +3920,14 @@ bot_update_prompt() { # chat version
 }
 
 bot_update_start() { # chat version; NEVER run self-update inside bot's polling process
-  local chat=$1 tag=$2 output message
+  local chat=$1 tag=$2 message
   [[ $tag =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ $tag == "$(bot_available_update)" ]] || {
     tg_send "$chat" 'ℹ️ Версия изменилась. Повторно откройте /status.' "$(bot_status_kb)"
     return 0
   }
   # Fixed unit name prevents starting another job while one update is still running.
-  if output=$(systemd-run --quiet --collect --no-block --unit=autoxray-bot-update \
-      --property=RuntimeMaxSec=1800 "$AX_BIN" bot-update-worker "$chat" "$tag" 2>&1); then
+  if systemd-run --quiet --collect --no-block --unit=autoxray-bot-update \
+      --property=RuntimeMaxSec=1800 "$AX_BIN" bot-update-worker "$chat" "$tag" >/dev/null 2>&1; then
     message=$(printf '⏳ Запущено обновление autoXRAY <b>%s → %s</b>.\nЭто отдельная systemd-задача. После завершения пришлю результат.' "$AX_VERSION" "$tag")
     tg_send "$chat" "$message"
   else
@@ -3912,30 +3936,38 @@ bot_update_start() { # chat version; NEVER run self-update inside bot's polling 
 }
 
 
-# Protect local modifications from silent loss. The button is intended only for
-# unmodified official installations; manual/custom builds require migration first.
+# Compare every release-managed file overwritten by self-update, not just the
+# main script. Fail closed on missing files, bad/duplicate manifest entries and
+# local modifications. User state and config files are not release-managed.
 bot_update_original_is_pristine() {
-  local sums expected actual url
+  local sums expected actual url file installed
   url="${AX_SUMS_BASE:-https://github.com/$AX_REPO/releases/download}/v$AX_VERSION/FILES.sha256"
   sums=$("$CURL" -fsSL --max-time 20 "$url" 2>/dev/null) || return 1
-  expected=$(printf '%s\n' "$sums" | awk '$2 == "autoxray" || $2 == "*autoxray" {print $1}')
-  [[ $expected =~ ^[0-9a-fA-F]{64}$ ]] || return 1
-  actual=$(sha256sum "$AX_BIN" 2>/dev/null | awk '{print $1}') || return 1
-  [[ ${actual,,} == ${expected,,} ]]
+  [[ -n $sums ]] || return 1
+  for file in "${RELEASE_FILES[@]}"; do
+    case $file in
+      autoxray) installed=$AX_BIN ;;
+      templates/*) installed="$TPL_DIR/${file#templates/}" ;;
+      components/telegram/*) installed="$TPL_DIR/telegram/${file#components/telegram/}" ;;
+      *) return 1 ;;
+    esac
+    # Manifest lookup must produce exactly one 64-character SHA256 sum.
+    expected=$(printf '%s\n' "$sums" | awk -v name="$file" '
+      $2 == name || $2 == "*" name {print $1}')
+    [[ $expected =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+    [[ -f $installed && ! -L $installed ]] || return 1
+    actual=$(sha256sum "$installed" 2>/dev/null | awk '{print $1}') || return 1
+    [[ ${actual,,} == "${expected,,}" ]] || return 1
+  done
+  return 0
 }
 
 # Выполняется только из отдельной systemd-службы, а не из long-polling Telegram-бота.
 bot_update_worker() { # admin chat version
   need_root
-  local chat=${1:-} tag=${2:-} live rc log installed fd
+  local chat=${1:-} tag=${2:-} live rc log installed
   [[ $chat =~ ^[0-9]{1,20}$ && $tag =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'Неверные параметры обновления'
   bot_is_admin "$chat" || die 'Обновление разрешено только Telegram-администратору'
-  # Explicit root-only update lock also protects direct CLI invocation.
-  exec {fd}>"$AX_ETC/.bot-update.lock"
-  if ! flock -n "$fd"; then
-    tg_send "$chat" '⚠️ Другое обновление уже выполняется.' || true
-    return 1
-  fi
   if ! ver_gt "$tag" "$AX_VERSION"; then
     tg_send "$chat" 'ℹ️ Запрошенная версия уже установлена или устарела.' || true
     return 0
@@ -3954,7 +3986,7 @@ bot_update_worker() { # admin chat version
   (umask 077; mkdir -p "$log_dir") || die 'Не создать каталог журнала обновления'
   chmod 700 "$log_dir"
   log="$log_dir/$(date -u +%Y%m%dT%H%M%SZ)-v${AX_VERSION}-to-${tag}.log"
-  if (umask 077; "$AX_BIN" self-update "v$tag" >"$log" 2>&1); then
+  if (umask 077; cmd_self_update "v$tag" >"$log" 2>&1); then
     installed=$("$AX_BIN" version 2>/dev/null) || installed=''
     if [[ $installed == "autoxray $tag" ]]; then
       tg_send "$chat" "$(printf '✅ <b>autoXRAY обновлён до %s</b>.\nПроверка конфигурации и служб выполнена штатным selfcheck.\nЖурнал на VPS: <code>%s</code>' "$tag" "$(html_esc <<<"$log")")" || true
@@ -4749,7 +4781,7 @@ menu_update() {
     echo
     choose "Что обновить" "📦 autoxray (скрипты и шаблоны)" "⚙️  Ядро Xray: версии и обновление" "🗺 Гео-данные (geoip, geosite)" "🕘 Откат к предыдущей версии" "🔙 Назад" || return 0
     case $CHOICE in
-      0) (cmd_self_update); pause ;;
+      0) (with_update_lock cmd_self_update); pause ;;
       1) newer=$(core_newer)
          clear; cmd_core list; echo
          if [[ -n $newer ]]; then
@@ -4897,8 +4929,8 @@ main() {
     init)         cmd_init "$@" ;;
     migrate)      cmd_migrate "$@" ;;
     node|nodes)   cmd_node "$@" ;;
-    self-update)  cmd_self_update "$@" ;;
-    bot-update-worker) bot_update_worker "$@" ;;
+    self-update)  with_update_lock cmd_self_update "$@" ;;
+    bot-update-worker) with_update_lock bot_update_worker "$@" ;;
     uninstall)    cmd_uninstall ;;
     selfcheck)    post_update_check ;;
     site)         cmd_site "$@" ;;
