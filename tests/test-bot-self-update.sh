@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tests only UI/routing. No system changes, downloads, Telegram calls or service operations.
+# Tests UI, update/rollback locking and failure paths. Never touch real system services.
 # shellcheck disable=SC1090,SC1091,SC2034
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -117,39 +117,61 @@ sed -i '$d' "$SUMS_FILE"
 bot_update_original_is_pristine || { echo 'FAIL: restored installation rejected'; exit 1; }
 printf 'OK: all release-managed files protected from overwrite\n'
 
-# The shared lock must protect the full update and be released on return.
-# No update is performed in this test.
+# Real flock supervisor regression. Run command handlers in a fresh shell,
+# just like production. An external `flock --close` retains the lock only in its
+# supervisor process, never in the update shell or its background descendants.
+# Substitute harmless service/restore functions in a COPY of the source to
+# exercise the real dispatcher and rollback selector without touching the host.
+TEST_DRIVER="$FIXTURE/test-driver.sh"
+cp "$ROOT/autoxray" "$TEST_DRIVER"
+cat >>"$TEST_DRIVER" <<'BASH'
 need_root() { :; }
 assert_lock_held() {
   if flock -n "$SNAP_DIR/.update.lock" -c true; then
     echo 'FAIL: common update lock was not held'; return 1
   fi
 }
-with_update_lock assert_lock_held
-# Verify that CLI update and worker routes use the lock without invoking
-# real downloads, systemd or replacing any files.
-cmd_self_update() { assert_lock_held; }
+cmd_self_update() {
+  assert_lock_held || return 1
+  if [[ ${AX_TEST_UPDATE_BG:-0} == 1 ]]; then
+    spawn_background_child
+  fi
+}
+maintenance_failure() {
+  assert_lock_held || return 1
+  return 37
+}
 bot_update_worker() { assert_lock_held; }
-main self-update
-main bot-update-worker
-
-# Exercise the REAL cmd_rollback with a dummy snapshot and a stub restore.
-# This proves that rollback cannot get as far as restoring files when an
-# update holds the same lock, without writing to the host filesystem.
-: >"$SNAP_DIR/fixture.tar.gz"
-RESTORE_LOG="$FIXTURE/restore.log"
-: >"$RESTORE_LOG"
 confirm() { return 0; }
 snapshot_restore() {
   assert_lock_held || return 1
-  printf '%s\n' "$1" >>"$RESTORE_LOG"
+  printf '%s\n' "$1" >>"$AX_MAINTENANCE_RESTORE_LOG"
 }
+spawn_background_child() {
+  assert_lock_held || return 1
+  sleep 15 >/dev/null 2>&1 &
+  printf '%s\n' "$!" >"$AX_MAINTENANCE_BG_PID"
+}
+BASH
+chmod +x "$TEST_DRIVER"
+mkdir -p "$SNAP_DIR"
+: >"$SNAP_DIR/fixture.tar.gz"
+RESTORE_LOG="$FIXTURE/restore.log"
+: >"$RESTORE_LOG"
+export AX_BIN="$TEST_DRIVER"
+export AX_SNAP_DIR="$SNAP_DIR"
+export AX_MAINTENANCE_RESTORE_LOG="$RESTORE_LOG"
+export AX_MAINTENANCE_BG_PID="$FIXTURE/background.pid"
+
+with_update_lock assert_lock_held
+main self-update
+main bot-update-worker
 main rollback 1
 [[ $(wc -l <"$RESTORE_LOG") -eq 1 ]] || {
   echo 'FAIL: unlocked rollback did not restore the fixture'; exit 1
 }
 
-# Check BOTH TUI rollback entry points and its update entry point.
+# Both TUI rollback entries and the TUI update entry must use the wrapper.
 grep -Fq '0) (with_update_lock cmd_self_update); pause ;;' "$ROOT/autoxray" || {
   echo 'FAIL: TUI bypasses update lock'; exit 1
 }
@@ -160,9 +182,35 @@ flock -n "$SNAP_DIR/.update.lock" -c true || {
   echo 'FAIL: maintenance lock was not released'; exit 1
 }
 
-# Hold the lock in ANOTHER process, with explicit synchronization rather
-# than timing-based sleeps. CLI update and manual rollback must both refuse
-# to run while that process holds it.
+# Regression: update starts a background subprocess; it is STILL RUNNING
+# after update returns, but it must NOT hold the lock. This exact scenario
+# previously prevented immediate rollback after a successful update.
+export AX_TEST_UPDATE_BG=1
+main self-update
+unset AX_TEST_UPDATE_BG
+BG_CHILD_PID=$(cat "$AX_MAINTENANCE_BG_PID")
+kill -0 "$BG_CHILD_PID" 2>/dev/null || {
+  echo 'FAIL: background child exited too early'; exit 1
+}
+flock -n "$SNAP_DIR/.update.lock" -c true || {
+  echo 'FAIL: background child inherited maintenance lock'; exit 1
+}
+main rollback 1
+[[ $(wc -l <"$RESTORE_LOG") -eq 2 ]] || {
+  echo 'FAIL: immediate rollback after background child was blocked'; exit 1
+}
+kill "$BG_CHILD_PID" 2>/dev/null || true
+# Even a failed maintenance command must release the supervisor lock.
+if with_update_lock maintenance_failure >/dev/null 2>&1; then
+  echo 'FAIL: maintenance failure was reported as success'; exit 1
+fi
+flock -n "$SNAP_DIR/.update.lock" -c true || {
+  echo 'FAIL: maintenance failure leaked lock'; exit 1
+}
+printf 'OK: background subprocess cannot retain the update/rollback lock\n'
+
+# Lock contention with another process must reject CLI update, Telegram
+# update and manual rollback, and must never enter snapshot_restore.
 LOCK_READY="$FIXTURE/lock-ready"
 LOCK_RELEASE="$FIXTURE/lock-release.fifo"
 mkfifo "$LOCK_RELEASE"
@@ -187,18 +235,17 @@ fi
 if (main rollback 1 >/dev/null 2>&1); then
   echo 'FAIL: concurrent CLI rollback was accepted'; exit 1
 fi
-[[ $(wc -l <"$RESTORE_LOG") -eq 1 ]] || {
+[[ $(wc -l <"$RESTORE_LOG") -eq 2 ]] || {
   echo 'FAIL: rollback restored files while maintenance lock was busy'; exit 1
 }
 printf 'release\n' >"$LOCK_RELEASE"
 wait "$LOCK_HOLDER_PID"
 LOCK_HOLDER_PID=''
-# Lock must become available again after competing update/rollback exits.
 main rollback 1
-[[ $(wc -l <"$RESTORE_LOG") -eq 2 ]] || {
+[[ $(wc -l <"$RESTORE_LOG") -eq 3 ]] || {
   echo 'FAIL: rollback did not recover after lock became free'; exit 1
 }
 flock -n "$SNAP_DIR/.update.lock" -c true || {
   echo 'FAIL: maintenance lock leaked after rollback'; exit 1
 }
-printf 'OK: CLI/Telegram updates and both TUI/CLI rollback paths share maintenance lock\n'
+printf 'OK: CLI/Telegram update and manual rollback share non-leaking maintenance lock\n'

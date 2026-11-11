@@ -3397,25 +3397,33 @@ RELEASE_FILES=(autoxray templates/sub.html templates/nginx.conf templates/report
 # One maintenance lock shared by CLI/TUI/Telegram update and manual rollback.
 # Held across version lookup, download, validation, installation, selfcheck,
 # automatic rollback on failure, and manual snapshot restoration.
-# The worker calls cmd_self_update in-process so it never tries to reacquire
-# its own lock from a child autoXRAY process.
+# Keep the lock in flock's supervisor, NOT in the shell executing maintenance.
+# `flock --close` closes its lock fd in the child BEFORE it executes any
+# command. Thus background jobs started by render, tests or systemctl cannot
+# inherit the lock, and rollback is available as soon as maintenance exits.
+# The child re-sources the installed autoXRAY and invokes the requested
+# internal function. Do not use a shell fd lock here: descendants inherit it.
 with_update_lock() {
   need_root
-  local update_fd update_rc=0
-  # This file must live OUTSIDE $AX_ETC: snapshot_restore replaces files in
-  # $AX_ETC, which could otherwise replace the locked inode mid-rollback.
+  local update_lock update_rc=0
   mkdir -p "$SNAP_DIR" || die "Не удалось создать $SNAP_DIR"
   chmod 700 "$SNAP_DIR" || die "Не удалось защитить $SNAP_DIR"
-  exec {update_fd}>"$SNAP_DIR/.update.lock" || die "Не удалось открыть lock обновления"
-  if ! flock -n "$update_fd"; then
+  update_lock="$SNAP_DIR/.update.lock"
+
+  # The lock is held for the full duration of the requested operation, but the
+  # operating command (and ALL its descendants) never receives its descriptor.
+  # $1 and $@ expand in the CHILD shell, intentionally not in this shell.
+  # shellcheck disable=SC2016
+  flock --exclusive --nonblock --close --conflict-exit-code 75 "$update_lock" \
+    bash -c 'AX_UNIT_TEST=1; source "$1"; unset AX_UNIT_TEST; shift; "$@"' \
+    ax-maintenance "$AX_BIN" "$@" || update_rc=$?
+
+  if [[ $update_rc -eq 75 ]]; then
     if [[ ${1:-} == bot_update_worker && ${2:-} =~ ^[0-9]{1,20}$ ]]; then
-      tg_send "$2" '⚠️ Обновление autoXRAY уже выполняется (через Telegram или SSH).' || true
+      tg_send "$2" '⚠️ Обновление autoXRAY или восстановление снимка уже выполняется (через Telegram или SSH).' || true
     fi
-    exec {update_fd}>&-
-    die 'Обновление autoXRAY уже выполняется (через Telegram или SSH).'
+    warn 'Другое обновление autoXRAY или восстановление снимка уже выполняется.'
   fi
-  "$@" || update_rc=$?
-  exec {update_fd}>&-
   return "$update_rc"
 }
 
