@@ -70,13 +70,19 @@ ver_gt() {
 
 # Последний релиз autoXRAY. Кэш /etc/autoxray/.latest обновляет cron (collect раз в 12 часов);
 # интерактивный запуск ходит в сеть только если кэша ещё нет (таймаут 3 с).
-latest_ax() { # [force]
-  local cache="$AX_ETC/.latest" age=999999 tag
-  [[ -f $cache ]] && age=$(( $(date +%s) - $(stat -c %Y "$cache") ))
-  if [[ ${1:-} == force ]] && [[ $age -gt 43200 ]] || [[ ! -f $cache ]]; then
-    tag=$("$CURL" -fsS --max-time 3 "$API/repos/$AX_REPO/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null)
-    mkdir -p "$AX_ETC" 2>/dev/null
-    { [[ -n $tag ]] && printf '%s\n' "${tag#v}" || { cat "$cache" 2>/dev/null || true; }; } >"$cache.tmp" 2>/dev/null && mv "$cache.tmp" "$cache" 2>/dev/null
+latest_ax() { # [force|refresh]
+  local cache="$AX_ETC/.latest" mtime age tag tmp
+  mtime=$(stat -c %Y "$cache" 2>/dev/null) || mtime=0
+  age=$(( $(date +%s) - mtime ))
+  if [[ ${1:-} == refresh || ${1:-} == force && $age -gt 43200 || ! -f $cache ]]; then
+    tag=$("$CURL" -fsS --max-time 3 "$API/repos/$AX_REPO/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null) || tag=''
+    if [[ -n $tag ]]; then
+      if mkdir -p "$AX_ETC" 2>/dev/null && tmp=$(mktemp "$cache.XXXXXX" 2>/dev/null); then
+        { printf '%s\n' "${tag#v}" >"$tmp" && mv -f "$tmp" "$cache"; } 2>/dev/null || rm -f "$tmp"
+      fi
+      printf '%s\n' "${tag#v}"
+      return 0
+    fi
   fi
   cat "$cache" 2>/dev/null
 }
@@ -1824,8 +1830,8 @@ cmd_user_devices() { # имя [del №|HWID|all]
 
 # Расписание: учёт трафика, лимиты IP, гео-данные
 cmd_setup_cron() {
-  need_root; mkdir -p /etc/cron.d
-  cat >/etc/cron.d/autoxray <<'EOF'
+  need_root; mkdir -p /etc/cron.d || return 1
+  cat >/etc/cron.d/autoxray <<'EOF' || return 1
 # учёт трафика, лимиты и сроки пользователей autoXRAY
 */5 * * * * root /usr/local/bin/autoxray collect >/dev/null 2>&1
 # лимит IP: разбор лога доступа (работает, только если у кого-то задан лимит)
@@ -3391,6 +3397,7 @@ cmd_migrate() {
 
 SNAP_DIR="${AX_SNAP_DIR:-/var/lib/autoxray/snapshots}"
 AX_BIN="${AX_BIN:-/usr/local/bin/autoxray}"
+UPDATE_CONFIRM_DIR="$AX_ETC/.update-confirm"
 RELEASE_FILES=(autoxray templates/sub.html templates/nginx.conf templates/report.html templates/gen_page.sh
                components/telegram/install.sh components/telegram/update.sh components/telegram/uninstall.sh components/telegram/artifacts.sh)
 
@@ -3401,11 +3408,12 @@ RELEASE_FILES=(autoxray templates/sub.html templates/nginx.conf templates/report
 # `flock --close` closes its lock fd in the child BEFORE it executes any
 # command. Thus background jobs started by render, tests or systemctl cannot
 # inherit the lock, and rollback is available as soon as maintenance exits.
-# The child re-sources the installed autoXRAY and invokes the requested
-# internal function. Do not use a shell fd lock here: descendants inherit it.
+# The child reads the script again under the lock, including when invoked
+# from a checkout or from a menu opened before another update completed.
 with_update_lock() {
   need_root
-  local update_lock update_rc=0
+  local script update_lock update_rc=0
+  script=$(realpath -- "${BASH_SOURCE[0]}") || die 'Не удалось определить путь к скрипту autoXRAY'
   mkdir -p "$SNAP_DIR" || die "Не удалось создать $SNAP_DIR"
   chmod 700 "$SNAP_DIR" || die "Не удалось защитить $SNAP_DIR"
   update_lock="$SNAP_DIR/.update.lock"
@@ -3415,27 +3423,36 @@ with_update_lock() {
   # $1 and $@ expand in the CHILD shell, intentionally not in this shell.
   # shellcheck disable=SC2016
   flock --exclusive --nonblock --close --conflict-exit-code 75 "$update_lock" \
-    bash -c 'AX_UNIT_TEST=1; source "$1"; unset AX_UNIT_TEST; shift; "$@"' \
-    ax-maintenance "$AX_BIN" "$@" || update_rc=$?
+    bash -c 'AX_UNIT_TEST=1; source "$1" || exit 1; unset AX_UNIT_TEST; shift; "$@"' \
+    ax-maintenance "$script" "$@" || update_rc=$?
 
   if [[ $update_rc -eq 75 ]]; then
-    if [[ ${1:-} == bot_update_worker && ${2:-} =~ ^[0-9]{1,20}$ ]]; then
-      tg_send "$2" '⚠️ Обновление autoXRAY или восстановление снимка уже выполняется (через Telegram или SSH).' || true
+    if [[ ${1:-} == bot_update_worker ]] && bot_update_admin "${2:-}"; then
+      bot_update_result "$2" '⚠️ Обновление autoXRAY или восстановление снимка уже выполняется (через Telegram или SSH).'
     fi
     warn 'Другое обновление autoXRAY или восстановление снимка уже выполняется.'
   fi
   return "$update_rc"
 }
 
+# Locks must keep their inodes. Telegram offsets and confirmations must never
+# be rewound by a rollback, including when restoring a pre-update snapshot.
+snapshot_tar() {
+  tar -C / --exclude="${LOCK#/}" --exclude="${AX_ETC#/}/.scan.lock" \
+    --exclude="${AX_ETC#/}/.soak.lock" --exclude="${AX_ETC#/}/bot.offset" \
+    --exclude="${UPDATE_CONFIRM_DIR#/}" --exclude="${SNAP_DIR#/}" \
+    --exclude="${AX_ETC#/}/.bot.token.new" --exclude="${AX_ETC#/}/.state.*" \
+    --exclude="${AX_ETC#/}/.latest.*" "$@"
+}
+
 # Снимок всего, что меняет обновление: скрипт, шаблоны, настройки, конфиги Xray и nginx, расписание
 snapshot_create() {
   local f p paths=()
-  mkdir -p "$SNAP_DIR"; chmod 700 "$SNAP_DIR"
-  f="$SNAP_DIR/$(date +%Y%m%d-%H%M%S)-v$AX_VERSION.tar.gz"
-  for p in "$AX_BIN" "$TPL_DIR" "$AX_ETC" "$XRAY_CFG" "$NGX_CONF" "$NGX_MAP" /etc/cron.d/autoxray; do
+  f=$(mktemp "$SNAP_DIR/$(date +%Y%m%d-%H%M%S)-XXXXXX-v$AX_VERSION.tar.gz") || return 1
+  for p in "$AX_BIN" "$TPL_DIR" "$AX_ETC" "$XRAY_CFG" "$NGX_CONF" "$NGX_MAP" "$NGX_ANN" "$NGX_DEV" /etc/cron.d/autoxray; do
     [[ -e $p ]] && paths+=("${p#/}")
   done
-  (umask 077; tar -C / -czf "$f" "${paths[@]}") || return 1
+  snapshot_tar -czf "$f" "${paths[@]}" || { rm -f "$f"; return 1; }
   echo "$f"
   # хранятся три последних снимка
   ls -1t "$SNAP_DIR"/*.tar.gz 2>/dev/null | tail -n +4 | while read -r old; do rm -f "$old"; done
@@ -3443,18 +3460,33 @@ snapshot_create() {
 
 # Бот работает отдельной службой и держит скрипт в памяти: без перезапуска он остаётся на старой версии после обновления или отката
 restart_bot_if_active() {
-  [[ $DRY == 1 ]] && return 0
-  systemctl is-active --quiet autoxray-bot 2>/dev/null && svc restart autoxray-bot
-  return 0
+  if [[ $DRY != 1 ]] && { [[ ${1:-0} == 1 ]] || systemctl is-active --quiet autoxray-bot 2>/dev/null; }; then
+    svc restart autoxray-bot
+  fi
 }
 
-snapshot_restore() { # файл
-  tar -C / -xzf "$1" || return 1
+snapshot_unpack() { # файл [auto] [пересобрать подписки]
+  local exclude=()
+  # An automatic rollback restores the release, not a previous set of users,
+  # credentials or traffic counters. Manual rollback explicitly restores settings.
+  [[ ${2:-} != auto ]] || exclude+=(--exclude="${AX_ETC#/}")
+  snapshot_tar "${exclude[@]}" -xzf "$1" || return 1
+  if [[ ${3:-0} == 1 ]]; then render_subs || return 1; fi
+}
+
+snapshot_restore() { # файл [auto] [бот был запущен] [пересобрать подписки]
+  local was_bot_active=${3:-0}
+  [[ $DRY != 1 ]] && systemctl is-active --quiet autoxray-bot 2>/dev/null && was_bot_active=1
+  if [[ -d $AX_ETC ]]; then
+    locked snapshot_unpack "$1" "${2:-}" "${4:-0}" || return 1
+  else
+    snapshot_unpack "$1" "${2:-}" "${4:-0}" || return 1
+  fi
   svc daemon-reload || return 1
   svc restart xray || return 1
   svc reload nginx 2>/dev/null || return 1
-  restart_bot_if_active
-  return 0
+  restart_bot_if_active "$was_bot_active" || return 1
+  post_update_check
 }
 
 # Проверка после обновления: конфиги, службы, подписка по HTTPS
@@ -3495,15 +3527,58 @@ cmd_rollback() {
   elif [[ -f $SNAP_DIR/$want ]]; then f=$SNAP_DIR/$want
   else die "rollback [list|номер|файл]"; fi
   confirm "Восстановить $(basename "$f")? Текущие настройки будут заменены" || die "Отменено."
-  snapshot_restore "$f" || die "Не удалось распаковать снимок"
+  snapshot_restore "$f" || die "Не удалось восстановить снимок или проверить службы: $f"
   ok "✅ Восстановлено: $(basename "$f")"
+}
+
+# Map the release manifest to the same installed paths for verification and installation.
+release_destination() {
+  case $1 in
+    autoxray) printf '%s\n' "$AX_BIN" ;;
+    templates/*) printf '%s\n' "$TPL_DIR/${1#templates/}" ;;
+    components/telegram/*.sh) printf '%s\n' "$TPL_DIR/telegram/${1#components/telegram/}" ;;
+    *) return 1 ;;
+  esac
+}
+
+release_file_sum() { # manifest release-path
+  local hash
+  hash=$(awk -v name="$2" '
+    $2 == name || $2 == "*" name {n++; if (NF == 2) hash=$1}
+    END {if (n == 1) print hash}
+  ' <<<"$1")
+  [[ $hash =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+  printf '%s\n' "${hash,,}"
+}
+
+release_file_matches() { # installed-or-staged-path expected-sha256
+  local actual
+  [[ -f $1 && ! -L $1 ]] || return 1
+  actual=$(sha256sum <"$1") || return 1
+  [[ ${actual%% *} == "$2" ]]
+}
+
+release_install() { # stage files...
+  local stage=$1 file dest tmp mode
+  shift
+  for file; do
+    dest=$(release_destination "$file") || return 1
+    mode=644; [[ $file == templates/* ]] || mode=755
+    mkdir -p -- "$(dirname -- "$dest")" || return 1
+    tmp=$(mktemp -- "${dest}.update.XXXXXX") || return 1
+    if ! { install -m "$mode" -- "$stage/$file" "$tmp" && mv -fT -- "$tmp" "$dest"; }; then
+      rm -f -- "$tmp"
+      return 1
+    fi
+  done
 }
 
 # Обновление autoxray, шаблонов и компонентов до релиза (по умолчанию последнего).
 # Перед заменой делается снимок; если после обновления конфиги или подписка не проходят проверку, всё возвращается назад.
-cmd_self_update() {
+cmd_self_update() { (
   need_root
-  local tag=${1:-} raw tmp f snap
+  local tag=${1:-} admin=${2:-} raw tmp f snap dest hash
+  local files=() assets=() new_paths=() was_bot_active=0 render_started=0
   if [[ -z $tag ]]; then
     tag=$("$CURL" -fsS --max-time 15 "$API/repos/$AX_REPO/releases/latest" | jq -r '.tag_name // empty')
     [[ -n $tag ]] || die "Не удалось узнать последний релиз (GitHub API недоступен)."
@@ -3512,47 +3587,76 @@ cmd_self_update() {
   [[ $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Версия вида vX.Y.Z"
   [[ ${tag#v} == "$AX_VERSION" ]] && { ok "Уже установлена версия $AX_VERSION."; return 0; }
   raw="${AX_RAW_BASE:-https://raw.githubusercontent.com/$AX_REPO}/$tag"
-  tmp=$(mktemp -d)
-  "$CURL" -fsSL --max-time 30 "$raw/autoxray" -o "$tmp/autoxray" || { rm -rf "${tmp:?}"; die "Не удалось скачать autoxray ($tag)"; }
-  bash -n "$tmp/autoxray" || { rm -rf "${tmp:?}"; die "Скачанный autoxray не прошёл проверку синтаксиса."; }
+  tmp=$(mktemp -d) || die 'Не удалось создать временный каталог обновления.'
+  trap 'rm -rf -- "$tmp"' EXIT
+  "$CURL" -fsSL --max-time 30 "$raw/autoxray" -o "$tmp/autoxray" || die "Не удалось скачать autoxray ($tag)"
+  bash -n "$tmp/autoxray" || die "Скачанный autoxray не прошёл проверку синтаксиса."
+  [[ $(sed -n 's/^AX_VERSION="\([0-9.]*\)".*/\1/p' "$tmp/autoxray") == "${tag#v}" ]] \
+    || die "Версия скачанного autoxray не соответствует релизу $tag."
   # список файлов берётся из НОВОЙ версии: в ней могли появиться шаблоны, о которых текущая не знает
-  local files=()
   mapfile -t files < <(sed -n '/^RELEASE_FILES=(/,/)/p' "$tmp/autoxray" | tr -d '()' | sed 's/^RELEASE_FILES=//' | tr ' ' '\n' | grep -E '^[A-Za-z0-9_./-]+$' | grep -v '\.\.')
   [[ ${#files[@]} -gt 0 ]] || files=("${RELEASE_FILES[@]}")
   [[ " ${files[*]} " == *" autoxray "* ]] || files+=(autoxray)
   for f in "${files[@]}"; do
     [[ $f == autoxray ]] && continue
-    mkdir -p "$tmp/$(dirname "$f")"
-    "$CURL" -fsSL --max-time 30 "$raw/$f" -o "$tmp/$f" || { rm -rf "${tmp:?}"; die "Не удалось скачать $f ($tag)"; }
+    [[ $f =~ ^(templates|components/telegram)/[A-Za-z0-9_.-]+$ ]] && release_destination "$f" >/dev/null \
+      || die "Неизвестный путь в релизе $tag: $f."
+    assets+=("$f")
+    mkdir -p "$tmp/$(dirname "$f")" || die 'Не удалось подготовить временный каталог обновления.'
+    "$CURL" -fsSL --max-time 30 "$raw/$f" -o "$tmp/$f" || die "Не удалось скачать $f ($tag)"
   done
   # Файлы релиза сверяются с контрольными суммами, опубликованными вместе с ним (FILES.sha256). Релизы до 3.13 их не имеют.
   local sums sums_url="${AX_SUMS_BASE:-https://github.com/$AX_REPO/releases/download}/$tag/FILES.sha256"
   if sums=$("$CURL" -fsSL --max-time 30 "$sums_url" 2>/dev/null) && [[ -n $sums ]]; then
     for f in "${files[@]}"; do
-      [[ $(printf '%s\n' "$sums" | awk -v f="$f" '$2 == f || $2 == "*" f {n++} END {print n+0}') == 1 ]] || { rm -rf "$tmp"; die "Манифест релиза не содержит единственную сумму $f."; }
+      hash=$(release_file_sum "$sums" "$f") || die "Манифест релиза не содержит единственную корректную сумму $f."
+      release_file_matches "$tmp/$f" "$hash" \
+        || die "Контрольные суммы файлов релиза $tag не совпали: обновление остановлено, ничего не изменено."
     done
-    (cd "$tmp" && printf '%s\n' "$sums" | sha256sum -c --quiet >/dev/null 2>&1) \
-      || { rm -rf "${tmp:?}"; die "Контрольные суммы файлов релиза $tag не совпали: обновление остановлено, ничего не изменено."; }
     echo -e " 🔏 ${DIM}Контрольные суммы релиза $tag совпали${NC}"
   elif ver_gt "${tag#v}" "3.12.99"; then
-    rm -rf "${tmp:?}"; die "Не удалось получить контрольные суммы релиза $tag ($sums_url): обновление остановлено."
+    die "Не удалось получить контрольные суммы релиза $tag ($sums_url): обновление остановлено."
   else warn "У релиза $tag нет контрольных сумм (он выпущен до 3.13): файлы не проверены."; fi
-  snap=$(snapshot_create) || { rm -rf "${tmp:?}"; die "Не удалось сделать снимок перед обновлением."; }
+  if [[ -n $admin ]] && ! bot_update_original_is_pristine; then
+    warn 'Установленные файлы не совпадают с официальным релизом или их суммы недоступны.'
+    return 78
+  fi
+  for f in "${files[@]}"; do
+    dest=$(release_destination "$f") || die "Неизвестный путь в релизе: $f."
+    [[ ! -d $dest ]] || die "Путь файла релиза занят каталогом: $dest."
+    if [[ -e $dest || -L $dest ]]; then
+      if [[ -n $admin && " ${RELEASE_FILES[*]} " != *" $f "* ]]; then
+        warn "Новый файл релиза $f перезаписал бы локальный файл: $dest."
+        return 78
+      fi
+    else new_paths+=("$dest"); fi
+  done
+  [[ -e /etc/cron.d/autoxray ]] || new_paths+=(/etc/cron.d/autoxray)
+  [[ $DRY != 1 ]] && systemctl is-active --quiet autoxray-bot 2>/dev/null && was_bot_active=1
+  [[ -z $admin ]] || bot_update_admin "$admin" || die 'Доступ администратора к обновлению отозван.'
+  if [[ -d $AX_ETC ]]; then
+    snap=$(locked snapshot_create) || die "Не удалось сделать снимок перед обновлением."
+  else
+    snap=$(snapshot_create) || die "Не удалось сделать снимок перед обновлением."
+  fi
+  # A queued job may outlive removal of its admin or disabling of the bot.
+  [[ -z $admin ]] || bot_update_admin "$admin" || die 'Доступ администратора к обновлению отозван.'
   echo -e " 💾 ${DIM}Снимок для отката: $snap${NC}"
-  install -m 755 "$tmp/autoxray" "$AX_BIN"
-  mkdir -p "$TPL_DIR/telegram"
-  install -m 644 "$tmp"/templates/* "$TPL_DIR/"
-  install -m 755 "$tmp"/components/telegram/*.sh "$TPL_DIR/telegram/"
-  rm -rf "${tmp:?}"
-  if ! { "$AX_BIN" setup-cron && "$AX_BIN" render && "$AX_BIN" selfcheck; }; then
-    warn "Новая версия не прошла проверку. Возвращаю $AX_VERSION."
-    snapshot_restore "$snap" || die "Откат не удался, снимок: $snap"
+  if ! { release_install "$tmp" "${assets[@]}" autoxray &&
+         [[ $("$AX_BIN" version) == "autoxray ${tag#v}" ]] &&
+         "$AX_BIN" setup-cron &&
+         { render_started=1; "$AX_BIN" render; } &&
+         "$AX_BIN" selfcheck && restart_bot_if_active "$was_bot_active"; }; then
+    warn "Установка или проверка новой версии завершилась ошибкой. Возвращаю $AX_VERSION."
+    local cleanup_rc=0
+    rm -f -- "${new_paths[@]}" || cleanup_rc=$?
+    snapshot_restore "$snap" auto "$was_bot_active" "$render_started" && [[ $cleanup_rc == 0 ]] \
+      || die "Откат не удался полностью, снимок: $snap"
     die "Обновление до ${tag#v} отменено, восстановлено состояние $AX_VERSION."
   fi
-  restart_bot_if_active
   ok "✅ autoxray $AX_VERSION → ${tag#v}. Заметки: https://github.com/$AX_REPO/releases/tag/$tag"
   echo -e " ${DIM}Откат при необходимости: autoxray rollback${NC}"
-}
+); }
 
 
 # Обновление geoip.dat / geosite.dat (на них опираются правила маршрутизации). Перезапуск Xray — только при изменении.
@@ -3841,6 +3945,7 @@ cmd_site() {
 TG_API="${AX_TG_API:-https://api.telegram.org}"
 BOT_TOKEN_FILE="$AX_ETC/bot.token"
 BOT_UNIT="${AX_UNIT_DIR:-/etc/systemd/system}/autoxray-bot.service"
+BOT_UPDATE_LOG_DIR="${AX_BOT_UPDATE_LOG_DIR:-/var/lib/autoxray/bot-updates}"
 
 bot_enabled() { [[ -s $BOT_TOKEN_FILE ]] && [[ $(st '.bot.enabled // false') == true ]]; }
 strip_ansi() { sed 's/\x1b\[[0-9;?]*[A-Za-z]//g'; }
@@ -3858,8 +3963,8 @@ tg_call() {
 tg_send() { # chat text [клавиатура json] [таймаут]
   local payload
   payload=$(jq -n --arg c "$1" --arg t "$2" --argjson m "${3:-null}" \
-    '{chat_id: ($c | tonumber), text: $t, parse_mode: "HTML", disable_web_page_preview: true} + (if $m != null then {reply_markup: $m} else {} end)')
-  tg_call sendMessage "$payload" "${4:-}" >/dev/null
+    '{chat_id: ($c | tonumber), text: $t, parse_mode: "HTML", disable_web_page_preview: true} + (if $m != null then {reply_markup: $m} else {} end)') || return 1
+  tg_call sendMessage "$payload" "${4:-}" | jq -e '.ok == true' >/dev/null
 }
 tg_edit() { # chat message_id text [клавиатура json]
   local payload
@@ -3894,10 +3999,18 @@ BOT_MAIN_KB='{"inline_keyboard":[[{"text":"📊 Статус","callback_data":"s
 
 # Кнопка обновления появляется только для релиза с корректным номером выше установленного.
 # Версию дополнительно проверяет независимый процесс непосредственно перед обновлением.
+bot_update_version() { [[ ${#1} -le 56 && $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+bot_update_admin() { [[ $1 =~ ^[1-9][0-9]{0,19}$ ]] && bot_enabled && bot_is_admin "$1"; }
+
+bot_update_result() { # chat text
+  bot_update_admin "$1" || return 0
+  tg_send "$1" "$2" "" 15 || warn "Telegram не принял сообщение об обновлении для администратора $1: $2"
+}
+
 bot_available_update() {
   local latest
-  latest=$(latest_ax)
-  if [[ $latest =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && ver_gt "$latest" "$AX_VERSION"; then
+  latest=$(latest_ax "$@") || return 0
+  if bot_update_version "$latest" && ver_gt "$latest" "$AX_VERSION"; then
     printf '%s\n' "$latest"
   fi
   return 0
@@ -3918,96 +4031,103 @@ bot_status_kb() {
 }
 
 bot_update_prompt() { # chat version
-  local chat=$1 requested=$2 latest message
+  local chat=$1 requested=$2 latest message nonce pending tmp
+  bot_update_admin "$chat" || return 0
   latest=$(bot_available_update)
   if [[ -z $latest || $requested != "$latest" ]]; then
     tg_send "$chat" 'ℹ️ Доступная версия изменилась или обновление уже установлено. Откройте /status.' "$(bot_status_kb)"
     return 0
   fi
-  message=$(printf '⬆️ <b>Обновление autoXRAY</b>\n\nТекущая: <b>%s</b>\nНовая: <b>%s</b>\n\nСистема создаст резервную копию, проверит SHA256 и выполнит selfcheck. При ошибке установки предусмотрен откат.\n\n⚠️ Ручные изменения скрипта могут быть потеряны. Убедитесь, что ваши модули совместимы с новым релизом.\n\nПодтвердить обновление?' "$AX_VERSION" "$latest")
-  tg_send "$chat" "$message" "$(bot_confirm_kb "upd:do:$latest" 'status')"
+  pending="$UPDATE_CONFIRM_DIR/$chat"
+  if ! { nonce=$(openssl rand -hex 16) && install -d -m 700 -- "$UPDATE_CONFIRM_DIR" &&
+         tmp=$(mktemp -- "$pending.XXXXXX") &&
+         printf '%s %s %s %s\n' "$nonce" "$AX_VERSION" "$latest" "$(( $(now) + 600 ))" >"$tmp" &&
+         mv -fT -- "$tmp" "$pending"; }; then
+    [[ -z ${tmp:-} ]] || rm -f -- "$tmp"
+    tg_send "$chat" '⚠️ Не удалось подготовить подтверждение обновления.'
+    return 1
+  fi
+  message=$(printf '⬆️ <b>Обновление autoXRAY</b>\n\nТекущая: <b>%s</b>\nНовая: <b>%s</b>\n\nСистема создаст снимок, проверит SHA256 и выполнит selfcheck. При ошибке установки предусмотрен откат. Проверьте совместимость сторонних модулей.\n\nПодтвердить обновление?' "$AX_VERSION" "$latest")
+  tg_send "$chat" "$message" "$(bot_confirm_kb "upd:do:$nonce" "upd:cancel:$nonce")"
 }
 
-bot_update_start() { # chat version; NEVER run self-update inside bot's polling process
-  local chat=$1 tag=$2 message
-  [[ $tag =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ $tag == "$(bot_available_update)" ]] || {
-    tg_send "$chat" 'ℹ️ Версия изменилась. Повторно откройте /status.' "$(bot_status_kb)"
+bot_update_start() { # chat nonce [do|cancel]
+  local chat=$1 nonce=$2 action=${3:-do} pending saved from tag expires message output
+  bot_update_admin "$chat" || return 0
+  pending="$UPDATE_CONFIRM_DIR/$chat"
+  if ! { [[ $nonce =~ ^[0-9a-f]{32}$ && -f $pending ]] &&
+         read -r saved from tag expires <"$pending" &&
+         [[ $saved == "$nonce" ]] && rm -- "$pending"; }; then
+    tg_send "$chat" 'ℹ️ Подтверждение недействительно. Повторно откройте /update.'
     return 0
-  }
-  # Fixed unit name prevents starting another job while one update is still running.
-  if systemd-run --quiet --collect --no-block --unit=autoxray-bot-update \
-      --property=RuntimeMaxSec=1800 "$AX_BIN" bot-update-worker "$chat" "$tag" >/dev/null 2>&1; then
+  fi
+  if [[ $action == cancel ]]; then
+    tg_send "$chat" 'Обновление отменено.'
+    return 0
+  fi
+  if [[ $from != "$AX_VERSION" || ! $expires =~ ^[0-9]+$ || $expires -le $(now) || $tag != "$(bot_available_update)" ]]; then
+    tg_send "$chat" 'ℹ️ Версия изменилась или подтверждение устарело. Повторно откройте /update.'
+    return 0
+  fi
+  # Type=exec reports launch failures before returning. The worker remains a
+  # separate service and survives a restart of the polling bot.
+  if output=$(systemd-run --quiet --collect --unit=autoxray-bot-update \
+      --property=Type=exec "$AX_BIN" bot-update-worker "$chat" "$from" "$tag" 2>&1); then
     message=$(printf '⏳ Запущено обновление autoXRAY <b>%s → %s</b>.\nЭто отдельная systemd-задача. После завершения пришлю результат.' "$AX_VERSION" "$tag")
     tg_send "$chat" "$message"
   else
-    tg_send "$chat" '⚠️ Не удалось запустить задачу обновления. Возможно, обновление уже выполняется. Проверьте systemctl status autoxray-bot-update.'
+    warn "Не удалось запустить autoxray-bot-update: $output"
+    tg_send "$chat" '⚠️ Не удалось запустить задачу обновления. Возможно, обновление уже выполняется. Проверьте <code>journalctl -u autoxray-bot -u autoxray-bot-update</code>.'
   fi
 }
-
 
 # Compare every release-managed file overwritten by self-update, not just the
 # main script. Fail closed on missing files, bad/duplicate manifest entries and
 # local modifications. User state and config files are not release-managed.
 bot_update_original_is_pristine() {
-  local sums expected actual url file installed
+  local sums expected url file installed
+  [[ ! -L $TPL_DIR && ! -L $TPL_DIR/telegram ]] || return 1
   url="${AX_SUMS_BASE:-https://github.com/$AX_REPO/releases/download}/v$AX_VERSION/FILES.sha256"
   sums=$("$CURL" -fsSL --max-time 20 "$url" 2>/dev/null) || return 1
-  [[ -n $sums ]] || return 1
   for file in "${RELEASE_FILES[@]}"; do
-    case $file in
-      autoxray) installed=$AX_BIN ;;
-      templates/*) installed="$TPL_DIR/${file#templates/}" ;;
-      components/telegram/*) installed="$TPL_DIR/telegram/${file#components/telegram/}" ;;
-      *) return 1 ;;
-    esac
-    # Manifest lookup must produce exactly one 64-character SHA256 sum.
-    expected=$(printf '%s\n' "$sums" | awk -v name="$file" '
-      $2 == name || $2 == "*" name {print $1}')
-    [[ $expected =~ ^[0-9a-fA-F]{64}$ ]] || return 1
-    [[ -f $installed && ! -L $installed ]] || return 1
-    actual=$(sha256sum "$installed" 2>/dev/null | awk '{print $1}') || return 1
-    [[ ${actual,,} == "${expected,,}" ]] || return 1
+    installed=$(release_destination "$file") || return 1
+    expected=$(release_file_sum "$sums" "$file") || return 1
+    release_file_matches "$installed" "$expected" || return 1
   done
   return 0
 }
 
 # Выполняется только из отдельной systemd-службы, а не из long-polling Telegram-бота.
-bot_update_worker() { # admin chat version
+bot_update_worker() { # admin chat confirmed-from-version target-version
   need_root
-  local chat=${1:-} tag=${2:-} live rc log installed
-  [[ $chat =~ ^[0-9]{1,20}$ && $tag =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'Неверные параметры обновления'
-  bot_is_admin "$chat" || die 'Обновление разрешено только Telegram-администратору'
-  if ! ver_gt "$tag" "$AX_VERSION"; then
-    tg_send "$chat" 'ℹ️ Запрошенная версия уже установлена или устарела.' || true
-    return 0
+  local chat=${1:-} from=${2:-} tag=${3:-} live rc log
+  bot_update_version "$from" && bot_update_version "$tag" || die 'Неверные параметры обновления'
+  bot_update_admin "$chat" || die 'Обновление разрешено только Telegram-администратору включённого бота'
+  if [[ $from != "$AX_VERSION" ]] || ! ver_gt "$tag" "$AX_VERSION"; then
+    bot_update_result "$chat" 'ℹ️ Установленная версия изменилась. Откройте /update и подтвердите обновление повторно.'
+    return 1
   fi
   # Verify pinned release against upstream again: reject forged / stale callback data.
   live=$("$CURL" -fsS --max-time 15 "$API/repos/$AX_REPO/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null) || live=''
   if [[ $live != "v$tag" && $live != "$tag" ]]; then
-    tg_send "$chat" '⚠️ Релиз не удалось проверить через GitHub, либо доступна другая версия. Ничего не устанавливалось.' || true
+    bot_update_result "$chat" '⚠️ Релиз не удалось проверить через GitHub, либо доступна другая версия. Откройте /update для повторной проверки.'
     return 1
   fi
-  if ! bot_update_original_is_pristine; then
-    tg_send "$chat" '🛑 Автообновление запрещено: установленный скрипт отличается от официального релиза или его контрольную сумму не удалось проверить. Возможны локальные доработки. Выполните миграцию модулей перед обновлением; никаких файлов не изменено.' || true
-    return 1
+  if ! { install -d -m 700 -- "$BOT_UPDATE_LOG_DIR" &&
+         log=$(mktemp -- "$BOT_UPDATE_LOG_DIR/$(date -u +%Y%m%dT%H%M%SZ)-v${AX_VERSION}-to-${tag}-XXXXXX.log"); }; then
+    bot_update_result "$chat" '⚠️ Не удалось создать журнал. Обновление остановлено.'
+    die 'Не удалось создать журнал обновления'
   fi
-  local log_dir="/var/lib/autoxray/bot-updates"
-  (umask 077; mkdir -p "$log_dir") || die 'Не создать каталог журнала обновления'
-  chmod 700 "$log_dir"
-  log="$log_dir/$(date -u +%Y%m%dT%H%M%SZ)-v${AX_VERSION}-to-${tag}.log"
-  if (umask 077; cmd_self_update "v$tag" >"$log" 2>&1); then
-    installed=$("$AX_BIN" version 2>/dev/null) || installed=''
-    if [[ $installed == "autoxray $tag" ]]; then
-      tg_send "$chat" "$(printf '✅ <b>autoXRAY обновлён до %s</b>.\nПроверка конфигурации и служб выполнена штатным selfcheck.\nЖурнал на VPS: <code>%s</code>' "$tag" "$(html_esc <<<"$log")")" || true
-      return 0
-    fi
-    tg_send "$chat" "⚠️ Обновление завершилось, но фактическая версия не соответствует $tag. Проверьте журнал на VPS: <code>$(html_esc <<<"$log")</code>" || true
-    return 1
+  if cmd_self_update "v$tag" "$chat" >"$log" 2>&1; then
+    bot_update_result "$chat" "$(printf '✅ <b>autoXRAY обновлён до %s</b>.\nПроверка конфигурации и служб выполнена штатным selfcheck.\nЖурнал на VPS: <code>%s</code>' "$tag" "$(html_esc <<<"$log")")"
+    return 0
+  else rc=$?; fi
+  if [[ $rc == 78 ]]; then
+    bot_update_result "$chat" "🛑 Обновление остановлено до установки. Проверьте локальные изменения и контрольные суммы. Журнал: <code>$(html_esc <<<"$log")</code>"
   else
-    rc=$?
-    tg_send "$chat" "$(printf '❌ <b>Обновление autoXRAY до %s не удалось</b> (код %s).\nШтатный установщик выполняет откат при ошибке selfcheck. Проверьте итоговое состояние и журнал: <code>%s</code>' "$tag" "$rc" "$(html_esc <<<"$log")")" || true
-    return "$rc"
+    bot_update_result "$chat" "$(printf '❌ <b>Обновление autoXRAY до %s не удалось</b> (код %s).\nИтог операции и отката в журнале: <code>%s</code>' "$tag" "$rc" "$(html_esc <<<"$log")")"
   fi
+  return "$rc"
 }
 
 
@@ -4173,7 +4293,7 @@ bot_callback() { # chat message_id callback_id data
     upd)
       case $b in
         ask) bot_update_prompt "$chat" "$c" ;;
-        do) bot_update_start "$chat" "$c" ;;
+        do|cancel) bot_update_start "$chat" "$c" "$b" ;;
       esac ;;
     doctor) bot_do cmd_doctor; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" ;;
     warp) bot_do cmd_warp status; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" ;;
@@ -4217,7 +4337,7 @@ bot_command() { # chat текст
     /start|/help) tg_send "$chat" "$(bot_help)" "$BOT_MAIN_KB" ;;
     /status) bot_do cmd_status; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" "$(bot_status_kb)" ;;
     /update)
-      local latest; latest=$(bot_available_update)
+      local latest; latest=$(bot_available_update refresh)
       if [[ -n $latest ]]; then bot_update_prompt "$chat" "$latest"
       else tg_send "$chat" "✅ Установлена актуальная версия autoXRAY <b>$AX_VERSION</b> (или сведения о новых релизах недоступны)."; fi ;;
     /users) bot_show_list "$chat" "" ;;
@@ -4938,7 +5058,7 @@ main() {
     init)         cmd_init "$@" ;;
     migrate)      cmd_migrate "$@" ;;
     node|nodes)   cmd_node "$@" ;;
-    self-update)  with_update_lock cmd_self_update "$@" ;;
+    self-update)  with_update_lock cmd_self_update "${1:-}" ;;
     bot-update-worker) with_update_lock bot_update_worker "$@" ;;
     uninstall)    cmd_uninstall ;;
     selfcheck)    post_update_check ;;
