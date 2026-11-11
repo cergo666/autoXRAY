@@ -15,7 +15,16 @@ trap cleanup EXIT
 export AX_DRY=1
 export AX_ETC="$FIXTURE/etc" AX_SNAP_DIR="$FIXTURE/snapshots" AX_BIN="$FIXTURE/installed-autoxray"
 export AX_TEMPLATES="$FIXTURE/share" AX_BOT_UPDATE_LOG_DIR="$FIXTURE/logs"
-mkdir -p "$AX_ETC"
+export AX_CURL=curl AX_TG_API=http://127.0.0.1:1
+export AX_TEST_CURL_LOG="$FIXTURE/unexpected-curl.log"
+mkdir -p "$AX_ETC" "$FIXTURE/bin"
+cat >"$FIXTURE/bin/curl" <<'BASH'
+#!/usr/bin/env bash
+printf '%s\n' 'Unexpected curl invocation' >>"$AX_TEST_CURL_LOG"
+exit 1
+BASH
+chmod +x "$FIXTURE/bin/curl"
+export PATH="$FIXTURE/bin:$PATH"
 printf '%s\n' '{"bot":{"enabled":true,"admins":[10001,10002]},"users":[{"name":"client","tg":10003}]}' >"$AX_ETC/state.json"
 printf '%s\n' test-token >"$AX_ETC/bot.token"
 AX_UNIT_TEST=1 source "$ROOT/autoxray"
@@ -68,11 +77,12 @@ callback 10001 10001 private "upd:do:$NEXT_VERSION"
 assert_contains "$TG_MSG" 'Подтверждение недействительно'
 [[ ! -s $LAUNCH_LOG ]]
 
+TG_MSG=''
 callback 10001 10001 private "$confirm_data"
 [[ $(wc -l <"$LAUNCH_LOG") -eq 1 ]]
 assert_contains "$(cat "$LAUNCH_LOG")" "$AX_BIN bot-update-worker 10001 $AX_VERSION $NEXT_VERSION"
 assert_contains "$(cat "$LAUNCH_LOG")" '--property=Type=exec'
-assert_contains "$TG_MSG" 'Запущено обновление'
+[[ -z $TG_MSG ]] || { echo 'FAIL: dispatch announced a start before the worker acquired the lock'; exit 1; }
 callback 10001 10001 private "$confirm_data"
 [[ $(wc -l <"$LAUNCH_LOG") -eq 1 ]]
 assert_contains "$TG_MSG" 'Подтверждение недействительно'
@@ -110,6 +120,7 @@ printf 'OK: authorized private chat, one-time confirmation, cancel, expiry, stal
 (
   mock_live() { printf '{"tag_name":"v%s"}\n' "$FAKE_LATEST"; }
   CURL=mock_live
+  tg_send() { TG_MSG=$2; printf '%s\n' "$2" >>"$FIXTURE/worker-messages"; }
   cmd_self_update() { printf '%s\n' "$@" >>"$FIXTURE/worker-calls"; return "${FAKE_UPDATE_RC:-0}"; }
   if (bot_update_worker 999 "$AX_VERSION" "$NEXT_VERSION") >/dev/null 2>&1; then
     echo 'FAIL: worker accepted a non-admin'; exit 1
@@ -125,7 +136,9 @@ printf 'OK: authorized private chat, one-time confirmation, cancel, expiry, stal
   assert_contains "$TG_MSG" 'Релиз не удалось проверить'
   [[ ! -e $FIXTURE/worker-calls ]]
   FAKE_LATEST=$NEXT_VERSION
+  : >"$FIXTURE/worker-messages"
   bot_update_worker 10001 "$AX_VERSION" "$NEXT_VERSION"
+  assert_contains "$(head -n 1 "$FIXTURE/worker-messages")" 'Запущено обновление'
   assert_contains "$TG_MSG" "обновлён до $NEXT_VERSION"
   [[ $(cat "$FIXTURE/worker-calls") == "$(printf 'v%s\n10001' "$NEXT_VERSION")" ]]
   for rc in 1 78; do
@@ -147,6 +160,30 @@ printf 'OK: authorized private chat, one-time confirmation, cancel, expiry, stal
   tg_send 10001 test
 )
 printf 'OK: worker authorization, pinned versions, protected logs, result and Telegram API errors\n'
+
+(
+  export AX_ETC="$FIXTURE/render/etc" AX_XRAY_CFG="$FIXTURE/render/xray.json"
+  export AX_NGINX_CONF="$FIXTURE/render/nginx.conf" AX_NGINX_MAP="$FIXTURE/render/userinfo.map"
+  export AX_TEMPLATES="$ROOT/templates"
+  AX_UNIT_TEST=1 source "$ROOT/autoxray"
+  apply_xray() { :; }
+  render_nginx() { :; }
+  rand() { printf '%0*d' "$2" 1; }
+  web="$FIXTURE/render/web"
+  main init --domain fixture.test --user alice --xhttp-path testpath --web "$web" >/dev/null 2>"$FIXTURE/init.log"
+  main render
+  token=$(jq -er '.users[0].token' "$STATE")
+  mv -- "$web/$token.txt" "$FIXTURE/good-subscription"
+  mkdir -- "$web/$token.txt"
+  if main render >"$FIXTURE/render-error" 2>&1; then
+    echo 'FAIL: render reported success with an unwritable subscription'; exit 1
+  fi
+  jq -e 'type == "array" and length > 0' "$web/$token.json" >/dev/null
+  rmdir -- "$web/$token.txt"
+  main render
+  cmp -s "$web/$token.txt" "$FIXTURE/good-subscription"
+)
+printf 'OK: render propagates subscription write failures and succeeds after recovery\n'
 
 # All release-managed installed files must match the manifest of the current
 # official release. A modified template or Telegram component must block update.
@@ -228,6 +265,8 @@ maintenance_failure() {
   return 37
 }
 bot_update_worker() { assert_lock_held; }
+latest_ax() { printf '%s\n' "$AX_VERSION"; }
+tg_send() { printf '%s %s\n' "$1" "$2" >>"$AX_MAINTENANCE_NOTIFY_LOG"; }
 confirm() { return 0; }
 snapshot_restore() {
   assert_lock_held || return 1
@@ -247,6 +286,7 @@ RESTORE_LOG="$FIXTURE/restore.log"
 AX_UNIT_TEST=1 source "$TEST_DRIVER"
 export AX_MAINTENANCE_RESTORE_LOG="$RESTORE_LOG"
 export AX_MAINTENANCE_BG_PID="$FIXTURE/background.pid"
+export AX_MAINTENANCE_NOTIFY_LOG="$FIXTURE/contention-notification.log"
 
 with_update_lock assert_lock_held
 main self-update
@@ -320,9 +360,28 @@ done
 if (main self-update >/dev/null 2>&1); then
   echo 'FAIL: concurrent CLI update was accepted'; exit 1
 fi
-if (main bot-update-worker 10001 "$AX_VERSION" "$NEXT_VERSION" >/dev/null 2>&1); then
-  echo 'FAIL: concurrent Telegram update was accepted'; exit 1
-fi
+rc=0
+main bot-update-worker 10001 "$AX_VERSION" "$NEXT_VERSION" >/dev/null 2>&1 || rc=$?
+[[ $rc == 75 && -s $AX_MAINTENANCE_NOTIFY_LOG ]] || {
+  echo 'FAIL: concurrent Telegram update did not return the lock conflict and notify the admin'; exit 1
+}
+assert_contains "$(cat "$AX_MAINTENANCE_NOTIFY_LOG")" '10001 ⚠️ Обновление autoXRAY или восстановление снимка уже выполняется'
+(
+  latest_ax() { printf '%s\n' "$NEXT_VERSION"; }
+  systemd-run() {
+    while [[ $1 == --* ]]; do shift; done
+    shift # path to the installed CLI
+    local worker_rc=0
+    main "$@" >/dev/null 2>&1 || worker_rc=$?
+    [[ $worker_rc == 75 ]]
+  }
+  bot_update_prompt 10001 "$NEXT_VERSION"
+  read -r nonce _ <"$UPDATE_CONFIRM_DIR/10001"
+  : >"$AX_MAINTENANCE_NOTIFY_LOG"
+  bot_update_start 10001 "$nonce"
+  [[ $(wc -l <"$AX_MAINTENANCE_NOTIFY_LOG") -eq 1 ]] || exit 1
+  assert_contains "$(cat "$AX_MAINTENANCE_NOTIFY_LOG")" '10001 ⚠️ Обновление autoXRAY или восстановление снимка уже выполняется'
+) || { echo 'FAIL: Telegram dispatch announced a start after a lock conflict'; exit 1; }
 if (main rollback 1 >/dev/null 2>&1); then
   echo 'FAIL: concurrent CLI rollback was accepted'; exit 1
 fi
@@ -339,4 +398,5 @@ main rollback 1
 flock -n "$SNAP_DIR/.update.lock" -c true || {
   echo 'FAIL: maintenance lock leaked after rollback'; exit 1
 }
+[[ ! -e $AX_TEST_CURL_LOG ]] || { echo 'FAIL: a unit test tried to call curl'; exit 1; }
 printf 'OK: CLI/Telegram update and manual rollback share non-leaking maintenance lock\n'

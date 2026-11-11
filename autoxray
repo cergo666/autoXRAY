@@ -864,11 +864,15 @@ sub_sing()  { subjq "$1" "$SUB_SING_TAIL"; }
 
 # Универсальная подписка: ссылки vless:// и hy2:// через перевод строки в base64 (v2rayNG, NekoBox, Streisand, Hiddify и др.)
 sub_txt() {
-  local txt; txt=$(sub_status_text "$1")
+  local txt uri; txt=$(sub_status_text "$1") || return 1
   {
-    user_links "$1" | cut -d'|' -f2-
-    [[ -n $txt ]] && printf 'vless://00000000-0000-4000-8000-000000000000@127.0.0.1:1?security=none&type=tcp#%s\n' "$(jq -rn --arg t "$txt" '$t | @uri')"
-  } | base64 -w0; echo
+    user_links "$1" | cut -d'|' -f2- || return 1
+    if [[ -n $txt ]]; then
+      uri=$(jq -rn --arg t "$txt" '$t | @uri') || return 1
+      printf 'vless://00000000-0000-4000-8000-000000000000@127.0.0.1:1?security=none&type=tcp#%s\n' "$uri"
+    fi
+  } | base64 -w0 || return 1
+  printf '\n'
 }
 
 sub_json() {
@@ -900,7 +904,7 @@ sub_html() {
   fi
 
   local sub_url="https://$domain/$token" out
-  out=$(<"$tpl")
+  out=$(<"$tpl") || return 1
   out=${out//'{{NAME}}'/$(html_esc <<<"$name")}
   out=${out//'{{DOMAIN}}'/$(html_esc <<<"$domain")}
   out=${out//'{{SUB_URL}}'/$(html_esc <<<"$sub_url")}
@@ -916,19 +920,41 @@ sub_html() {
   printf '%s\n' "$out"
 }
 
+# Записываем производный файл целиком, прежде чем заменять предыдущий.
+write_generated_file() { # путь режим команда [аргументы...], пустой режим сохраняет прежние права
+  local dest=$1 mode=$2 dir tmp
+  shift 2
+  dir=$(dirname -- "$dest") && mkdir -p -- "$dir" || return 1
+  tmp=$(mktemp -- "$dir/.autoxray.XXXXXX") || return 1
+  if [[ -z $mode ]]; then
+    mode=$(stat -Lc '%a' -- "$dest" 2>/dev/null) || printf -v mode '%o' "$(( 0666 & ~$(umask) ))"
+  fi
+  if "$@" >"$tmp" && chmod "$mode" "$tmp" && mv -fT -- "$tmp" "$dest"; then return 0; fi
+  rm -f -- "$tmp"
+  return 1
+}
+
 # Файлы подписок + map для заголовка subscription-userinfo в nginx.
-render_subs() {
-  local web name token map_new changed=0 keep=" "
-  web=$(st .web); mkdir -p "$web"
-  map_new=$(mktemp)
+render_subs() { (
+  local web names name token tmp map_new changed=0 keep=" " rc=0
+  web=$(st .web) && mkdir -p -- "$web" || return 1
+  names=$(jq -r '.users[].name' "$STATE") || return 1
+  tmp=$(mktemp -d) || return 1
+  trap 'rm -rf -- "$tmp"' EXIT
+  map_new="$tmp/userinfo"
+  : >"$map_new" || return 1
   while IFS= read -r name; do
-    token=$(user_get "$name" | jq -r .token)
-    sub_json "$name" >"$web/$token.json" || warn "Не удалось собрать подписку для $name"
-    sub_html "$name" >"$web/$token.html" 2>/dev/null || rm -f "$web/$token.html"
-    sub_txt "$name" >"$web/$token.txt"
-    sub_clash "$name" >"$web/$token.yaml" 2>/dev/null || { warn "Не удалось собрать Clash-подписку для $name"; rm -f "$web/$token.yaml"; }
-    sub_sing "$name" >"$web/$token.sing" 2>/dev/null || { warn "Не удалось собрать sing-box-подписку для $name"; rm -f "$web/$token.sing"; }
-    chmod 644 "$web/$token".{json,html,txt,yaml,sing} 2>/dev/null
+    [[ -n $name ]] || continue
+    token=$(user_get "$name" | jq -er .token) || return 1
+    write_generated_file "$web/$token.json" 644 sub_json "$name" || rc=1
+    write_generated_file "$web/$token.txt" 644 sub_txt "$name" || rc=1
+    write_generated_file "$web/$token.yaml" 644 sub_clash "$name" || rc=1
+    write_generated_file "$web/$token.sing" 644 sub_sing "$name" || rc=1
+    if [[ -f $TPL_DIR/sub.html ]]; then
+      write_generated_file "$web/$token.html" 644 sub_html "$name" || rc=1
+    else
+      rm -f -- "$web/$token.html" || rc=1
+    fi
     keep+="$token "
     jq -r --arg n "$name" --arg tok "$token" --slurpfile t "$TRAFFIC" '
       .users[] | select(.name == $n) as $u
@@ -936,8 +962,8 @@ render_subs() {
       | ("upload=\($up); download=\($dn)"
          + (if $u.limit > 0 then "; total=\($u.limit)" else "" end)
          + (if $u.expire > 0 then "; expire=\($u.expire)" else "" end)) as $info
-      | ("json", "txt", "yaml", "sing") as $ext | "\"/\($tok).\($ext)\" \"\($info)\";"' "$STATE" >>"$map_new"
-  done < <(jq -r '.users[].name' "$STATE")
+      | ("json", "txt", "yaml", "sing") as $ext | "\"/\($tok).\($ext)\" \"\($info)\";"' "$STATE" >>"$map_new" || return 1
+  done <<<"$names"
 
   # удаляем файлы подписок отозванных пользователей
   local f base
@@ -945,11 +971,10 @@ render_subs() {
     [[ -e $f ]] || continue
     base=$(basename "$f"); base=${base%.*}
     [[ $base =~ ^[A-Za-z0-9]{20,32}$ ]] || continue
-    [[ $keep == *" $base "* ]] || rm -f "$f"
+    [[ $keep == *" $base "* ]] || rm -f -- "$f" || rc=1
   done
 
   # объявления: предупреждение о сроке и трафике у каждого пользователя, иначе общий текст (sub announce)
-  mkdir -p "$(dirname "$NGX_ANN")"
   jq -r --slurpfile t "$TRAFFIC" --argjson now "$(now)" "$JQ_DEFS"'
     def b64: if . == "" then "" else "base64:" + (.[0:200] | @base64) end;
     (.sub.announce // "") as $all
@@ -962,9 +987,10 @@ render_subs() {
          else [(if $u.limit > 0 and used($u) * 100 >= $u.limit * 80 then "⚠️ Израсходовано больше 80% трафика" else empty end),
                (if $u.expire > 0 and $u.expire - $now <= 259200 then "⏳ Доступ до " + ($u.expire | strftime("%d.%m.%Y")) else empty end)]
               | select(length > 0) | join(" · ") end
-       | b64 as $v | ("json", "txt", "yaml", "sing") as $ext | "\"/\($u.token).\($ext)\" \"\($v)\";")' "$STATE" >"$map_new.ann"
-  if [[ ! -f $NGX_ANN ]] || ! cmp -s "$map_new.ann" "$NGX_ANN"; then cat "$map_new.ann" >"$NGX_ANN"; changed=1; fi
-  rm -f "$map_new.ann"
+       | b64 as $v | ("json", "txt", "yaml", "sing") as $ext | "\"/\($u.token).\($ext)\" \"\($v)\";")' "$STATE" >"$tmp/announce" || return 1
+  if ! cmp -s "$tmp/announce" "$NGX_ANN"; then
+    if write_generated_file "$NGX_ANN" '' cat "$tmp/announce"; then changed=1; else rc=1; fi
+  fi
 
   if [[ ! -f $NGX_MAP ]] || ! cmp -s "$map_new" "$NGX_MAP"; then
     # Если изменились только счётчики трафика, nginx перечитывается не чаще раза в час: после каждого reload старые
@@ -973,12 +999,15 @@ render_subs() {
     local strip='s/upload=[0-9]+; download=[0-9]+//'
     if [[ -f $NGX_MAP ]] && [[ $(sed -E "$strip" "$map_new") == "$(sed -E "$strip" "$NGX_MAP")" ]] \
        && (( $(now) - $(stat -c %Y "$NGX_MAP") < ${AX_USERINFO_EVERY:-3600} )); then :
-    else mkdir -p "$(dirname "$NGX_MAP")"; cat "$map_new" >"$NGX_MAP"; changed=1; fi
+    elif write_generated_file "$NGX_MAP" '' cat "$map_new"; then changed=1; else rc=1; fi
   fi
-  rm -f "$map_new"
-  [[ $changed == 1 ]] && svc reload nginx 2>/dev/null
-  devices_map
-  return 0
+  devices_map || rc=1
+  [[ $changed == 0 ]] || reload_nginx_if_active || rc=1
+  return "$rc"
+); }
+
+reload_nginx_if_active() {
+  if [[ $DRY != 1 ]] && systemctl is-active --quiet nginx 2>/dev/null; then svc reload nginx; fi
 }
 
 NGX_CONF="${AX_NGINX_CONF:-/etc/nginx/conf.d/default.conf}"
@@ -1005,13 +1034,13 @@ FALLBACK_STATIC='    location / {
     }'
 
 # nginx.conf собирается из шаблона и state.json; при ошибке `nginx -t` прежний файл возвращается.
-render_nginx() {
+render_nginx() { (
   local tpl="$TPL_DIR/nginx.conf" out fb new
   [[ -f $tpl ]] || { warn "Нет шаблона $tpl — nginx.conf не обновлён."; return 0; }
-  local f; for f in "$NGX_MAP" "$NGX_ANN" "$NGX_DEV"; do [[ -f $f ]] || { mkdir -p "$(dirname "$f")"; : >"$f"; }; done
+  local f; for f in "$NGX_MAP" "$NGX_ANN" "$NGX_DEV"; do [[ -f $f ]] || write_generated_file "$f" '' true || return 1; done
   fb=$FALLBACK_STATIC
   [[ $(st '.telegram.enabled // false') == true ]] && fb=$FALLBACK_PROXY
-  out=$(<"$tpl")
+  out=$(<"$tpl") || return 1
   local rb=""
   if [[ -n $(report_users) && -n $(st '.reports.token // empty') ]]; then
     rb="    # отчёты о посещениях (секретный адрес; включаются у пользователей: autoxray user set <имя> --report on)
@@ -1040,19 +1069,27 @@ render_nginx() {
   out=${out//'{{AUTH_PATH}}'/$(st .paths.auth)}
   out=${out//'{{AUTH_CODE}}'/$(st '.auth.code // "ERR_AUTH_FAILED"')}
   out=${out//'{{AUTH_MSG}}'/$(st '.auth.msg // "Authentication failed."')}
-  new=$(mktemp); printf '%s\n' "$out" >"$new"
-  if [[ -f $NGX_CONF ]] && cmp -s "$new" "$NGX_CONF"; then rm -f "$new"; return 0; fi
-  [[ -f $NGX_CONF ]] && cp -p "$NGX_CONF" "$NGX_CONF.bak"
-  mkdir -p "$(dirname "$NGX_CONF")"; cat "$new" >"$NGX_CONF"; rm -f "$new"
+  new=$(mktemp) || return 1
+  trap 'rm -f -- "$new"' EXIT
+  printf '%s\n' "$out" >"$new" || return 1
+  if cmp -s "$new" "$NGX_CONF"; then return 0; fi
+  [[ ! -f $NGX_CONF ]] || cp -p "$NGX_CONF" "$NGX_CONF.bak" || return 1
+  write_generated_file "$NGX_CONF" '' cat "$new" || return 1
   if command -v nginx >/dev/null 2>&1 && ! nginx -t >/tmp/autoxray-nginx.log 2>&1; then
     warn "nginx отклонил конфиг, возвращаю прежний. Лог: /tmp/autoxray-nginx.log"; tail -n 5 /tmp/autoxray-nginx.log >&2
     if [[ -f $NGX_CONF.bak ]]; then cp -p "$NGX_CONF.bak" "$NGX_CONF"; else rm -f "$NGX_CONF"; fi
     return 1
   fi
   svc reload nginx 2>/dev/null || svc restart nginx
-}
+); }
 
-render_all() { apply_xray; local rc=$?; render_subs; render_nginx || rc=1; return $rc; }
+render_all() {
+  local rc=0
+  apply_xray || rc=1
+  render_subs || rc=1
+  render_nginx || rc=1
+  return "$rc"
+}
 # Для команд, меняющих state: если конфиг не применился, не рапортуем об успехе.
 apply_or_die() { render_all || die "Изменения сохранены в state.json, но не применены (причина выше). Исправьте её и выполните: autoxray render"; }
 
@@ -1761,18 +1798,17 @@ devices_collect() {
 }
 
 # map для nginx: «токен:HWID» известных устройств и запрет остальных у тех, кто выбрал лимит
-devices_map() {
-  local new; new=$(mktemp)
-  [[ -s $DEVICES ]] || echo '{}' >"$DEVICES"
+devices_map() { (
+  local new; new=$(mktemp) || return 1
+  trap 'rm -f -- "$new"' EXIT
+  [[ -s $DEVICES ]] || printf '{}\n' >"$DEVICES" || return 1
   jq -r --slurpfile d "$DEVICES" '
     .users[] | select((.devices // 0) > 0) | . as $u | (($d[0][$u.name] // {}) | to_entries | map(select(.value.ok))) as $ok
     | ($ok[] | "\"\($u.token):\(.key)\" 0;"),
-      (if ($ok | length) >= $u.devices then "\"~^\($u.token):.\" 1;" else empty end)' "$STATE" >"$new"
-  if [[ ! -f $NGX_DEV ]] || ! cmp -s "$new" "$NGX_DEV"; then
-    mkdir -p "$(dirname "$NGX_DEV")"; cat "$new" >"$NGX_DEV"; rm -f "$new"; svc reload nginx 2>/dev/null; return 0
-  fi
-  rm -f "$new"
-}
+      (if ($ok | length) >= $u.devices then "\"~^\($u.token):.\" 1;" else empty end)' "$STATE" >"$new" || return 1
+  if cmp -s "$new" "$NGX_DEV"; then return 0; fi
+  write_generated_file "$NGX_DEV" '' cat "$new" && reload_nginx_if_active
+); }
 
 # Отклонённые новые устройства: уведомление администратору и самому пользователю (если он привязал Telegram)
 devices_notify() {
@@ -3460,32 +3496,43 @@ snapshot_create() {
 
 # Бот работает отдельной службой и держит скрипт в памяти: без перезапуска он остаётся на старой версии после обновления или отката
 restart_bot_if_active() {
-  if [[ $DRY != 1 ]] && { [[ ${1:-0} == 1 ]] || systemctl is-active --quiet autoxray-bot 2>/dev/null; }; then
-    svc restart autoxray-bot
+  if [[ $DRY != 1 ]] && bot_enabled && systemctl is-active --quiet autoxray-bot 2>/dev/null; then
+    svc try-restart autoxray-bot
   fi
 }
 
-snapshot_unpack() { # файл [auto] [пересобрать подписки]
-  local exclude=()
-  # An automatic rollback restores the release, not a previous set of users,
-  # credentials or traffic counters. Manual rollback explicitly restores settings.
-  [[ ${2:-} != auto ]] || exclude+=(--exclude="${AX_ETC#/}")
-  snapshot_tar "${exclude[@]}" -xzf "$1" || return 1
-  if [[ ${3:-0} == 1 ]]; then render_subs || return 1; fi
+snapshot_unpack() { # файл [auto]
+  local path exclude=()
+  # Automatic rollback keeps live state and rebuilds its derived configs.
+  if [[ ${2:-} == auto ]]; then
+    for path in "$AX_ETC" "$XRAY_CFG" "$NGX_CONF" "$NGX_MAP" "$NGX_ANN" "$NGX_DEV"; do
+      exclude+=(--exclude="${path#/}")
+    done
+  fi
+  snapshot_tar "${exclude[@]}" -xzf "$1"
 }
 
-snapshot_restore() { # файл [auto] [бот был запущен] [пересобрать подписки]
-  local was_bot_active=${3:-0}
-  [[ $DRY != 1 ]] && systemctl is-active --quiet autoxray-bot 2>/dev/null && was_bot_active=1
+snapshot_reload_services() {
+  svc restart xray || return 1
+  svc reload nginx 2>/dev/null
+}
+
+snapshot_restore() { # файл [auto]
   if [[ -d $AX_ETC ]]; then
-    locked snapshot_unpack "$1" "${2:-}" "${4:-0}" || return 1
+    locked snapshot_unpack "$1" "${2:-}" || return 1
   else
-    snapshot_unpack "$1" "${2:-}" "${4:-0}" || return 1
+    snapshot_unpack "$1" "${2:-}" || return 1
   fi
   svc daemon-reload || return 1
-  svc restart xray || return 1
-  svc reload nginx 2>/dev/null || return 1
-  restart_bot_if_active "$was_bot_active" || return 1
+  if [[ ${2:-} == auto ]]; then
+    # The maintenance lock still covers this operation. The restored CLI
+    # takes the state lock itself while regenerating configs and subscriptions.
+    AX_USERINFO_EVERY=0 "$AX_BIN" render || return 1
+    locked snapshot_reload_services || return 1
+  else
+    snapshot_reload_services || return 1
+  fi
+  restart_bot_if_active || return 1
   post_update_check
 }
 
@@ -3578,7 +3625,7 @@ release_install() { # stage files...
 cmd_self_update() { (
   need_root
   local tag=${1:-} admin=${2:-} raw tmp f snap dest hash
-  local files=() assets=() new_paths=() was_bot_active=0 render_started=0
+  local files=() assets=() new_paths=()
   if [[ -z $tag ]]; then
     tag=$("$CURL" -fsS --max-time 15 "$API/repos/$AX_REPO/releases/latest" | jq -r '.tag_name // empty')
     [[ -n $tag ]] || die "Не удалось узнать последний релиз (GitHub API недоступен)."
@@ -3632,7 +3679,6 @@ cmd_self_update() { (
     else new_paths+=("$dest"); fi
   done
   [[ -e /etc/cron.d/autoxray ]] || new_paths+=(/etc/cron.d/autoxray)
-  [[ $DRY != 1 ]] && systemctl is-active --quiet autoxray-bot 2>/dev/null && was_bot_active=1
   [[ -z $admin ]] || bot_update_admin "$admin" || die 'Доступ администратора к обновлению отозван.'
   if [[ -d $AX_ETC ]]; then
     snap=$(locked snapshot_create) || die "Не удалось сделать снимок перед обновлением."
@@ -3644,13 +3690,12 @@ cmd_self_update() { (
   echo -e " 💾 ${DIM}Снимок для отката: $snap${NC}"
   if ! { release_install "$tmp" "${assets[@]}" autoxray &&
          [[ $("$AX_BIN" version) == "autoxray ${tag#v}" ]] &&
-         "$AX_BIN" setup-cron &&
-         { render_started=1; "$AX_BIN" render; } &&
-         "$AX_BIN" selfcheck && restart_bot_if_active "$was_bot_active"; }; then
+         "$AX_BIN" setup-cron && "$AX_BIN" render &&
+         "$AX_BIN" selfcheck && restart_bot_if_active; }; then
     warn "Установка или проверка новой версии завершилась ошибкой. Возвращаю $AX_VERSION."
     local cleanup_rc=0
     rm -f -- "${new_paths[@]}" || cleanup_rc=$?
-    snapshot_restore "$snap" auto "$was_bot_active" "$render_started" && [[ $cleanup_rc == 0 ]] \
+    snapshot_restore "$snap" auto && [[ $cleanup_rc == 0 ]] \
       || die "Откат не удался полностью, снимок: $snap"
     die "Обновление до ${tag#v} отменено, восстановлено состояние $AX_VERSION."
   fi
@@ -4052,7 +4097,7 @@ bot_update_prompt() { # chat version
 }
 
 bot_update_start() { # chat nonce [do|cancel]
-  local chat=$1 nonce=$2 action=${3:-do} pending saved from tag expires message output
+  local chat=$1 nonce=$2 action=${3:-do} pending saved from tag expires output
   bot_update_admin "$chat" || return 0
   pending="$UPDATE_CONFIRM_DIR/$chat"
   if ! { [[ $nonce =~ ^[0-9a-f]{32}$ && -f $pending ]] &&
@@ -4071,11 +4116,8 @@ bot_update_start() { # chat nonce [do|cancel]
   fi
   # Type=exec reports launch failures before returning. The worker remains a
   # separate service and survives a restart of the polling bot.
-  if output=$(systemd-run --quiet --collect --unit=autoxray-bot-update \
+  if ! output=$(systemd-run --quiet --collect --unit=autoxray-bot-update \
       --property=Type=exec "$AX_BIN" bot-update-worker "$chat" "$from" "$tag" 2>&1); then
-    message=$(printf '⏳ Запущено обновление autoXRAY <b>%s → %s</b>.\nЭто отдельная systemd-задача. После завершения пришлю результат.' "$AX_VERSION" "$tag")
-    tg_send "$chat" "$message"
-  else
     warn "Не удалось запустить autoxray-bot-update: $output"
     tg_send "$chat" '⚠️ Не удалось запустить задачу обновления. Возможно, обновление уже выполняется. Проверьте <code>journalctl -u autoxray-bot -u autoxray-bot-update</code>.'
   fi
@@ -4118,6 +4160,7 @@ bot_update_worker() { # admin chat confirmed-from-version target-version
     bot_update_result "$chat" '⚠️ Не удалось создать журнал. Обновление остановлено.'
     die 'Не удалось создать журнал обновления'
   fi
+  bot_update_result "$chat" "$(printf '⏳ Запущено обновление autoXRAY <b>%s → %s</b>.\nПосле завершения пришлю результат.' "$AX_VERSION" "$tag")"
   if cmd_self_update "v$tag" "$chat" >"$log" 2>&1; then
     bot_update_result "$chat" "$(printf '✅ <b>autoXRAY обновлён до %s</b>.\nПроверка конфигурации и служб выполнена штатным selfcheck.\nЖурнал на VPS: <code>%s</code>' "$tag" "$(html_esc <<<"$log")")"
     return 0
