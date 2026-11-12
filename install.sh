@@ -262,6 +262,8 @@ elif [ "$INIT_MODE" = direct ] && [ -f /usr/local/etc/xray/config.json ] \
     fi
 fi
 if [ "$REUSE" != true ]; then
+    echo -e "${GRN}Настраиваем защиту SSH (Fail2ban)${NC}"
+    autoxray setup-fail2ban || die "Не удалось подготовить защиту SSH."
     AUTH_PATHS=(
         "/api/v1/authenticate" "/api/auth/login" "/auth/session" "/v2/login"
         "/api/v1/session" "/gateway/auth" "/sso/authenticate" "/api/v2/token"

@@ -1882,6 +1882,106 @@ EOF
   chmod 644 /etc/cron.d/autoxray
 }
 
+# ---------------------------------------------------------- защита SSH
+
+F2B_RUN_DIR=/run/autoxray
+
+f2b_client() { LC_ALL=C timeout 5s fail2ban-client "$@"; }
+
+f2b_ssh_ports() {
+  local config addresses address port
+  local ports=()
+  # Ubuntu может принимать SSH через сокет systemd с собственными ListenStream.
+  if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+    config=$(systemctl show --property=Listen --value ssh.socket) || return 1
+    addresses=$(awk '{for (i=2; i<=NF; i++) if ($i == "(Stream)") print $(i-1)}' <<<"$config")
+  else
+    config=$(sshd -T) || return 1
+    addresses=$(awk '$1 == "listenaddress" {print $2}' <<<"$config")
+    [[ -n $addresses ]] || addresses=$(awk '$1 == "port" {print $2}' <<<"$config")
+  fi
+  while IFS= read -r address; do
+    port=${address##*:}
+    [[ $port =~ ^[0-9]{1,5}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) || return 1
+    ports+=("$((10#$port))")
+  done <<<"$addresses"
+  printf '%s\n' "${ports[@]}" | sort -nu | paste -sd, -
+}
+
+setup_fail2ban() { ( # каталог конфигурации Fail2ban
+  local etc=$1 ports existing stage ready=0 installing=0 _
+  local jail="$etc/jail.d/90-autoxray-sshd.local" server="$etc/fail2ban.d/90-autoxray.local"
+  if command -v fail2ban-client >/dev/null 2>&1; then
+    f2b_client status sshd >/dev/null || die "Действующий Fail2ban не обслуживает jail sshd. Проверьте его настройки и повторите установку."
+    ok "✅ Используется существующая защита Fail2ban SSH."
+    return 0
+  fi
+
+  if [[ -e $etc || -L $etc ]]; then
+    [[ -d $etc && ! -L $etc ]] || die "Обнаружена существующая конфигурация Fail2ban в $etc."
+    existing=$(find "$etc" -mindepth 1 ! -type d -print -quit) || return 1
+    [[ -z $existing ]] || die "Обнаружены настройки Fail2ban без пакета. Восстановите существующую установку Fail2ban."
+  fi
+  ports=$(f2b_ssh_ports) || die "Не удалось определить порты SSH для Fail2ban."
+  mkdir -p -- "$etc/jail.d" "$etc/fail2ban.d" || return 1
+  stage=$(mktemp -d -- "$etc/.autoxray.XXXXXX") || return 1
+  trap '
+    if [[ $ready == 0 ]]; then
+      if [[ $installing == 1 ]] && command -v fail2ban-client >/dev/null 2>&1; then
+        systemctl disable --now fail2ban.service 8>&- || warn "Проверьте состояние fail2ban.service."
+      fi
+      [[ $stage/jail -ef $jail ]] && rm -f -- "$jail"
+      [[ $stage/server -ef $server ]] && rm -f -- "$server"
+    fi
+    rm -rf -- "$stage"
+  ' EXIT
+
+  # Пакет может запустить службу при установке. К этому моменту jail уже
+  # читает журнал systemd и применяет правила только к портам SSH.
+  ( umask 077
+    cat >"$stage/jail" <<EOF
+[sshd]
+enabled = true
+backend = systemd
+mode = aggressive
+port = $ports
+banaction = nftables[type=multiport]
+maxretry = 3
+findtime = 10m
+bantime = 24h
+bantime.increment = true
+bantime.maxtime = 30d
+EOF
+  ) && ( umask 077; printf '[Definition]\ndbpurgeage = 2678400\n' >"$stage/server" ) || return 1
+  ln -T -- "$stage/jail" "$jail" && ln -T -- "$stage/server" "$server" || return 1
+
+  installing=1
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends fail2ban nftables python3-systemd 8>&- \
+    || die "Не удалось установить пакеты для Fail2ban."
+  nft list tables >/dev/null || die "Не удалось обратиться к nftables."
+  LC_ALL=C fail2ban-client -t || die "Fail2ban не принял конфигурацию SSH."
+  systemctl restart fail2ban.service 8>&- || die "Не удалось запустить Fail2ban."
+  for _ in {1..12}; do
+    if systemctl is-active --quiet fail2ban.service && f2b_client status sshd >/dev/null 2>&1; then
+      systemctl enable fail2ban.service 8>&- || die "Не удалось включить автозапуск Fail2ban."
+      ready=1
+      ok "✅ Fail2ban защищает SSH на портах $ports."
+      return 0
+    fi
+    sleep 0.25
+  done
+  die "Jail sshd не запустился. Проверьте journalctl -u fail2ban.service."
+); }
+
+cmd_setup_fail2ban() {
+  [[ $EUID -eq 0 && $DRY != 1 ]] || die "Для установки Fail2ban нужны root права."
+  install -d -m 700 -- "$F2B_RUN_DIR" || return 1
+  (
+    flock -n 8 || die "Настройка Fail2ban уже выполняется."
+    setup_fail2ban /etc/fail2ban
+  ) 8>"$F2B_RUN_DIR/fail2ban-setup.lock"
+}
+
 # ------------------------------------------------------- отчёты о посещениях
 
 REPORT_DATA="$AX_ETC/reports"                                  # суточные агрегаты по пользователям (закрыто, 700)
@@ -4040,7 +4140,139 @@ bot_notify() {
   return 0
 }
 
-BOT_MAIN_KB='{"inline_keyboard":[[{"text":"📊 Статус","callback_data":"status"},{"text":"👥 Пользователи","callback_data":"list"}],[{"text":"🩺 Диагностика","callback_data":"doctor"},{"text":"🌍 WARP","callback_data":"warp"}]]}'
+BOT_MAIN_KB='{"inline_keyboard":[[{"text":"📊 Статус","callback_data":"status"},{"text":"👥 Пользователи","callback_data":"list"}],[{"text":"🩺 Диагностика","callback_data":"doctor"},{"text":"🌍 WARP","callback_data":"warp"}],[{"text":"🛡 Fail2ban SSH","callback_data":"f2b:p:0"}]]}'
+
+# Встроенные в Fail2ban команды работают только с jail sshd.
+bot_f2b_admin() { [[ $1 =~ ^[1-9][0-9]{0,19}$ ]] && bot_enabled && bot_is_admin "$1"; }
+
+f2b_normalize_ips() {
+  python3 -c '
+import ipaddress
+import sys
+
+for text in sys.stdin.read().split():
+    if "%" in text:
+        continue
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError:
+        continue
+    print(getattr(ip, "ipv4_mapped", None) or ip)
+'
+}
+
+f2b_banned_ips() { f2b_client get sshd banip | f2b_normalize_ips; }
+
+f2b_is_banned() { # печатает 0 или 1; сбой запроса передаётся отдельно
+  local reply
+  reply=$(f2b_client get sshd banned "$1") || return 1
+  [[ $reply == 0 || $reply == 1 ]] || return 1
+  printf '%s\n' "$reply"
+}
+
+bot_f2b_unavailable() {
+  tg_send "$1" '⚠️ Jail <code>sshd</code> недоступен. Проверьте <code>fail2ban-client status sshd</code>.' "$BOT_MAIN_KB"
+}
+
+bot_f2b_report() { # chat page [message_id]
+  local chat=$1 page=$2 mid=${3:-} status counters banned start stop ip msg kb
+  local -a ips=() counts=()
+  bot_f2b_admin "$chat" || return 0
+  [[ $page =~ ^[0-9]{1,5}$ ]] || return 0
+  if ! status=$(f2b_client status sshd 2>/dev/null) || ! banned=$(f2b_banned_ips 2>/dev/null); then
+    bot_f2b_unavailable "$chat"
+    return
+  fi
+  counters=$(awk '/Currently failed:|Total failed:|Currently banned:|Total banned:/ && $NF ~ /^[0-9]+$/ {print $NF}' <<<"$status")
+  mapfile -t counts <<<"$counters"
+  [[ ${#counts[@]} -eq 4 ]] || { bot_f2b_unavailable "$chat"; return; }
+  [[ -z $banned ]] || mapfile -t ips <<<"$banned"
+  page=$((10#$page))
+  if (( ${#ips[@]} == 0 )); then page=0
+  elif (( page * 10 >= ${#ips[@]} )); then page=$(( (${#ips[@]} - 1) / 10 )); fi
+  start=$((page * 10)); stop=$((start + 10))
+  msg=$(printf '🛡 <b>Fail2ban SSH</b>\n\nОшибок сейчас / всего: %s / %s\nБанов сейчас / всего: %s / %s' "${counts[@]}")
+  if (( ${#ips[@]} == 0 )); then
+    msg+=$'\n\nНет заблокированных отдельных IP.'
+  else
+    msg+=$'\n\n'"<b>Заблокированные IP · страница $((page + 1))</b>"
+    for ip in "${ips[@]:start:10}"; do msg+=$'\n'"• <code>$ip</code>"; done
+  fi
+  kb=$(jq -nc --argjson page "$page" --argjson next "$((stop < ${#ips[@]}))" '
+    [$ARGS.positional[] | [{text:("🔓 " + .),callback_data:("f2b:ask:" + .)}]] as $rows
+    | [(if $page > 0 then {text:"⬅️ Назад",callback_data:("f2b:p:" + ($page-1|tostring))} else empty end),
+       (if $next == 1 then {text:"Далее ➡️",callback_data:("f2b:p:" + ($page+1|tostring))} else empty end)] as $nav
+    | {inline_keyboard: ($rows + (if ($nav|length) > 0 then [$nav] else [] end)
+      + [[{text:"🔄 Обновить",callback_data:("f2b:p:" + ($page|tostring))},{text:"🏠 Меню",callback_data:"status"}]])}' \
+    --args "${ips[@]:start:10}") || return 1
+  if [[ -n $mid ]]; then tg_edit "$chat" "$mid" "$msg" "$kb"; else tg_send "$chat" "$msg" "$kb"; fi
+}
+
+bot_f2b_save_confirmation() { # chat nonce IP; под блокировкой state
+  local dir="$F2B_RUN_DIR/fail2ban-confirm" tmp
+  install -d -m 700 -- "$dir" || return 1
+  tmp=$(mktemp -- "$dir/.pending.XXXXXX") || return 1
+  if printf '%s %s %s\n' "$2" "$3" "$(( $(now) + 300 ))" >"$tmp" && mv -fT -- "$tmp" "$dir/$1"; then return 0; fi
+  rm -f -- "$tmp"
+  return 1
+}
+
+bot_f2b_take_confirmation() { # chat nonce; под блокировкой state
+  local file="$F2B_RUN_DIR/fail2ban-confirm/$1" nonce ip expires
+  [[ -f $file ]] && read -r nonce ip expires <"$file" && [[ $nonce == "$2" ]] || return 1
+  rm -- "$file" || return 1
+  [[ $expires =~ ^[0-9]{1,12}$ ]] && (( 10#$expires > $(now) )) || return 1
+  printf '%s\n' "$ip"
+}
+
+bot_f2b_confirm() { # chat IP
+  local chat=$1 ip=${2:-} banned nonce
+  bot_f2b_admin "$chat" || return 0
+  if [[ ! $ip =~ ^[0-9A-Fa-f:.]{1,45}$ ]] || ! ip=$(f2b_normalize_ips <<<"$ip") || [[ -z $ip ]]; then
+    tg_send "$chat" 'Укажите один IPv4 или IPv6, например <code>/unban 203.0.113.5</code>.'
+    return
+  fi
+  if ! banned=$(f2b_is_banned "$ip" 2>/dev/null); then bot_f2b_unavailable "$chat"; return; fi
+  if [[ $banned == 0 ]]; then
+    tg_send "$chat" "ℹ️ <code>$ip</code> сейчас не заблокирован в jail sshd."
+    return
+  fi
+  if ! nonce=$(openssl rand -hex 16) || ! locked bot_f2b_save_confirmation "$chat" "$nonce" "$ip"; then
+    tg_send "$chat" '⚠️ Не удалось подготовить подтверждение. Повторите команду.'
+    return
+  fi
+  tg_send "$chat" "🔓 Разблокировать <code>$ip</code> в Fail2ban SSH?" "$(bot_confirm_kb "f2b:do:$nonce" "f2b:cancel:$nonce")"
+}
+
+bot_f2b_finish() { # chat nonce do|cancel
+  local chat=$1 nonce=$2 action=$3 ip banned changed result message
+  bot_f2b_admin "$chat" || return 0
+  if [[ ! $nonce =~ ^[0-9a-f]{32}$ ]] || ! ip=$(locked bot_f2b_take_confirmation "$chat" "$nonce"); then
+    tg_send "$chat" 'ℹ️ Подтверждение недействительно или истекло. Повторите /unban.'
+    return
+  fi
+  if [[ $action == cancel ]]; then tg_send "$chat" 'Разблокировка отменена.'; return; fi
+  [[ $ip =~ ^[0-9A-Fa-f:.]{1,45}$ ]] || return 1
+  if ! banned=$(f2b_is_banned "$ip" 2>/dev/null); then bot_f2b_unavailable "$chat"; return; fi
+  if [[ $banned == 0 ]]; then
+    tg_send "$chat" "ℹ️ <code>$ip</code> уже не заблокирован в jail sshd."
+    return
+  fi
+  bot_f2b_admin "$chat" || return 0
+  if ! changed=$(f2b_client set sshd unbanip "$ip" 2>/dev/null); then
+    result=failed; message="❌ Fail2ban вернул ошибку при разблокировке <code>$ip</code>."
+  elif ! banned=$(f2b_is_banned "$ip" 2>/dev/null); then
+    result=unverified; message="⚠️ Команда отправлена. Состояние <code>$ip</code> не удалось проверить."
+  elif [[ $banned == 1 ]]; then
+    result=still_banned; message="❌ <code>$ip</code> по-прежнему заблокирован в jail sshd."
+  elif [[ $changed == 0 ]]; then
+    result=already_clear; message="ℹ️ <code>$ip</code> уже не заблокирован в jail sshd."
+  else
+    result=unbanned; message="✅ <code>$ip</code> разблокирован в jail sshd."
+  fi
+  printf 'autoxray-bot: fail2ban jail=sshd action=unban admin=%s ip=%s result=%s\n' "$chat" "$ip" "$result" >&2
+  tg_send "$chat" "$message"
+}
 
 # Кнопка обновления появляется только для релиза с корректным номером выше установленного.
 # Версию дополнительно проверяет независимый процесс непосредственно перед обновлением.
@@ -4202,6 +4434,8 @@ bot_help() {
 /stats — трафик
 /doctor — диагностика
 /warp — состояние WARP
+/fail2ban — статистика SSH-защиты и список банов
+/unban <code>IP</code> — разблокировать адрес в Fail2ban SSH с подтверждением
 /id — ваш Telegram ID
 EOF
 }
@@ -4330,6 +4564,12 @@ bot_callback() { # chat message_id callback_id data
   tg_answer "$cbid"
   case $a in
     bc) if [[ $b == ok && -s $AX_ETC/.broadcast.txt ]]; then bot_broadcast_send "$chat"; else rm -f "$AX_ETC/.broadcast.txt"; tg_send "$chat" "Рассылка отменена."; fi ;;
+    f2b)
+      case $b in
+        p) [[ -z $d ]] && bot_f2b_report "$chat" "$c" "$mid" ;;
+        ask) bot_f2b_confirm "$chat" "${data#f2b:ask:}" ;;
+        do|cancel) [[ -z $d ]] && bot_f2b_finish "$chat" "$c" "$b" ;;
+      esac ;;
     list) bot_show_list "$chat" "$mid" ;;
     new) tg_send "$chat" "Создайте пользователя: <code>/add имя [ГБ] [дней]</code>" ;;
     status) bot_do cmd_status; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" "$(bot_status_kb)" ;;
@@ -4379,6 +4619,9 @@ bot_command() { # chat текст
   case $cmd in
     /start|/help) tg_send "$chat" "$(bot_help)" "$BOT_MAIN_KB" ;;
     /status) bot_do cmd_status; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" "$(bot_status_kb)" ;;
+    /fail2ban) bot_f2b_report "$chat" 0 ;;
+    /unban) if (( ${#a[@]} == 1 )); then bot_f2b_confirm "$chat" "$name"
+            else tg_send "$chat" 'Используйте <code>/unban IP</code>.'; fi ;;
     /update)
       local latest; latest=$(bot_available_update refresh)
       if [[ -n $latest ]]; then bot_update_prompt "$chat" "$latest"
@@ -5119,6 +5362,7 @@ main() {
     export)       cmd_export_import export "$@" ;;
     import)       cmd_export_import import "$@" ;;
     setup-cron)   cmd_setup_cron ;;
+    setup-fail2ban) cmd_setup_fail2ban ;;
     doctor)       cmd_doctor ;;
     geo-update)   need_root; cmd_geo_update "$@" ;;
     firewall)     cmd_firewall "$@" ;;

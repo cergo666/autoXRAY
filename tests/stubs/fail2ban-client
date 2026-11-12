@@ -1,0 +1,5 @@
+#!/bin/sh
+# Активный sshd jail на хосте с существующей конфигурацией.
+[ -n "${AX_TEST_F2B_STATUS_LOG:-}" ] && [ "$*" = 'status sshd' ] || exit 1
+printf '%s\n' "$*" >>"$AX_TEST_F2B_STATUS_LOG"
+printf '%s\n' 'Status for the jail: sshd'
