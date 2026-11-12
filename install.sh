@@ -5,7 +5,7 @@
 # Запуск:  bash -c "$(curl -L https://github.com/cergo666/autoXRAY/releases/latest/download/install.sh)" -- домен.com
 # Мост RU -> EU: добавьте vless:// ссылки EU-серверов после домена (XHTTP/RAW TLS):
 #          ... -- домен.com "vless://..." "vless://..."
-# Автоматизация (без вопросов): AX_TG=y|n AX_FP=1..8 AX_USER=имя AX_WARP=n|y|ru bash install.sh домен.com
+# Автоматизация: AX_TG=y|n AX_FP=1..8 AX_USER=имя AX_WARP=n|y|ru AX_FAIL2BAN=y|n bash install.sh домен.com
 # Отладка из локальной копии репозитория: AUTOXRAY_SRC=/путь/к/репозиторию
 
 GRN='\033[1;32m'
@@ -262,8 +262,7 @@ elif [ "$INIT_MODE" = direct ] && [ -f /usr/local/etc/xray/config.json ] \
     fi
 fi
 if [ "$REUSE" != true ]; then
-    echo -e "${GRN}Настраиваем защиту SSH (Fail2ban)${NC}"
-    autoxray setup-fail2ban || die "Не удалось подготовить защиту SSH."
+    autoxray setup-fail2ban --install || die "Не удалось подготовить защиту SSH."
     AUTH_PATHS=(
         "/api/v1/authenticate" "/api/auth/login" "/auth/session" "/v2/login"
         "/api/v1/session" "/gateway/auth" "/sso/authenticate" "/api/v2/token"

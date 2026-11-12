@@ -24,3 +24,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: e2e в Docker (direct, bridge, install, migrate)
         run: tests/run.sh all
+
+  fail2ban-e2e:
+    runs-on: ubuntu-24.04
+    needs: lint
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Зависимости теста SSH
+        run: |
+          sudo apt-get update -q
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openssh-server iproute2 jq
+      - name: Реальные sshd, Fail2ban и nftables
+        run: sudo env AX_FAIL2BAN_TEST_VM=1 bash tests/e2e-fail2ban.sh

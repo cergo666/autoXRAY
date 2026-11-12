@@ -1885,8 +1885,9 @@ EOF
 # ---------------------------------------------------------- защита SSH
 
 F2B_RUN_DIR=/run/autoxray
+F2B_CLIENT_TIMEOUT=5s
 
-f2b_client() { LC_ALL=C timeout 5s fail2ban-client "$@"; }
+f2b_client() { LC_ALL=C timeout "$F2B_CLIENT_TIMEOUT" fail2ban-client "$@"; }
 
 f2b_ssh_ports() {
   local config addresses address port
@@ -1908,8 +1909,107 @@ f2b_ssh_ports() {
   printf '%s\n' "${ports[@]}" | sort -nu | paste -sd, -
 }
 
+f2b_jail_config() { # порты SSH
+  cat <<EOF
+[sshd]
+enabled = true
+backend = systemd
+mode = aggressive
+port = $1
+# При чтении старых ошибок бан может сработать сразу. Сохраняем текущий SSH-сеанс установщика.
+banaction = nftables[type=multiport,blocktype="tcp flags syn / syn,ack reject"]
+maxretry = 3
+findtime = 10m
+bantime = 24h
+bantime.increment = true
+bantime.maxtime = 30d
+EOF
+}
+
+f2b_managed_ports() {
+  local jail=$1 ports
+  [[ -f $jail && ! -L $jail && -O $jail ]] || return 1
+  ports=$(sed -n 's/^port = \([0-9,]*\)$/\1/p' "$jail") || return 1
+  [[ $ports =~ ^[0-9]+(,[0-9]+)*$ ]] && cmp -s -- "$jail" <(f2b_jail_config "$ports") || return 1
+  printf '%s\n' "$ports"
+}
+
+f2b_configured_ports() {
+  # Fail2ban формирует список команд из всех конфигурационных файлов и переопределений.
+  LC_ALL=C fail2ban-client -d 8>&- | python3 -c '
+import ast
+import sys
+
+ports = None
+for line in sys.stdin:
+    if not line.startswith("["):
+        continue
+    cmd = ast.literal_eval(line)
+    if cmd[:4] == ["multi-set", "sshd", "action", "nftables"]:
+        ports = dict(cmd[4]).get("port", ports)
+    elif cmd[:5] == ["set", "sshd", "action", "nftables", "port"]:
+        ports = cmd[5]
+if ports is None:
+    sys.exit(1)
+print(ports)
+'
+}
+
+f2b_reload_sshd() { LC_ALL=C fail2ban-client reload --restart --if-exists sshd 8>&-; }
+
+f2b_sync_ports() { ( # файл jail, записанные порты, актуальные порты SSH
+  local jail=$1 previous=$2 ports=$3 active configured db tmp applied=0 reloading=0 ready=0
+  active=$(f2b_client get sshd action nftables port) || die "Не удалось проверить порты jail sshd. Проверьте локальные настройки Fail2ban."
+  if [[ $previous == "$ports" && $active == "$ports" ]]; then
+    ok "✅ Fail2ban защищает SSH на портах $ports."
+    return 0
+  fi
+
+  # При перезапуске jail действующие баны восстанавливаются из базы Fail2ban.
+  db=$(f2b_client get dbfile) || die "Не удалось проверить действующую базу Fail2ban."
+  db=${db##*$'\n`- '}
+  [[ $db == /* && -f $db ]] \
+    || die "Для обновления портов с сохранением банов нужна действующая база Fail2ban."
+  nft list tables >/dev/null || die "Не удалось обратиться к nftables."
+  tmp=$(mktemp -d -- "${jail%/*}/.autoxray-ports.XXXXXX") || return 1
+  trap '
+    if [[ $ready == 0 ]]; then
+      if [[ $applied == 1 ]]; then
+        if [[ -L $jail ]] || ! cmp -s -- "$jail" <(f2b_jail_config "$ports"); then
+          warn "Файл $jail изменён во время обновления. Предыдущая версия сохранена в $tmp/previous."
+          exit 1
+        fi
+        if ! mv -fT -- "$tmp/previous" "$jail"; then
+          warn "Восстановите конфигурацию из $tmp/previous."
+          exit 1
+        fi
+      fi
+      if [[ $reloading == 1 ]]; then
+        f2b_reload_sshd >/dev/null || warn "Проверьте jail sshd после восстановления конфигурации."
+      fi
+    fi
+    rm -rf -- "$tmp"
+  ' EXIT
+
+  if [[ $previous != "$ports" ]]; then
+    cp -p -- "$jail" "$tmp/previous" && cp -p -- "$tmp/previous" "$tmp/next" || return 1
+    f2b_jail_config "$ports" >"$tmp/next" || return 1
+    [[ ! -L $jail ]] && cmp -s -- "$jail" <(f2b_jail_config "$previous") \
+      || die "Файл $jail изменён во время обновления."
+    mv -fT -- "$tmp/next" "$jail" || return 1
+    applied=1
+  fi
+  configured=$(f2b_configured_ports) && [[ $configured == "$ports" ]] \
+    || die "Fail2ban не использует порты $ports из $jail. Проверьте локальные переопределения jail sshd."
+  reloading=1
+  f2b_reload_sshd && active=$(f2b_client get sshd action nftables port) && [[ $active == "$ports" ]] \
+    || die "Не удалось применить порты SSH $ports в Fail2ban."
+  ready=1
+  ok "✅ Fail2ban защищает SSH на портах $ports."
+); }
+
 setup_fail2ban() { ( # каталог конфигурации Fail2ban
-  local etc=$1 ports existing ready=0 installing=0 _
+  local etc=$1 ports previous active existing ready=0 installing=0 _
   local stage="$etc/.autoxray-setup"
   local jail="$etc/jail.d/90-autoxray-sshd.local" server="$etc/fail2ban.d/90-autoxray.local"
 
@@ -1918,7 +2018,12 @@ setup_fail2ban() { ( # каталог конфигурации Fail2ban
   if [[ ! -d $stage || -L $stage ]]; then
     if command -v fail2ban-client >/dev/null 2>&1; then
       f2b_client status sshd >/dev/null || die "Действующий Fail2ban не обслуживает jail sshd. Проверьте его настройки и повторите установку."
-      ok "✅ Используется существующая защита Fail2ban SSH."
+      if [[ ! -L $etc && ! -L $etc/jail.d ]] && previous=$(f2b_managed_ports "$jail"); then
+        ports=$(f2b_ssh_ports) || die "Не удалось определить порты SSH для Fail2ban."
+        f2b_sync_ports "$jail" "$previous" "$ports"
+        return $?
+      fi
+      ok "✅ Найден действующий jail sshd с локальной конфигурацией."
       return 0
     fi
     if [[ -e $etc || -L $etc ]]; then
@@ -1951,25 +2056,12 @@ setup_fail2ban() { ( # каталог конфигурации Fail2ban
 
   # Пакет может запустить службу при установке. К этому моменту jail уже
   # читает журнал systemd и применяет правила только к портам SSH.
-  ( umask 077
-    cat >"$stage/jail" <<EOF
-[sshd]
-enabled = true
-backend = systemd
-mode = aggressive
-port = $ports
-# При чтении старых ошибок бан может сработать сразу. Сохраняем текущий SSH-сеанс установщика.
-banaction = nftables[type=multiport,blocktype="tcp flags syn / syn,ack reject"]
-maxretry = 3
-findtime = 10m
-bantime = 24h
-bantime.increment = true
-bantime.maxtime = 30d
-EOF
-  ) && ( umask 077; printf '[Definition]\ndbpurgeage = 2678400\n' >"$stage/server" ) || return 1
+  ( umask 077; f2b_jail_config "$ports" >"$stage/jail" ) \
+    && ( umask 077; printf '[Definition]\ndbpurgeage = 2678400\n' >"$stage/server" ) || return 1
   [[ $stage/jail -ef $jail ]] || ln -T -- "$stage/jail" "$jail" || return 1
   [[ $stage/server -ef $server ]] || ln -T -- "$stage/server" "$server" || return 1
 
+  warn "Недавние ошибки SSH могут сразу заблокировать повторный вход. Снять бан можно из консоли сервера."
   installing=1
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends fail2ban nftables python3-systemd 8>&- \
     || die "Не удалось установить пакеты для Fail2ban."
@@ -1977,7 +2069,7 @@ EOF
   LC_ALL=C fail2ban-client -t || die "Fail2ban не принял конфигурацию SSH."
   systemctl restart fail2ban.service 8>&- || die "Не удалось запустить Fail2ban."
   for _ in {1..12}; do
-    if systemctl is-active --quiet fail2ban.service && f2b_client status sshd >/dev/null 2>&1; then
+    if systemctl is-active --quiet fail2ban.service && active=$(f2b_client get sshd action nftables port 2>/dev/null) && [[ $active == "$ports" ]]; then
       systemctl enable fail2ban.service 8>&- || die "Не удалось включить автозапуск Fail2ban."
       ready=1
       ok "✅ Fail2ban защищает SSH на портах $ports."
@@ -1989,6 +2081,20 @@ EOF
 ); }
 
 cmd_setup_fail2ban() {
+  if [[ $# == 1 && $1 == --install ]]; then
+    local choice=${AX_FAIL2BAN:-}
+    if [[ -z $choice && -t 0 ]]; then
+      warn "Fail2ban может сразу заблокировать повторный вход при недавних ошибках SSH."
+      read -r -p 'Включить защиту SSH (Fail2ban)? [y/N] ' choice || return 0
+    fi
+    case $choice in
+      ''|n|N) return 0 ;;
+      y|Y) ;;
+      *) die "AX_FAIL2BAN принимает y или n." ;;
+    esac
+  elif [[ $# != 0 ]]; then
+    die "Использование: autoxray setup-fail2ban"
+  fi
   [[ $EUID -eq 0 && $DRY != 1 ]] || die "Для установки Fail2ban нужны root права."
   install -d -m 700 -- "$F2B_RUN_DIR" || return 1
   (
@@ -4241,7 +4347,7 @@ bot_f2b_take_confirmation() { # chat nonce; под блокировкой state
 }
 
 bot_f2b_confirm() { # chat IP
-  local chat=$1 ip=${2:-} banned nonce
+  local chat=$1 ip=${2:-} banned nonce F2B_CLIENT_TIMEOUT=20s
   bot_f2b_admin "$chat" || return 0
   if [[ ! $ip =~ ^[0-9A-Fa-f:.]{1,45}$ ]] || ! ip=$(f2b_normalize_ips <<<"$ip") || [[ -z $ip ]]; then
     tg_send "$chat" 'Укажите один IPv4 или IPv6, например <code>/unban 203.0.113.5</code>.'
@@ -4260,7 +4366,7 @@ bot_f2b_confirm() { # chat IP
 }
 
 bot_f2b_finish() { # chat nonce do|cancel
-  local chat=$1 nonce=$2 action=$3 ip banned changed result message
+  local chat=$1 nonce=$2 action=$3 ip banned changed result message unban_ok=0 F2B_CLIENT_TIMEOUT=20s
   bot_f2b_admin "$chat" || return 0
   if [[ ! $nonce =~ ^[0-9a-f]{32}$ ]] || ! ip=$(locked bot_f2b_take_confirmation "$chat" "$nonce"); then
     tg_send "$chat" 'ℹ️ Подтверждение недействительно или истекло. Повторите /unban.'
@@ -4274,16 +4380,21 @@ bot_f2b_finish() { # chat nonce do|cancel
     return
   fi
   bot_f2b_admin "$chat" || return 0
-  if ! changed=$(f2b_client set sshd unbanip "$ip" 2>/dev/null); then
-    result=failed; message="❌ Fail2ban вернул ошибку при разблокировке <code>$ip</code>."
-  elif ! banned=$(f2b_is_banned "$ip" 2>/dev/null); then
-    result=unverified; message="⚠️ Команда отправлена. Состояние <code>$ip</code> не удалось проверить."
+  if changed=$(f2b_client set sshd unbanip "$ip" 2>/dev/null); then unban_ok=1; fi
+  if ! banned=$(f2b_is_banned "$ip" 2>/dev/null); then
+    result=unverified; message="⚠️ Состояние <code>$ip</code> после команды не удалось проверить."
   elif [[ $banned == 1 ]]; then
-    result=still_banned; message="❌ <code>$ip</code> по-прежнему заблокирован в jail sshd."
-  elif [[ $changed == 0 ]]; then
+    if [[ $unban_ok == 1 ]]; then
+      result=still_banned; message="❌ <code>$ip</code> по-прежнему заблокирован в jail sshd."
+    else
+      result=failed; message="❌ Fail2ban вернул ошибку при разблокировке <code>$ip</code>."
+    fi
+  elif [[ $unban_ok == 1 && $changed == 1 ]]; then
+    result=unbanned; message="✅ <code>$ip</code> разблокирован в jail sshd."
+  elif [[ $unban_ok == 1 && $changed == 0 ]]; then
     result=already_clear; message="ℹ️ <code>$ip</code> уже не заблокирован в jail sshd."
   else
-    result=unbanned; message="✅ <code>$ip</code> разблокирован в jail sshd."
+    result=confirmed_clear; message="✅ <code>$ip</code> больше не заблокирован в jail sshd."
   fi
   printf 'autoxray-bot: fail2ban jail=sshd action=unban admin=%s ip=%s result=%s\n' "$chat" "$ip" "$result" >&2
   tg_send "$chat" "$message"
@@ -5330,6 +5441,7 @@ usage() {
   echo -e "  ${C}autoxray bot${N} setup|status|on|off|add-admin|del-admin|proxy|test|remove   ${D}Telegram-бот администратора и уведомления${N}"
   echo -e "  ${C}autoxray site${N} status|regenerate|set <папка>   ${D}сайт-маскировка: новый дизайн или свой сайт${N}"
   echo -e "  ${C}autoxray firewall${N} [--dry-run]  ${D}🔥 настроить ufw (SSH, 80, 443)${N}"
+  echo -e "  ${C}autoxray setup-fail2ban${N}        ${D}включить Fail2ban для SSH или сверить его порты${N}"
   echo -e "  ${C}autoxray hop${N} on [20000-30000]|off|status   ${D}Hysteria2 меняет UDP-порты (port hopping)${N}"
   echo -e "${H}Обслуживание${N}"
   echo -e "  ${C}autoxray backup${N} [файл]  ${C}restore${N} <файл>  ${C}render${N}  ${D}пересобрать конфиги${N}"
@@ -5377,7 +5489,7 @@ main() {
     export)       cmd_export_import export "$@" ;;
     import)       cmd_export_import import "$@" ;;
     setup-cron)   cmd_setup_cron ;;
-    setup-fail2ban) cmd_setup_fail2ban ;;
+    setup-fail2ban) cmd_setup_fail2ban "$@" ;;
     doctor)       cmd_doctor ;;
     geo-update)   need_root; cmd_geo_update "$@" ;;
     firewall)     cmd_firewall "$@" ;;

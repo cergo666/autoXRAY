@@ -24,8 +24,21 @@ set -euo pipefail
 cd "$AX_F2B_FIXTURE"
 printf '%s\n' "$*" >>client.log
 [[ -e installed && ! -e unavailable ]] || exit 1
+configured_ports() {
+  if [[ -f override-ports ]]; then cat override-ports; else sed -n 's/^port = //p' "$AX_F2B_JAIL"; fi
+}
 case $* in
   '-t') [[ ! -e invalid-config ]] ;;
+  '-d')
+    [[ ! -e invalid-config ]]
+    printf "['multi-set', 'sshd', 'action', 'nftables', [['port', '%s']]]\n" "$(configured_ports)" ;;
+  'get dbfile') printf 'Current database file is:\n\140- %s\n' "$AX_F2B_FIXTURE/db" ;;
+  'get sshd action nftables port') [[ -e active ]]; cat live-ports ;;
+  'reload --restart --if-exists sshd')
+    [[ ! -e /proc/$$/fd/8 ]]
+    configured_ports >live-ports
+    if [[ -e reload-fails-once ]]; then rm reload-fails-once; exit 1; fi
+    touch active ;;
   'status sshd')
     [[ -e active ]] || exit 1
     printf 'Status for the jail: sshd\n  Currently failed: 1\n  Total failed: 19\n  Currently banned: %s\n  Total banned: 29\n' "$(wc -l <bans)" ;;
@@ -38,6 +51,7 @@ case $* in
     printf '%s\n' "$4" >>unbans
     [[ ! -e unban-error ]] || exit 1
     if [[ ! -e still-banned ]]; then grep -Fxv -- "$4" bans >bans.next || true; mv -- bans.next bans; fi
+    [[ ! -e unban-late-error ]] || exit 124
     [[ ! -e unavailable-after-unban ]] || touch unavailable
     echo 1 ;;
   *) exit 1 ;;
@@ -69,7 +83,10 @@ printf '%s\n' "$*" >>systemctl.log
 case $* in
   'is-active --quiet ssh.socket') [[ -f socket-listen ]] ;;
   'show --property=Listen --value ssh.socket') cat socket-listen ;;
-  'restart fail2ban.service') [[ ! -e /proc/$$/fd/8 && ! -e restart-fails ]]; touch active ;;
+  'restart fail2ban.service')
+    [[ ! -e /proc/$$/fd/8 && ! -e restart-fails ]]
+    sed -n 's/^port = //p' "$AX_F2B_JAIL" >live-ports
+    touch active ;;
   'is-active --quiet fail2ban.service') [[ -e active ]] ;;
   'enable fail2ban.service') [[ ! -e /proc/$$/fd/8 ]]; touch enabled ;;
   'disable --now fail2ban.service') [[ ! -e /proc/$$/fd/8 ]]; rm -f active enabled ;;
@@ -88,6 +105,17 @@ assert_contains() {
   [[ $1 == *"$2"* ]] || { printf 'FAIL: expected %q in %q\n' "$2" "$1" >&2; exit 1; }
 }
 
+env -u AX_FAIL2BAN bash ./autoxray setup-fail2ban --install </dev/null
+AX_FAIL2BAN=n bash ./autoxray setup-fail2ban --install </dev/null
+printf '\n' | env -u AX_FAIL2BAN script -qec 'bash ./autoxray setup-fail2ban --install' /dev/null >"$FIXTURE/prompt.log"
+grep -Fq 'Включить защиту SSH (Fail2ban)? [y/N]' "$FIXTURE/prompt.log"
+if AX_FAIL2BAN=y bash ./autoxray setup-fail2ban --install </dev/null >"$FIXTURE/opt-in.log" 2>&1; then
+  echo 'FAIL: opted-in setup bypassed the root guard'; exit 1
+fi
+grep -Fq 'Для установки Fail2ban нужны root права' "$FIXTURE/opt-in.log"
+[[ ! -e $FIXTURE/client.log && ! -e $FIXTURE/apt.log && ! -e $FIXTURE/systemctl.log ]]
+printf 'OK: installer setup requires opt-in and noninteractive default leaves Fail2ban alone\n'
+
 printf 'port 22\nlistenaddress [::]:2222\nlistenaddress 127.0.0.1:4444\nlistenaddress 0.0.0.0:2222\n' >"$FIXTURE/sshd-config"
 [[ $(f2b_ssh_ports) == 2222,4444 ]]
 printf '[::]:2022 (Stream)\n0.0.0.0:2022 (Stream)\n127.0.0.1:8022 (Stream)\n' >"$FIXTURE/socket-listen"
@@ -100,6 +128,7 @@ printf 'OK: actual SSH listen addresses, socket activation and invalid port reje
 etc="$FIXTURE/etc"
 jail="$etc/jail.d/90-autoxray-sshd.local"
 server="$etc/fail2ban.d/90-autoxray.local"
+export AX_F2B_JAIL="$jail"
 touch "$FIXTURE/apt-fails"
 if setup_fail2ban "$etc" >"$FIXTURE/setup.log" 2>&1; then echo 'FAIL: apt error ignored'; exit 1; fi
 [[ ! -e $jail && ! -e $server && -d $etc/.autoxray-setup ]]
@@ -111,6 +140,30 @@ for setting in 'port = 2222,4444' 'maxretry = 3' 'findtime = 10m' 'bantime = 24h
 grep -Fxq 'dbpurgeage = 2678400' "$server"
 [[ $(stat -c %a "$jail") == 600 && -e $FIXTURE/enabled && ! -e $etc/.autoxray-setup ]]
 printf 'OK: clean installation, exact policy, no inherited setup lock and retry after apt error\n'
+
+touch "$FIXTURE/db"
+setup_fail2ban "$etc" >/dev/null
+if grep -q '^reload ' "$FIXTURE/client.log"; then echo 'FAIL: unchanged jail reloaded'; exit 1; fi
+printf '[::]:2022 (Stream)\n127.0.0.1:8022 (Stream)\n' >"$FIXTURE/socket-listen"
+printf '9999\n' >"$FIXTURE/override-ports"
+if setup_fail2ban "$etc" >"$FIXTURE/override.log" 2>&1; then echo 'FAIL: local port override ignored'; exit 1; fi
+grep -Fxq 'port = 2222,4444' "$jail"
+[[ $(cat "$FIXTURE/live-ports") == 2222,4444 ]]
+if grep -q '^reload ' "$FIXTURE/client.log"; then echo 'FAIL: overriding policy reloaded'; exit 1; fi
+rm -- "$FIXTURE/override-ports"
+
+touch "$FIXTURE/reload-fails-once"
+if setup_fail2ban "$etc" >"$FIXTURE/reload.log" 2>&1; then echo 'FAIL: reload error ignored'; exit 1; fi
+grep -Fxq 'port = 2222,4444' "$jail"
+[[ $(cat "$FIXTURE/live-ports") == 2222,4444 ]]
+( setup_fail2ban "$etc" ) 8>"$FIXTURE/test.lock" >/dev/null
+grep -Fxq 'port = 2022,8022' "$jail"
+[[ $(cat "$FIXTURE/live-ports") == 2022,8022 && $(stat -c %a "$jail") == 600 ]]
+printf '2222,4444\n' >"$FIXTURE/live-ports"
+setup_fail2ban "$etc" >/dev/null
+[[ $(cat "$FIXTURE/live-ports") == 2022,8022 ]]
+rm -- "$FIXTURE/socket-listen"
+printf 'OK: managed port changes and interrupted reload recovered, overrides preserved\n'
 
 printf '# local policy\n' >>"$jail"
 before=$(sha256sum <"$jail")
@@ -129,6 +182,7 @@ printf 'OK: installed, inactive and residual custom configuration preserved\n'
 etc="$FIXTURE/bad-etc"
 jail="$etc/jail.d/90-autoxray-sshd.local"
 server="$etc/fail2ban.d/90-autoxray.local"
+export AX_F2B_JAIL="$jail"
 touch "$FIXTURE/invalid-config"
 if setup_fail2ban "$etc" >"$FIXTURE/invalid.log" 2>&1; then echo 'FAIL: invalid config accepted'; exit 1; fi
 [[ ! -e $jail && ! -e $server && -e $FIXTURE/installed && ! -e $FIXTURE/enabled ]]
@@ -232,3 +286,12 @@ assert_contains "$TG_MSG" 'не удалось проверить'
 grep -Fq 'result=unverified' "$FIXTURE/audit.log"
 [[ ! -e $FIXTURE/unexpected-curl ]]
 printf 'OK: backend errors and unknown state reported without false success\n'
+
+rm -- "$FIXTURE/unavailable-after-unban" "$FIXTURE/unavailable"
+message 10001 10001 private '/unban 198.51.100.3'
+touch "$FIXTURE/unban-late-error"
+callback 10001 10001 private "$(confirm_data)" 2>>"$FIXTURE/audit.log"
+assert_contains "$TG_MSG" 'больше не заблокирован в jail sshd'
+grep -Fq 'ip=198.51.100.3 result=confirmed_clear' "$FIXTURE/audit.log"
+if grep -Fxq '198.51.100.3' "$FIXTURE/bans"; then echo 'FAIL: ban remains after verified unban'; exit 1; fi
+printf 'OK: ban status verified when unban succeeded before a client timeout\n'
