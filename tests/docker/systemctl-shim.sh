@@ -30,13 +30,17 @@ case $cmd in
             *) printf '%s\n' root ;;
         esac ;;
     is-failed) svc=${*: -1}; [ "$svc" = xray ] && [ -e /run/xray-failed ] && { echo failed; exit 0; }; echo active ;;
-    is-active) svc=${*: -1}; case $svc in xray) [ -f $XRAY_PID ] && kill -0 "$(cat $XRAY_PID)" 2>/dev/null ;; nginx) nginx_running ;; autoxray-bot) [ -f /run/bot.active ] ;; *) false ;; esac ;;
+    is-active) svc=${*: -1}; case $svc in xray) [ -f $XRAY_PID ] && kill -0 "$(cat $XRAY_PID)" 2>/dev/null ;; nginx) nginx_running ;; autoxray-bot) [ -f /run/bot.active ] ;; *) false ;; esac; exit $? ;;
+    disable) if [[ $* == '--now autoxray-bot' ]]; then rm -f /run/bot.active; fi ;;
+    try-restart) : ;; # бот представлен флагом активности, команда не запускает остановленную службу
     restart|start|reload|stop)
         for svc in "$@"; do
             case $svc in
                 xray) xray_stop; [ "$cmd" = stop ] || xray_start || exit 1 ;;
                 nginx) if [ "$cmd" = stop ]; then nginx -s quit 2>/dev/null
                        elif nginx_running; then nginx -s reload; else nginx; fi ;;
+                autoxray-bot) if [[ $cmd == stop ]]; then rm -f /run/bot.active
+                              elif [[ $cmd == start || $cmd == restart ]]; then touch /run/bot.active; fi ;;
             esac
         done ;;
     *) : ;;

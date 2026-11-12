@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# Запуск проверок в Docker: tests/run.sh [direct|bridge|install|supply-chain|all] (по умолчанию all)
+# Запуск проверок: tests/run.sh [direct|bridge|install|supply-chain|unit|all] (по умолчанию all)
 # Наборы независимы (каждый в своём контейнере), поэтому `all` запускает их параллельно и печатает журналы по очереди.
 # AX_SERIAL=1 — по одному, с выводом в реальном времени.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 IMG=autoxray-test:local
-docker build -q -t "$IMG" tests/docker >/dev/null
 
 run() {
   docker run --rm --cap-add NET_ADMIN -v "$PWD":/opt/autoxray:ro "$IMG" bash -c "/opt/autoxray/tests/$1"
@@ -19,7 +18,7 @@ suite() { # имя -> запуск набора
     migrate) run "e2e-install.sh migrate" ;;
     verify)  run "e2e-install.sh verify" ;;
     supply-chain) run e2e-supply-chain.sh ;;
-    unit)    bash "$(dirname "$0")/unit.sh" ;;
+    unit)    bash "$(dirname "$0")/unit.sh" && bash "$(dirname "$0")/test-bot-self-update.sh" ;;
   esac
 }
 
@@ -32,6 +31,10 @@ case "${1:-all}" in
   all)     suites=(direct bridge fresh migrate verify supply-chain unit) ;;
   *) echo "usage: $0 [direct|bridge|install|supply-chain|unit|all]"; exit 2 ;;
 esac
+
+if [[ ${suites[*]} != unit ]]; then
+  docker build -q -t "$IMG" tests/docker >/dev/null
+fi
 
 if [[ ${AX_SERIAL:-0} == 1 || ${#suites[@]} -eq 1 ]]; then
   for s in "${suites[@]}"; do suite "$s"; done

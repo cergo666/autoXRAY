@@ -391,11 +391,14 @@ autoxray ipwatch >/dev/null 2>&1
 autoxray debug on 5 >/dev/null 2>&1; autoxray debug off >/dev/null 2>&1; [ "$(jq -r .log.loglevel /usr/local/etc/xray/config.json)" = none ] && pass "debug off возвращает обычный режим" || fail "debug off"
 
 step "Версии: баннер обновления и список версий ядра (поддельный GitHub API)"
+ORIG_VER=$(autoxray version | awk '{print $2}')
+TEST_MAJOR=$((10#${ORIG_VER%%.*} + 1))
+BANNER_VER="$TEST_MAJOR.0.0"
 mkdir -p /tmp/api/repos/cergo666/autoXRAY/releases /tmp/api/repos/XTLS/Xray-core
-echo '{"tag_name":"v99.0.0"}' > /tmp/api/repos/cergo666/autoXRAY/releases/latest
+printf '{"tag_name":"v%s"}\n' "$BANNER_VER" > /tmp/api/repos/cergo666/autoXRAY/releases/latest
 echo '[{"tag_name":"v99.1.0","prerelease":false,"draft":false},{"tag_name":"v100.0.0","prerelease":true,"draft":false},{"tag_name":"v26.9.9","prerelease":false,"draft":false}]' > /tmp/api/repos/XTLS/Xray-core/releases
 rm -f /etc/autoxray/.latest
-AX_API=file:///tmp/api autoxray status 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -q 'Доступна версия 99.0.0' && pass "баннер: доступна новая версия autoxray" || fail "баннера обновления нет"
+AX_API=file:///tmp/api autoxray status 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -Fq "Доступна версия $BANNER_VER" && pass "баннер: доступна новая версия autoxray" || fail "баннера обновления нет"
 AX_API=file:///tmp/api autoxray core list 2>&1 | sed 's/\x1b\[[0-9;]*m//g' > /tmp/core.out
 grep -q 'v99.1.0' /tmp/core.out && grep -q 'v100.0.0.*пререлиз' /tmp/core.out && ! grep -q 'v99.1.0.*пререлиз' /tmp/core.out && pass "core list: новее текущей, пререлиз помечен" || { fail "core list"; cat /tmp/core.out; }
 grep -q 'лучше не обновлять без необходимости' /tmp/core.out && pass "предупреждение об обновлении ядра" || fail "нет предупреждения"
@@ -660,35 +663,189 @@ autoxray site status | sed 's/\x1b\[[0-9;]*m//g' | grep -q custom && pass "site 
 autoxray site regenerate >/dev/null
 
 step "Безопасное обновление: снимок, успешное обновление, откат при сбое"
-ORIG_VER=$(autoxray version | awk '{print $2}')
-mk_release() { # версия [постфикс-код]
-  rm -rf "/tmp/rel/v$1"; mkdir -p "/tmp/rel/v$1"; cp -r /opt/autoxray/templates /opt/autoxray/components "/tmp/rel/v$1/"
-  sed "s/^AX_VERSION=\".*\"/AX_VERSION=\"$1\"/" /opt/autoxray/autoxray > "/tmp/rel/v$1/autoxray"
-  [ -n "${2:-}" ] && sed -i "s|^[[:space:]]*main \"\$@\"\$|$2\nmain \"\$@\"|" "/tmp/rel/v$1/autoxray"
-  return 0
+export AX_TG_API=http://127.0.0.1:1
+GOOD_VER="$TEST_MAJOR.0.1"
+BAD_HASH_VER="$TEST_MAJOR.0.2"
+MISSING_HASH_VER="$TEST_MAJOR.0.3"
+NO_SUMS_VER="$TEST_MAJOR.0.4"
+FAIL_CHECK_VER="$TEST_MAJOR.0.5"
+FAIL_INSTALL_VER="$TEST_MAJOR.0.6"
+FAIL_RENDER_VER="$TEST_MAJOR.0.7"
+mk_release() { # версия [файл с переопределением функций]
+  local dir="/tmp/rel/v$1"
+  rm -rf "$dir"; mkdir -p "$dir"; cp -r /opt/autoxray/templates /opt/autoxray/components "$dir/"
+  sed "s/^AX_VERSION=\".*\"/AX_VERSION=\"$1\"/" /opt/autoxray/autoxray >"$dir/autoxray"
+  if [[ -n ${2:-} ]]; then
+    awk -v hook="$2" '/^[[:space:]]*main "\$@"$/ {while ((getline line < hook) > 0) print line} {print}' \
+      "$dir/autoxray" >"$dir/autoxray.with-hook" && mv "$dir/autoxray.with-hook" "$dir/autoxray"
+  fi
 }
 export AX_SUMS_BASE=file:///tmp/rel
 sums_for() { (cd "/tmp/rel/v$1" && files=$(sed -n '/^RELEASE_FILES=(/,/)/p' autoxray | tr -d '()' | sed 's/^RELEASE_FILES=//' | tr ' ' '\n' | grep -E '^[A-Za-z0-9_./-]+$') && sha256sum $files > FILES.sha256); }
-mk_release 9.9.9; sums_for 9.9.9
+mk_release "$GOOD_VER"; sums_for "$GOOD_VER"
+(umask 077; jq '.bot.enabled = true' /etc/autoxray/state.json > /tmp/bot-update-state.json &&
+  mv /tmp/bot-update-state.json /etc/autoxray/state.json && printf '%s\n' test-token > /etc/autoxray/bot.token)
 touch /run/bot.active; : > /run/systemctl.log
-AX_RAW_BASE=file:///tmp/rel autoxray self-update v9.9.9 >/tmp/upd1.out 2>&1 && [ "$(autoxray version | awk '{print $2}')" = 9.9.9 ] && pass "self-update до 9.9.9 прошёл проверки" || { fail "self-update"; sed 's/\x1b\[[0-9;]*m//g' /tmp/upd1.out | tail -n 8; }
-grep -q 'restart autoxray-bot' /run/systemctl.log && pass "self-update перезапускает службу бота (иначе он остаётся на старом коде)" || fail "бот не перезапущен после self-update"
-rm -f /run/bot.active
+AX_RAW_BASE=file:///tmp/rel autoxray self-update "v$GOOD_VER" >/tmp/upd1.out 2>&1 && [ "$(autoxray version | awk '{print $2}')" = "$GOOD_VER" ] && pass "self-update до $GOOD_VER прошёл проверки" || { fail "self-update"; sed 's/\x1b\[[0-9;]*m//g' /tmp/upd1.out | tail -n 8; }
+grep -Eq '^(try-)?restart autoxray-bot$' /run/systemctl.log && pass "self-update перезапускает работающего бота" || fail "бот не перезапущен после self-update"
 ls /var/lib/autoxray/snapshots/*-v$ORIG_VER.tar.gz >/dev/null 2>&1 && pass "перед обновлением создан снимок" || fail "снимка нет"
 # подмена файла в релизе: суммы не сходятся, обновление отклоняется до любых изменений
-mk_release 9.9.7; sums_for 9.9.7; echo '<!-- подмена -->' >> /tmp/rel/v9.9.7/templates/sub.html
-AX_RAW_BASE=file:///tmp/rel autoxray self-update v9.9.7 >/tmp/upd-tamper.out 2>&1 && fail "обновление с подменённым файлом прошло" || { grep -q 'не совпали' /tmp/upd-tamper.out && [ "$(autoxray version | awk '{print $2}')" = 9.9.9 ] && pass "подменённый файл релиза: обновление отклонено, версия не изменилась" || fail "подмена: $(tail -n 3 /tmp/upd-tamper.out)"; }
-mk_release 9.9.5; sums_for 9.9.5; sed -i '/templates\/sub.html/d' /tmp/rel/v9.9.5/FILES.sha256
-AX_RAW_BASE=file:///tmp/rel autoxray self-update v9.9.5 >/tmp/upd-incomplete.out 2>&1 && fail "неполный манифест принят" || { grep -q 'Манифест релиза' /tmp/upd-incomplete.out && pass "неполный манифест обновления отклонён" || fail "неполный манифест: другая ошибка"; }
-mk_release 9.9.6; rm -f /tmp/rel/v9.9.6/FILES.sha256
-AX_RAW_BASE=file:///tmp/rel autoxray self-update v9.9.6 >/tmp/upd-nosum.out 2>&1 && fail "обновление без контрольных сумм прошло" || { grep -q 'контрольные суммы' /tmp/upd-nosum.out && pass "релиз новее 3.13 без контрольных сумм не ставится" || fail "без сумм: $(tail -n 3 /tmp/upd-nosum.out)"; }
-mk_release 9.9.8 'post_update_check() { return 1; }'; sums_for 9.9.8
-state_md5=$(md5sum /etc/autoxray/state.json | cut -d' ' -f1)
-AX_RAW_BASE=file:///tmp/rel autoxray self-update v9.9.8 >/tmp/upd2.out 2>&1 && fail "сломанное обновление не должно проходить" || pass "сломанное обновление отклонено"
-[ "$(autoxray version | awk '{print $2}')" = 9.9.9 ] && pass "после неудачи версия вернулась (9.9.9)" || fail "версия после отката: $(autoxray version)"
-[ "$state_md5" = "$(md5sum /etc/autoxray/state.json | cut -d' ' -f1)" ] && pass "state.json не изменился после отката" || fail "state.json изменился"
+mk_release "$BAD_HASH_VER"; sums_for "$BAD_HASH_VER"; echo '<!-- подмена -->' >> "/tmp/rel/v$BAD_HASH_VER/templates/sub.html"
+AX_RAW_BASE=file:///tmp/rel autoxray self-update "v$BAD_HASH_VER" >/tmp/upd-tamper.out 2>&1 && fail "обновление с подменённым файлом прошло" || { grep -q 'не совпали' /tmp/upd-tamper.out && [ "$(autoxray version | awk '{print $2}')" = "$GOOD_VER" ] && pass "подменённый файл релиза: обновление отклонено, версия не изменилась" || fail "подмена: $(tail -n 3 /tmp/upd-tamper.out)"; }
+mk_release "$MISSING_HASH_VER"; sums_for "$MISSING_HASH_VER"; sed -i '/templates\/sub.html/d' "/tmp/rel/v$MISSING_HASH_VER/FILES.sha256"
+AX_RAW_BASE=file:///tmp/rel autoxray self-update "v$MISSING_HASH_VER" >/tmp/upd-incomplete.out 2>&1 && fail "неполный манифест принят" || { grep -q 'Манифест релиза' /tmp/upd-incomplete.out && pass "неполный манифест обновления отклонён" || fail "неполный манифест: другая ошибка"; }
+mk_release "$NO_SUMS_VER"; rm -f "/tmp/rel/v$NO_SUMS_VER/FILES.sha256"
+AX_RAW_BASE=file:///tmp/rel autoxray self-update "v$NO_SUMS_VER" >/tmp/upd-nosum.out 2>&1 && fail "обновление без контрольных сумм прошло" || { grep -q 'контрольные суммы' /tmp/upd-nosum.out && pass "релиз новее 3.13 без контрольных сумм не ставится" || fail "без сумм: $(tail -n 3 /tmp/upd-nosum.out)"; }
+autoxray user add rollbackuser >/dev/null || fail "не удалось создать пользователя для проверки отката"
+autoxray sub warn on >/dev/null
+rollback_token=$(jq -r '.users[] | select(.name == "rollbackuser").token' /etc/autoxray/state.json)
+client_cfg "$rollback_token" 1 127.0.0.1 >/tmp/rollback-client.json
+client_start /tmp/rollback-client.json && via_proxy ok.txt >/dev/null && pass "до обновления rollbackuser подключается" || fail "до обновления rollbackuser не подключился"
+client_stop
+
+# Model an administrator changing access after the snapshot and before selfcheck fails.
+cat >/tmp/rollback-selfcheck.sh <<'SH'
+post_update_check() {
+  "$AX_BIN" user set rollbackuser --disable >/dev/null || return 1
+  "$AX_BIN" sub support @rollback_support >/dev/null || return 1
+  "$AX_BIN" bot off >/dev/null || return 1
+  sha256sum <"$STATE" >/tmp/rollback-live-state.sha256
+  echo 401 >"$AX_ETC/bot.offset"
+  jq '.observed.up = 42 | .rollbackuser.up = 42' "$TRAFFIC" >"$TRAFFIC.fixture" && mv "$TRAFFIC.fixture" "$TRAFFIC"
+  return 1
+}
+SH
+mk_release "$FAIL_CHECK_VER" /tmp/rollback-selfcheck.sh
+sed -i '/^RELEASE_FILES=(/s|(autoxray |(autoxray templates/pr1-extra.html |' "/tmp/rel/v$FAIL_CHECK_VER/autoxray"
+printf 'new release file\n' >"/tmp/rel/v$FAIL_CHECK_VER/templates/pr1-extra.html"
+printf '\n<!-- changed by the broken release -->\n' >>"/tmp/rel/v$FAIL_CHECK_VER/templates/sub.html"
+sums_for "$FAIL_CHECK_VER"
+sub_md5=$(md5sum "$WEB/$TOKEN_A.html" | cut -d' ' -f1)
+lock_inode=$(stat -c %i /etc/autoxray/.lock)
+printf '%s\n' 400 > /etc/autoxray/bot.offset
+: > /run/systemctl.log
+AX_RAW_BASE=file:///tmp/rel autoxray self-update "v$FAIL_CHECK_VER" >/tmp/upd2.out 2>&1 && fail "сломанное обновление не должно проходить" || pass "сломанное обновление отклонено"
+[ "$(autoxray version | awk '{print $2}')" = "$GOOD_VER" ] && pass "после неудачи версия вернулась ($GOOD_VER)" || fail "версия после отката: $(autoxray version)"
+if jq -e '.bot.enabled == false' /etc/autoxray/state.json >/dev/null && ! systemctl is-active --quiet autoxray-bot &&
+   ! grep -Eq '^(try-)?restart autoxray-bot$' /run/systemctl.log; then
+  pass "автооткат оставил бота выключенным после bot off во время обновления"
+else
+  fail "автооткат запустил выключенного бота"
+fi
+[ "$(sha256sum </etc/autoxray/state.json)" = "$(cat /tmp/rollback-live-state.sha256)" ] &&
+  jq -e 'any(.users[]; .name == "rollbackuser" and .enabled == false)' /etc/autoxray/state.json >/dev/null &&
+  pass "после автоотката сохранён state.json с отключённым пользователем" || fail "автооткат изменил актуальный state.json"
+check "отключённого пользователя нет в конфиге Xray" jq -e \
+  'all(.inbounds[].settings.clients[]?; .email != "rollbackuser")' /usr/local/etc/xray/config.json
+if client_start /tmp/rollback-client.json; then
+  if curl -fsS --max-time 5 --socks5-hostname 127.0.0.1:10808 http://93.184.216.34:8080/ok.txt >/dev/null 2>&1; then
+    fail "после автоотката Xray снова пропускает отключённого пользователя"
+  else
+    pass "после автоотката Xray отклоняет старые ключи отключённого пользователя"
+  fi
+else
+  fail "после автоотката не запустился клиент для проверки старых ключей"
+fi
+client_stop
+client_cfg "$TOKEN_A" 1 127.0.0.1 >/tmp/rollback-control.json
+client_start /tmp/rollback-control.json && via_proxy ok.txt >/dev/null && pass "после автоотката активный пользователь подключается" || fail "после автоотката активный пользователь не подключился"
+client_stop
+disabled_announce=$(printf '⛔ Доступ отключён' | base64 -w0)
+if curl -fsS --max-time 8 -D /tmp/rollback-headers -o /dev/null "https://$DOMAIN/$rollback_token.json" &&
+   grep -Fqi "announce: base64:$disabled_announce" /tmp/rollback-headers &&
+   grep -Fqi 'support-url: https://t.me/rollback_support' /tmp/rollback-headers &&
+   grep -Fqi 'subscription-userinfo: upload=42;' /tmp/rollback-headers; then
+  pass "nginx отдаёт актуальные статус доступа, счётчик и ссылку поддержки"
+else
+  fail "nginx отдаёт заголовки из старого снимка"
+fi
 curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.json" >/dev/null && pass "после отката подписка работает" || fail "подписка после отката"
+[ "$(md5sum "$WEB/$TOKEN_A.html" | cut -d' ' -f1)" = "$sub_md5" ] && pass "после автоотката восстановлена HTML-подписка" || fail "после автоотката осталась HTML-подписка сломанного релиза"
+[ ! -e /usr/local/share/autoxray/pr1-extra.html ] && pass "автооткат удалил добавленный релизом файл" || fail "автооткат оставил новый файл"
+[ "$(cat /etc/autoxray/bot.offset)" = 401 ] && jq -e '.observed.up == 42' /etc/autoxray/traffic.json >/dev/null && pass "автооткат сохранил изменения рабочих данных после снимка" || fail "автооткат затёр рабочие данные"
 printf 'y\n' | autoxray rollback 2 >/tmp/rb.out 2>&1; [ "$(autoxray version | awk '{print $2}')" = "$ORIG_VER" ] && pass "rollback возвращает исходную версию ($ORIG_VER)" || { fail "rollback: $(autoxray version)"; tail -n 5 /tmp/rb.out; }
+# Older snapshots included the Telegram offset and the lock inode.
+mkdir -p /tmp/legacy-snapshot/etc
+mkdir -m 700 /tmp/legacy-snapshot/etc/autoxray
+printf '1\n' >/tmp/legacy-snapshot/etc/autoxray/bot.offset
+: >/tmp/legacy-snapshot/etc/autoxray/.lock
+tar -C /tmp/legacy-snapshot -czf /tmp/legacy-snapshot.tar.gz etc/autoxray
+if printf 'y\n' | autoxray rollback /tmp/legacy-snapshot.tar.gz >/tmp/rb-legacy.out 2>&1 &&
+   [ "$(cat /etc/autoxray/bot.offset)" = 401 ] && [ "$(stat -c %i /etc/autoxray/.lock)" = "$lock_inode" ]; then
+  pass "ручной откат старого снимка сохранил позицию бота и блокировку состояния"
+else
+  fail "откат старого снимка заменил позицию бота или блокировку"; tail -n 5 /tmp/rb-legacy.out
+fi
+rm -f /etc/autoxray/bot.offset   # следующий тест использует другой, локальный Telegram API
+
+mk_release "$FAIL_INSTALL_VER"
+printf '\n<!-- copied before the injected failure -->\n' >>"/tmp/rel/v$FAIL_INSTALL_VER/templates/sub.html"
+sums_for "$FAIL_INSTALL_VER"
+mkdir -p /tmp/ax-fail-install
+cat >/tmp/ax-fail-install/install <<'SH'
+#!/bin/bash
+for arg; do
+  if [[ $arg == */templates/nginx.conf ]]; then
+    touch /tmp/ax-fail-install/triggered
+    exit 1
+  fi
+done
+exec /usr/bin/install "$@"
+SH
+chmod +x /tmp/ax-fail-install/install
+template_before=$(sha256sum </usr/local/share/autoxray/sub.html)
+if PATH="/tmp/ax-fail-install:$PATH" AX_RAW_BASE=file:///tmp/rel autoxray self-update "v$FAIL_INSTALL_VER" >/tmp/upd-install.out 2>&1; then
+  fail "ошибка копирования проигнорирована"
+elif [ -e /tmp/ax-fail-install/triggered ] &&
+     grep -q 'восстановлено состояние' /tmp/upd-install.out &&
+     [ "$(autoxray version)" = "autoxray $ORIG_VER" ] &&
+     [ "$(sha256sum </usr/local/share/autoxray/sub.html)" = "$template_before" ]; then
+  pass "ошибка при частичной установке вызвала откат уже заменённого шаблона"
+else
+  fail "не восстановился шаблон после ошибки установки"; tail -n 8 /tmp/upd-install.out
+fi
+
+# Инъекция сбоя публикации map: прежний файл остаётся читаемым для nginx -t.
+mkdir -p /tmp/ax-fail-render
+cat >/tmp/ax-fail-render/mv <<'SH'
+#!/bin/bash
+if [[ -f /tmp/ax-fail-render/armed && ${*: -1} == /etc/nginx/autoxray-devices.map ]]; then
+  touch /tmp/ax-fail-render/triggered
+  echo 'injected devices map write failure' >&2
+  exit 1
+fi
+exec /usr/bin/mv "$@"
+SH
+chmod +x /tmp/ax-fail-render/mv
+cat >/tmp/rollback-render-failure.sh <<'SH'
+post_update_check() {
+  locked st_edit '(.users[] | select(.name == "alice") | .devices) = 1' || return 1
+  jq '.alice = {"known-hwid": {ok: true}}' "$DEVICES" >"$DEVICES.fixture" && mv "$DEVICES.fixture" "$DEVICES" || return 1
+  touch /tmp/ax-fail-render/armed
+  return 1
+}
+SH
+mk_release "$FAIL_RENDER_VER" /tmp/rollback-render-failure.sh; sums_for "$FAIL_RENDER_VER"
+if PATH="/tmp/ax-fail-render:$PATH" AX_RAW_BASE=file:///tmp/rel autoxray self-update "v$FAIL_RENDER_VER" >/tmp/upd-render.out 2>&1; then
+  fail "ошибка записи карты устройств проигнорирована"
+elif [ -e /tmp/ax-fail-render/triggered ] && grep -q 'Откат не удался полностью' /tmp/upd-render.out &&
+     [ "$(autoxray version)" = "autoxray $ORIG_VER" ] &&
+     jq -e 'any(.users[]; .name == "alice" and .devices == 1)' /etc/autoxray/state.json >/dev/null; then
+  pass "сбой записи карты устройств сообщён как неполный откат, версия и пользовательские данные сохранены"
+else
+  fail "автооткат скрыл ошибку записи карты устройств"; tail -n 8 /tmp/upd-render.out
+fi
+rm -f /tmp/ax-fail-render/armed
+hwid_code() { [ "$(curl -sS --max-time 5 -H "X-HWID: $1" -o /dev/null -w '%{http_code}' "https://$DOMAIN/$TOKEN_A.json")" = "$2" ]; }
+if autoxray render >/dev/null && wait_for hwid_code unknown-hwid 403 && hwid_code known-hwid 200; then
+  pass "после повторной генерации nginx разрешает известное устройство и отклоняет незарегистрированное"
+else
+  fail "после повторной генерации nginx не применил лимит устройств"
+fi
+autoxray user set alice --devices 0 >/dev/null
+autoxray user devices alice del all >/dev/null
+autoxray bot remove >/dev/null
+
 install_cli
 
 step "Telegram-бот: команды администратора, подтверждения, уведомления (поддельный Telegram API)"
