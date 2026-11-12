@@ -98,17 +98,18 @@ rm -- "$FIXTURE/socket-listen"
 printf 'OK: actual SSH listen addresses, socket activation and invalid port rejection\n'
 
 etc="$FIXTURE/etc"
+jail="$etc/jail.d/90-autoxray-sshd.local"
+server="$etc/fail2ban.d/90-autoxray.local"
 touch "$FIXTURE/apt-fails"
 if setup_fail2ban "$etc" >"$FIXTURE/setup.log" 2>&1; then echo 'FAIL: apt error ignored'; exit 1; fi
-[[ -z $(find "$etc" -type f -print -quit) ]]
+[[ ! -e $jail && ! -e $server && -d $etc/.autoxray-setup ]]
 rm -- "$FIXTURE/apt-fails"
 : >"$FIXTURE/bans"
 ( setup_fail2ban "$etc" ) 8>"$FIXTURE/test.lock" >"$FIXTURE/setup.log"
-jail="$etc/jail.d/90-autoxray-sshd.local"
 for setting in 'port = 2222,4444' 'maxretry = 3' 'findtime = 10m' 'bantime = 24h' 'bantime.increment = true' 'bantime.maxtime = 30d' \
-    'backend = systemd' 'mode = aggressive' 'banaction = nftables[type=multiport]'; do grep -Fxq -- "$setting" "$jail"; done
-grep -Fxq 'dbpurgeage = 2678400' "$etc/fail2ban.d/90-autoxray.local"
-[[ $(stat -c %a "$jail") == 600 && -e $FIXTURE/enabled ]]
+    'backend = systemd' 'mode = aggressive' 'banaction = nftables[type=multiport,blocktype="tcp flags syn / syn,ack reject"]'; do grep -Fxq -- "$setting" "$jail"; done
+grep -Fxq 'dbpurgeage = 2678400' "$server"
+[[ $(stat -c %a "$jail") == 600 && -e $FIXTURE/enabled && ! -e $etc/.autoxray-setup ]]
 printf 'OK: clean installation, exact policy, no inherited setup lock and retry after apt error\n'
 
 printf '# local policy\n' >>"$jail"
@@ -125,16 +126,29 @@ if setup_fail2ban "$etc" >"$FIXTURE/leftovers.log" 2>&1; then echo 'FAIL: residu
 [[ $(sha256sum <"$jail") == "$before" && $(sha256sum <"$FIXTURE/apt.log") == "$apt_before" ]]
 printf 'OK: installed, inactive and residual custom configuration preserved\n'
 
+etc="$FIXTURE/bad-etc"
+jail="$etc/jail.d/90-autoxray-sshd.local"
+server="$etc/fail2ban.d/90-autoxray.local"
 touch "$FIXTURE/invalid-config"
-if setup_fail2ban "$FIXTURE/bad-etc" >"$FIXTURE/invalid.log" 2>&1; then echo 'FAIL: invalid config accepted'; exit 1; fi
-[[ -z $(find "$FIXTURE/bad-etc" -type f -print -quit) && ! -e $FIXTURE/enabled ]]
-rm -- "$FIXTURE/invalid-config" "$FIXTURE/installed"
+if setup_fail2ban "$etc" >"$FIXTURE/invalid.log" 2>&1; then echo 'FAIL: invalid config accepted'; exit 1; fi
+[[ ! -e $jail && ! -e $server && -e $FIXTURE/installed && ! -e $FIXTURE/enabled ]]
+rm -- "$FIXTURE/invalid-config"
 touch "$FIXTURE/restart-fails"
-if setup_fail2ban "$FIXTURE/bad-etc" >"$FIXTURE/restart.log" 2>&1; then echo 'FAIL: start error ignored'; exit 1; fi
-[[ -z $(find "$FIXTURE/bad-etc" -type f -print -quit) && ! -e $FIXTURE/enabled ]]
+if setup_fail2ban "$etc" >"$FIXTURE/restart.log" 2>&1; then echo 'FAIL: start error ignored'; exit 1; fi
+grep -Fq 'Не удалось запустить Fail2ban' "$FIXTURE/restart.log"
+[[ ! -e $jail && ! -e $server && ! -e $FIXTURE/enabled ]]
 grep -Fxq 'disable --now fail2ban.service' "$FIXTURE/systemctl.log"
 rm -- "$FIXTURE/restart-fails"
-printf 'OK: only generated files removed when config or service startup fails\n'
+
+printf '# admin policy\n' >"$jail"
+if setup_fail2ban "$etc" >"$FIXTURE/custom.log" 2>&1; then echo 'FAIL: custom policy overwritten during retry'; exit 1; fi
+grep -Fxq '# admin policy' "$jail"
+rm -- "$jail"
+ln -- "$etc/.autoxray-setup/jail" "$jail"
+setup_fail2ban "$etc" >"$FIXTURE/retry.log"
+grep -Fxq 'port = 2222,4444' "$jail"
+[[ -f $server && -e $FIXTURE/enabled && ! -e $etc/.autoxray-setup ]]
+printf 'OK: recovery after package install, service failures and interrupted file publication; admin policy preserved\n'
 
 touch "$FIXTURE/active"
 printf '198.51.100.%s\n' {1..12} >"$FIXTURE/bans"

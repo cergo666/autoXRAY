@@ -1909,31 +1909,44 @@ f2b_ssh_ports() {
 }
 
 setup_fail2ban() { ( # каталог конфигурации Fail2ban
-  local etc=$1 ports existing stage ready=0 installing=0 _
+  local etc=$1 ports existing ready=0 installing=0 _
+  local stage="$etc/.autoxray-setup"
   local jail="$etc/jail.d/90-autoxray-sshd.local" server="$etc/fail2ban.d/90-autoxray.local"
-  if command -v fail2ban-client >/dev/null 2>&1; then
-    f2b_client status sshd >/dev/null || die "Действующий Fail2ban не обслуживает jail sshd. Проверьте его настройки и повторите установку."
-    ok "✅ Используется существующая защита Fail2ban SSH."
-    return 0
-  fi
 
-  if [[ -e $etc || -L $etc ]]; then
-    [[ -d $etc && ! -L $etc ]] || die "Обнаружена существующая конфигурация Fail2ban в $etc."
-    existing=$(find "$etc" -mindepth 1 ! -type d -print -quit) || return 1
-    [[ -z $existing ]] || die "Обнаружены настройки Fail2ban без пакета. Восстановите существующую установку Fail2ban."
+  # Закрытый каталог сохраняется при сбое, чтобы отличить прерванную
+  # установку autoXRAY от Fail2ban, настроенного администратором.
+  if [[ ! -d $stage || -L $stage ]]; then
+    if command -v fail2ban-client >/dev/null 2>&1; then
+      f2b_client status sshd >/dev/null || die "Действующий Fail2ban не обслуживает jail sshd. Проверьте его настройки и повторите установку."
+      ok "✅ Используется существующая защита Fail2ban SSH."
+      return 0
+    fi
+    if [[ -e $etc || -L $etc ]]; then
+      [[ -d $etc && ! -L $etc ]] || die "Обнаружена существующая конфигурация Fail2ban в $etc."
+      existing=$(find "$etc" -mindepth 1 ! -type d -print -quit) || return 1
+      [[ -z $existing ]] || die "Обнаружены настройки Fail2ban без пакета. Восстановите существующую установку Fail2ban."
+    fi
   fi
   ports=$(f2b_ssh_ports) || die "Не удалось определить порты SSH для Fail2ban."
-  mkdir -p -- "$etc/jail.d" "$etc/fail2ban.d" || return 1
-  stage=$(mktemp -d -- "$etc/.autoxray.XXXXXX") || return 1
+  if [[ ! -d $stage ]]; then
+    mkdir -p -- "$etc/jail.d" "$etc/fail2ban.d" && mkdir -m 700 -- "$stage" || return 1
+  fi
+  [[ ! -L $etc && -O $stage ]] || die "Не удалось продолжить настройку Fail2ban в $etc."
+  if { [[ -e $jail || -L $jail ]] && [[ ! $stage/jail -ef $jail ]]; } ||
+     { [[ -e $server || -L $server ]] && [[ ! $stage/server -ef $server ]]; }; then
+    die "Конфигурация Fail2ban была изменена. Проверьте файлы в $etc."
+  fi
+
   trap '
-    if [[ $ready == 0 ]]; then
+    if [[ $ready == 1 ]]; then
+      rm -rf -- "$stage"
+    else
       if [[ $installing == 1 ]] && command -v fail2ban-client >/dev/null 2>&1; then
         systemctl disable --now fail2ban.service 8>&- || warn "Проверьте состояние fail2ban.service."
       fi
       [[ $stage/jail -ef $jail ]] && rm -f -- "$jail"
       [[ $stage/server -ef $server ]] && rm -f -- "$server"
     fi
-    rm -rf -- "$stage"
   ' EXIT
 
   # Пакет может запустить службу при установке. К этому моменту jail уже
@@ -1945,7 +1958,8 @@ enabled = true
 backend = systemd
 mode = aggressive
 port = $ports
-banaction = nftables[type=multiport]
+# При чтении старых ошибок бан может сработать сразу. Сохраняем текущий SSH-сеанс установщика.
+banaction = nftables[type=multiport,blocktype="tcp flags syn / syn,ack reject"]
 maxretry = 3
 findtime = 10m
 bantime = 24h
@@ -1953,7 +1967,8 @@ bantime.increment = true
 bantime.maxtime = 30d
 EOF
   ) && ( umask 077; printf '[Definition]\ndbpurgeage = 2678400\n' >"$stage/server" ) || return 1
-  ln -T -- "$stage/jail" "$jail" && ln -T -- "$stage/server" "$server" || return 1
+  [[ $stage/jail -ef $jail ]] || ln -T -- "$stage/jail" "$jail" || return 1
+  [[ $stage/server -ef $server ]] || ln -T -- "$stage/server" "$server" || return 1
 
   installing=1
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends fail2ban nftables python3-systemd 8>&- \
