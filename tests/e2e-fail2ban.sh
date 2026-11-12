@@ -28,7 +28,8 @@ if id "$account" >/dev/null 2>&1 || [[ -e /run/netns/$ns || -e $socket_conf || -
 fi
 tmp=$(mktemp -d /run/autoxray-f2b-test.XXXXXX)
 unset AX_DRY AX_FAIL2BAN
-socket_active=0 service_active=0 session_pid=
+socket_active=0 service_active=0 socket_disabled=0 session_pid=
+socket_enable_state=$(systemctl is-enabled ssh.socket || true)
 if systemctl is-active --quiet ssh.socket; then socket_active=1; fi
 if systemctl is-active --quiet ssh.service; then service_active=1; fi
 
@@ -42,6 +43,12 @@ cleanup() {
   if [[ -n $session_pid ]]; then kill "$session_pid" 2>/dev/null || true; fi
   systemctl stop fail2ban.service ssh.service ssh.socket 2>/dev/null || true
   rm -f -- "$socket_conf" "$sshd_conf" "$local_conf" "/etc/sudoers.d/$account"
+  if (( socket_disabled )); then
+    case $socket_enable_state in
+      enabled) systemctl enable ssh.socket ;;
+      enabled-runtime) systemctl enable --runtime ssh.socket ;;
+    esac
+  fi
   systemctl daemon-reload
   if (( socket_active )); then systemctl start ssh.socket || true; fi
   if (( service_active )); then systemctl start ssh.service || true; fi
@@ -195,6 +202,12 @@ check_port "$socket_port" "$old_port"
 echo 'OK: после смены ListenStream баны действуют на новом порту и сохраняют сроки'
 
 systemctl stop ssh.service ssh.socket
+# На Ubuntu включённый ssh.socket создаёт Requires для ssh.service.
+socket_disabled=1
+case $socket_enable_state in
+  enabled) systemctl disable ssh.socket ;;
+  enabled-runtime) systemctl disable --runtime ssh.socket ;;
+esac
 rm -- "$socket_conf"
 printf 'Port %s\nListenAddress %s:%s\nListenAddress [%s]:%s\n' \
   "$service_port" "$host4" "$service_port" "$host6" "$service_port" >"$sshd_conf"
