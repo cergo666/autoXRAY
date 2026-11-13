@@ -680,6 +680,12 @@ check "Remove domain override" autoxray rules del example.org
 jq -e '.server_policy.block_domains == []' /etc/autoxray/state.json >/dev/null \
     && pass "block override removed" || fail "block override remained"
 check "Xray syntax after reverting rules" xray run -test -c /usr/local/etc/xray/config.json
+check "Allow one domain on server" autoxray rules allow policy-check.example.com
+check "Guarded server route with private and public DNS answers" \
+    python3 /opt/autoxray/tests/test-server-rules-xray.py --public-target 93.184.216.34
+check "Remove the last allow override" autoxray rules del policy-check.example.com
+check "Remove the extra Freedom outbound with the last allow override" \
+    jq -e 'all(.outbounds[]; .tag != "ax-policy-direct")' /usr/local/etc/xray/config.json
 
 step "Безопасное обновление: снимок, успешное обновление, откат при сбое"
 export AX_TG_API=http://127.0.0.1:1

@@ -7,6 +7,7 @@ No subprocesses, no shell execution, no direct changes to Xray services.
 """
 from __future__ import annotations
 
+import copy
 import html
 import json
 import os
@@ -26,6 +27,7 @@ FILTERS = {
 IPCHECK = frozenset({"ifconfig.me", "checkip.amazonaws.com", "pify.org", "2ip.io", "geosite:category-ip-geo-detect"})
 DENY_SUFFIXES = (".local", ".localhost", ".internal", ".lan", ".home.arpa", ".invalid", ".test")
 DOMAIN = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?")
+ALLOW_OUTBOUND = "ax-policy-direct"
 
 
 class PolicyError(ValueError):
@@ -80,20 +82,21 @@ def validate(state: dict) -> tuple[dict, list[str], list[str]]:
 
 
 def transformed(raw: str, state: dict) -> str:
+    if (state.get("mode") or "direct") != "direct":
+        return raw  # Policy does not affect bridge routing.
     if not policy_of(state):
         return raw  # Byte-for-byte compatibility with an unconfigured installation.
-    if state.get("mode", "direct") != "direct":
-        return raw  # Policy does not affect bridge routing.
     flags, allowed, blocked = validate(state)
     cfg = json.loads(raw)
     route = cfg.get("routing")
     if not isinstance(route, dict) or not isinstance(route.get("rules"), list):
         raise PolicyError("Отсутствуют routing.rules")
-    outbounds = {x.get("tag") for x in cfg.get("outbounds", []) if isinstance(x, dict)}
+    outbounds = {x.get("tag"): x for x in cfg.get("outbounds", []) if isinstance(x, dict)}
     if not {"direct", "block", "block-bt"}.issubset(outbounds):
         raise PolicyError("Отсутствует обязательный outbound")
 
     kept = []
+    private_domains = []
     for rule in route["rules"]:
         if not isinstance(rule, dict):
             raise PolicyError("Некорректный Xray rule")
@@ -108,6 +111,9 @@ def transformed(raw: str, state: dict) -> str:
             continue
         if tag == "block" and domains:
             skip = set()
+            if allowed and "geosite:private" in domains:
+                private_domains.append({**rule, "domain": ["geosite:private"]})
+                skip.add("geosite:private")
             if not flags["ads"]:
                 skip.add("geosite:category-ads")
             if not flags["spyware"]:
@@ -134,27 +140,45 @@ def transformed(raw: str, state: dict) -> str:
         raise PolicyError("Непредусмотренный порядок защитных правил Xray")
     index = first_domain
     extras = []
-    if allowed:
-        extras.append({"domain": ["domain:" + x for x in allowed], "outboundTag": "direct", "ruleTag": "ax-policy-allow"})
     if blocked:
         extras.append({"domain": ["domain:" + x for x in blocked], "outboundTag": "block", "ruleTag": "ax-policy-block"})
-    route["rules"] = kept[:index] + extras + kept[index:]
+    cfg["outbounds"] = [x for x in cfg["outbounds"] if x.get("tag") != ALLOW_OUTBOUND]
+    if allowed:
+        if not any(rule.get("ip") == ["geoip:private"] and rule.get("outboundTag") == "block"
+                   and rule.keys() <= {"ip", "outboundTag", "type", "ruleTag"} for rule in kept[:index]):
+            raise PolicyError("Отсутствует общее правило блокировки приватных IP")
+        direct = copy.deepcopy(outbounds["direct"])
+        if (direct.get("protocol") != "freedom" or direct.get("proxySettings")
+                or direct.get("streamSettings", {}).get("sockopt", {}).get("dialerProxy")
+                or direct.get("settings", {}).get("redirect")):
+            raise PolicyError("Прямой outbound не поддерживает проверку приватных IP")
+        # IPIfNonMatch can select a domain rule without resolving it. Freedom
+        # checks the resolved addresses and the destination of the connection.
+        direct["tag"] = ALLOW_OUTBOUND
+        direct.setdefault("settings", {}).setdefault("finalRules", []).insert(
+            0, {"action": "block", "ip": ["geoip:private"]})
+        cfg["outbounds"].append(direct)
+        extras.append({"domain": ["domain:" + x for x in allowed],
+                       "outboundTag": ALLOW_OUTBOUND, "ruleTag": "ax-policy-allow"})
+    route["rules"] = kept[:index] + private_domains + extras + kept[index:]
     return json.dumps(cfg, ensure_ascii=False, indent=2) + "\n"
 
 
 def change(state: dict, operation: str, key: str, value: str | None = None) -> bool:
-    if state.get("mode", "direct") != "direct":
+    if (state.get("mode") or "direct") != "direct":
         raise PolicyError("Правила доступны только в режиме direct")
     validate(state)
     new = json.loads(json.dumps(state))
-    policy = new.setdefault("server_policy", {})
+    policy = new["server_policy"] = policy_of(new)
     if operation == "set":
         if key not in FILTERS or value not in ("on", "off"):
             raise PolicyError("Использование: set ipcheck|ads|spyware|bittorrent on|off")
         desired = value == "on"
         if filters_of(new)[key] == desired:
             return False
-        policy.setdefault("filters", {})[key] = desired
+        if policy.get("filters") is None:
+            policy["filters"] = {}
+        policy["filters"][key] = desired
     elif operation in ("allow", "block", "del"):
         if value is not None or not valid_domain(key):
             raise PolicyError("Требуется один допустимый домен, например example.com")
@@ -210,16 +234,27 @@ def status(state: dict) -> str:
     result += ["", "🔐 <b>Неизменяемые ограничения</b>",
                "• Приватные IP, почтовые/SMB-порты, лимиты пользователей", "",
                "✅ <b>Разрешённые домены</b>"]
-    result += ["• <code>" + html.escape(d) + "</code>" for d in allowed[:20]] or ["Нет"]
-    if len(allowed) > 20:
-        result.append("…и ещё " + str(len(allowed) - 20))
+    result += status_domains(allowed)
     result += ["", "🚫 <b>Заблокированные домены</b>"]
-    result += ["• <code>" + html.escape(d) + "</code>" for d in blocked[:20]] or ["Нет"]
-    if len(blocked) > 20:
-        result.append("…и ещё " + str(len(blocked) - 20))
+    result += status_domains(blocked)
     result += ["", "➕ /rule allow example.com", "🚫 /rule block example.com", "🗑 /rule del example.com",
                "", "ℹ️ Изменения действуют на сервере, а не в клиентских подписках."]
     return "\n".join(result)
+
+
+def status_domains(domains: list[str]) -> list[str]:
+    # Leave room for the menu and the other list within Telegram's limit.
+    budget = 1600
+    lines = []
+    for domain in domains[:20]:
+        line = "• <code>" + html.escape(domain) + "</code>"
+        budget -= len(line) + 1
+        if budget < 0:
+            break
+        lines.append(line)
+    if len(domains) > len(lines):
+        lines.append(f"…и ещё {len(domains) - len(lines)}")
+    return lines or ["Нет"]
 
 
 def keyboard(state: dict) -> str:
