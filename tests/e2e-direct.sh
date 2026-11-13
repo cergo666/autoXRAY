@@ -11,7 +11,7 @@ step "Подготовка: TLS, CLI, цель за пределами серв�
 setup_tls "$DOMAIN"
 install_cli
 start_target
-check "цель отвечает напрямую" curl -fsS --max-time 5 http://93.184.216.34:8080/ok.txt
+check "цель отвечает напрямую" curl -fsS --noproxy "*" --max-time 5 http://93.184.216.34:8080/ok.txt
 
 step "Установка: init + сайт-маскировка + render (Xray -test и nginx -t настоящие)"
 mkdir -p "$WEB"
@@ -45,7 +45,7 @@ for spec in "0 XHTTP stream-up" "1 RAW Vision" "2 Hysteria2"; do
     step "Трафик через сервер: $name (alice)"
     client_cfg "$TOKEN_A" "$idx" 127.0.0.1 > /tmp/client-$idx.json
     if client_start /tmp/client-$idx.json; then
-        out=$(via_proxy ok.txt 2>&1)
+        out=$(via_proxy ok.txt 2>/tmp/via.err)
         [ "$out" = "TARGET-OK" ] && pass "$name: запрос дошёл до цели" || { fail "$name: ответ '$out'"; tail -n 8 /tmp/client.out; tail -n 8 /var/log/xray/server.out; }
     else
         fail "$name: клиент не стартовал"
@@ -592,7 +592,7 @@ jq '.[2] | .outbounds |= map(if .tag == "proxy" then .settings.address = "127.0.
 check "клиентский Xray принимает конфиг с udphop" xray run -test -c /tmp/client-hop.json
 nft reset counters table inet autoxray_hop >/dev/null 2>&1
 if client_start /tmp/client-hop.json; then
-  out=$(via_proxy ok.txt 2>&1); [ "$out" = TARGET-OK ] && pass "Hysteria2 со сменой портов: трафик идёт" || { fail "трафик с udphop: $out"; tail -n 8 /tmp/client.out; }
+  out=$(via_proxy ok.txt 2>/tmp/via.err); [ "$out" = TARGET-OK ] && pass "Hysteria2 со сменой портов: трафик идёт" || { fail "трафик с udphop: $out"; tail -n 8 /tmp/client.out; }
   pk=$(nft -j list table inet autoxray_hop | jq '[.nftables[] | .rule? | select(. != null) | .expr[] | .counter? | select(. != null) | .packets] | add')
   [ "${pk:-0}" -gt 0 ] && pass "пакеты шли на порты диапазона ($pk)" || fail "счётчик перенаправления пуст"
 else fail "клиент с udphop не стартовал"; fi
@@ -661,6 +661,25 @@ autoxray site set /tmp/mysite >/dev/null 2>&1 && curl -fsS --max-time 8 "https:/
 curl -fsS --max-time 8 "https://$DOMAIN/$TOKEN_A.json" >/dev/null && pass "подписки продолжают работать со своим сайтом" || fail "подписка после site set"
 autoxray site status | sed 's/\x1b\[[0-9;]*m//g' | grep -q custom && pass "site status показывает режим custom" || fail "site status"
 autoxray site regenerate >/dev/null
+
+step "Server rules: изменение без потери защиты и восстановление настроек"
+# Old installations without a policy should preserve the original rendering.
+check "CLI status of server policy" autoxray rules status
+check "Reject editing invalid domain" bash -c '! autoxray rules block "foo.com;id"'
+check "Block one domain on server" autoxray rules block example.org
+jq -e '.server_policy.block_domains | index("example.org") != null' /etc/autoxray/state.json >/dev/null \
+    && pass "server_policy persisted" || fail "server_policy missing"
+check "Xray syntax after rule insertion" xray run -test -c /usr/local/etc/xray/config.json
+jq -e '[.routing.rules[] | select(.ruleTag == "ax-policy-block")][0].domain == ["domain:example.org"]' \
+    /usr/local/etc/xray/config.json >/dev/null && pass "server block rule is rendered" || fail "block rule missing"
+check "Disable advertising filter" autoxray rules set ads off
+jq -e '[.routing.rules[] | .domain[]?] | index("geosite:category-ads") == null' \
+    /usr/local/etc/xray/config.json >/dev/null && pass "ads filter removed" || fail "ads still blocked"
+check "Re-enable advertising filter" autoxray rules set ads on
+check "Remove domain override" autoxray rules del example.org
+jq -e '.server_policy.block_domains == []' /etc/autoxray/state.json >/dev/null \
+    && pass "block override removed" || fail "block override remained"
+check "Xray syntax after reverting rules" xray run -test -c /usr/local/etc/xray/config.json
 
 step "Безопасное обновление: снимок, успешное обновление, откат при сбое"
 export AX_TG_API=http://127.0.0.1:1
