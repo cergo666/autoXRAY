@@ -75,7 +75,7 @@ KEYRING_PKG=$([ "$ID" = "ubuntu" ] && echo "ubuntu-keyring" || echo "debian-arch
 
 echo -e "${YEL}Подготовка официального репозитория Nginx для $ID ($VERSION_CODENAME)...${NC}"
 apt-get update || die "apt-get update не выполнен"
-apt-get install -y curl gnupg2 ca-certificates lsb-release "$KEYRING_PKG" jq dnsutils openssl wget tar socat cron gettext-base qrencode util-linux git openssh-client \
+apt-get install -y curl gnupg2 ca-certificates lsb-release "$KEYRING_PKG" jq dnsutils openssl wget tar socat cron gettext-base qrencode util-linux git openssh-client python3 \
     || die "Не удалось установить зависимости"
 
 NGINX_KEY_TMP=$(mktemp)
@@ -210,7 +210,7 @@ echo -e "${GRN}Лимиты применены. Текущий ulimit -n: $(ulim
 # CLI autoxray, шаблоны, сайт-маскировка
 # ==========================================
 echo -e "${YEL}Устанавливаем autoxray...${NC}"
-RELEASE_FILES=(autoxray templates/sub.html templates/nginx.conf templates/report.html templates/gen_page.sh
+RELEASE_FILES=(autoxray templates/sub.html templates/nginx.conf templates/report.html templates/gen_page.sh templates/server_rules.py
                components/telegram/install.sh components/telegram/update.sh components/telegram/uninstall.sh components/telegram/artifacts.sh)
 STAGE=$(mktemp -d)
 for t in "${RELEASE_FILES[@]}"; do

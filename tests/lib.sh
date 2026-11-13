@@ -43,7 +43,7 @@ setup_tls() { # домен [каталог общего CA]
 install_cli() {
     install -m 755 /opt/autoxray/autoxray /usr/local/bin/autoxray
     mkdir -p /usr/local/share/autoxray/telegram
-    install -m 644 /opt/autoxray/templates/sub.html /opt/autoxray/templates/nginx.conf /opt/autoxray/templates/report.html /opt/autoxray/templates/gen_page.sh /usr/local/share/autoxray/
+    install -m 644 /opt/autoxray/templates/sub.html /opt/autoxray/templates/nginx.conf /opt/autoxray/templates/report.html /opt/autoxray/templates/gen_page.sh /opt/autoxray/templates/server_rules.py /usr/local/share/autoxray/
 }
 
 # Профиль i из подписки пользователя -> клиентский конфиг, адрес сервера заменён на $2 (DNS в тесте не нужен)
@@ -78,10 +78,47 @@ via_proxy() { # файл — с тремя попытками: клиент Xray
 
 # Внешняя «цель»: адрес из публичный адрес, не RU и не private на lo и простой http-сервер
 start_target() {
-    ip addr add 93.184.216.34/32 dev lo 2>/dev/null || true
-    mkdir -p /srv/target; echo "TARGET-OK" > /srv/target/ok.txt
-    (cd /srv/target && nohup python3 -m http.server 8080 --bind 93.184.216.34 >/tmp/target.out 2>&1 &)
-    local i
-    for i in $(seq 1 50); do curl -fsS --max-time 2 http://93.184.216.34:8080/ok.txt >/dev/null 2>&1 && return 0; sleep 0.2; done
-    echo "target не поднялся"; return 1
+    # A public-looking address is intentionally bound to lo so geo rules see
+    # non-private traffic, without depending on a real external server.
+    if ! ip -4 addr show dev lo | grep -Fq '93.184.216.34/32'; then
+        ip addr add 93.184.216.34/32 dev lo || {
+            echo "target: cannot assign test IP to lo" >&2
+            return 1
+        }
+    fi
+    # Python HTTPServer does reverse DNS in server_bind() before listen().
+    # Without a hosts entry the fake public test IP can stall in isolated CI.
+    if ! grep -Eq '^[[:space:]]*93[.]184[.]216[.]34[[:space:]]' /etc/hosts; then
+        printf '93.184.216.34 ax-e2e-target.test\n' >> /etc/hosts || return 1
+    fi
+    mkdir -p /srv/target
+    printf 'TARGET-OK\n' > /srv/target/ok.txt
+
+    # Keep the server PID and run it directly in the background. The old
+    # nested `(cd ... && nohup ... &)` could obscure startup failures.
+    (
+        cd /srv/target || exit 1
+        exec python3 -u -m http.server 8080 --bind 93.184.216.34
+    ) >/tmp/target.out 2>&1 &
+    local target_pid i
+    target_pid=$!
+
+    # Readiness, not process existence: allow slow CI containers up to ~30s.
+    for i in $(seq 1 120); do
+        if curl -fsS --noproxy '*' --connect-timeout 1 --max-time 2 \
+            http://93.184.216.34:8080/ok.txt 2>/dev/null | grep -qx 'TARGET-OK'; then
+            return 0
+        fi
+        kill -0 "$target_pid" 2>/dev/null || break
+        sleep 0.25
+    done
+
+    echo "target: HTTP server did not become ready (pid=$target_pid)" >&2
+    echo "--- target log ---" >&2
+    tail -n 40 /tmp/target.out >&2 || true
+    echo "--- target process ---" >&2
+    ps -p "$target_pid" -o pid,stat,wchan:24,etime,args >&2 || true
+    echo "--- listeners on 8080 ---" >&2
+    ss -ltnp 2>&1 | grep -E '(^State|:8080)' >&2 || true
+    return 1
 }

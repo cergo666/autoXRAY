@@ -12,6 +12,7 @@ shopt -u patsub_replacement 2>/dev/null || true
 AX_VERSION="3.14.4"
 AX_REPO="cergo666/autoXRAY"
 XRAY_TESTED="v26.10.31"          # версия ядра, с которой этот релиз проверен тестами
+XRAY_RULES_MIN="v26.10.31"       # Freedom finalRules проверяет фактический адрес соединения
 API="${AX_API:-https://api.github.com}"
 AX_ETC="${AX_ETC:-/etc/autoxray}"
 STATE="$AX_ETC/state.json"
@@ -133,7 +134,15 @@ hbytes() {
 hdate() { [[ ${1:-0} -gt 0 ]] && date -d "@$1" +%F || echo "∞"; }
 
 lock()   { exec 9>>"$LOCK"; flock -w 30 9 || die "Другая операция autoxray ещё выполняется."; }
-locked() { lock; "$@"; local rc=$?; exec 9>&-; return $rc; }
+state_lock_held() { [[ ${ax_state_locked:-0} == 1 && $LOCK -ef /proc/self/fd/9 ]]; }
+locked() {
+  if state_lock_held; then "$@"; return $?; fi
+  local ax_state_locked=1 rc
+  lock
+  "$@"; rc=$?
+  exec 9>&-
+  return "$rc"
+}
 
 # ---------------------------------------------------------------- состояние
 
@@ -142,6 +151,7 @@ mode()    { jq -r '.mode // "direct"' "$STATE"; }
 # В режиме моста 3-я группа UUID зарезервирована под vlessRoute (0000 = автобалансировщик)
 user_uuid() { local u; u=$(new_uuid); [[ ${1:-direct} == bridge ]] && u="${u:0:14}0000${u:18}"; echo "$u"; }
 st_edit() {
+  if ! state_lock_held; then locked st_edit "$@"; return $?; fi
   local tmp
   tmp=$(mktemp "$AX_ETC/.state.XXXXXX") || die "Не могу создать временный файл в $AX_ETC"
   if jq "$@" "$STATE" >"$tmp"; then chmod 600 "$tmp"; mv "$tmp" "$STATE"; else rm -f "$tmp"; die "Ошибка обновления state.json"; fi
@@ -439,13 +449,40 @@ geo_missing() {
 }
 
 render_xray_json() {
-  local prog="$SERVER_COMMON"$'\n'"$XRAY_JQ"
-  [[ $(mode) == bridge ]] && prog="$SERVER_COMMON"$'\n'"$BRIDGE_COMMON"$'\n'"$BRIDGE_JQ"
+  local source=${1:-$STATE} prog="$SERVER_COMMON"$'\n'"$XRAY_JQ"
+  [[ $(jq -r '.mode // "direct"' "$source") == bridge ]] && prog="$SERVER_COMMON"$'\n'"$BRIDGE_COMMON"$'\n'"$BRIDGE_JQ"
   [[ -f $BANS ]] || echo '[]' >"$BANS"
   # ключи-заглушки (когда активных пользователей нет) постоянны: иначе каждый render менял бы конфиг и перезапускал Xray
-  local h; h=$(jq -r '"dummy:" + (.socks.pass // "") + (.domain // "")' "$STATE" | sha256sum)
-  jq -n --slurpfile s "$STATE" --slurpfile t "$TRAFFIC" --slurpfile b "$BANS" --argjson now "$(now)" \
+  local h; h=$(jq -r '"dummy:" + (.socks.pass // "") + (.domain // "")' "$source" | sha256sum)
+  jq -n --slurpfile s "$source" --slurpfile t "$TRAFFIC" --slurpfile b "$BANS" --argjson now "$(now)" \
     --argjson geomiss "$(geo_missing)" --arg dummy_id "${h:0:8}-${h:8:4}-4${h:13:3}-8${h:17:3}-${h:20:12}" --arg dummy_auth "${h:32:16}" "$prog"
+}
+
+rules_python_available() {
+  if [[ ! -x ${AX_RULES_PYTHON:-/usr/bin/python3} ]]; then
+    warn "Для серверных правил нужен Python 3. Установите его командой: apt-get install python3"
+    return 1
+  fi
+}
+
+rules_python() {
+  rules_python_available || return 1
+  "${AX_RULES_PYTHON:-/usr/bin/python3}" "$TPL_DIR/server_rules.py" "$@" 9>&-
+}
+
+render_xray_with_rules() {
+  local source=$1 configured
+  configured=$(jq -r '
+    if (.mode // "direct") != "direct" or .server_policy == null then false
+    elif (.server_policy | type) != "object" then error("Некорректное значение server_policy")
+    else (.server_policy | length > 0) end
+  ' "$source") || return 1
+  if [[ $configured == true ]]; then
+    rules_python_available || return 1
+    render_xray_json "$source" | rules_python "$source" transform
+  else
+    render_xray_json "$source"
+  fi
 }
 
 # Учётная запись службы xray. Установщик XTLS ставит User=xray; в контейнере тестов systemctl может ответить root.
@@ -556,17 +593,31 @@ heal_xray_logs() {
 # Применяет config.json: проверка через `xray run -test`, откат при ошибке,
 # перезапуск только если файл действительно изменился.
 apply_xray() {
-  local new rc=0 grp had_old=0
+  if ! state_lock_held; then locked apply_xray "$@"; return $?; fi
+  local source=${1:-$STATE} new rc=0 grp had_old=0 test_log
   [[ -f $XRAY_CFG ]] && had_old=1
-  new=$(mktemp --suffix=.json) || die "mktemp"
-  render_xray_json >"$new" || { rm -f "$new"; die "Не удалось собрать config.json"; }
-  if [[ -f $XRAY_CFG ]] && cmp -s "$new" "$XRAY_CFG"; then rm -f "$new"; heal_xray_logs; return 0; fi
+  new=$(mktemp --suffix=.json) || return 1
+  if ! render_xray_with_rules "$source" >"$new" || ! check_rules_core "$new"; then
+    rm -f "$new"; warn "Не удалось собрать серверные правила Xray"; return 1
+  fi
+  if [[ $had_old == 1 ]] && cmp -s "$new" "$XRAY_CFG"; then
+    rm -f -- "$new"
+    if [[ $source == "$STATE" ]]; then heal_xray_logs; return 0; fi
+    heal_xray_logs && xray_rules_ready
+    return $?
+  fi
+  if [[ $source != "$STATE" && $DRY != 1 ]] && ! command -v xray >/dev/null 2>&1; then
+    warn "Не найдено ядро Xray для проверки конфигурации."
+    rm -f "$new"; return 1
+  fi
   if command -v xray >/dev/null 2>&1; then
-    if ! xray run -test -c "$new" >/tmp/autoxray-test.log 2>&1; then
-      warn "Xray отклонил новый конфиг, изменения НЕ применены. Лог: /tmp/autoxray-test.log"
-      tail -n 5 /tmp/autoxray-test.log >&2
-      rm -f "$new"; return 1
+    test_log=$(mktemp) || { rm -f "$new"; return 1; }
+    if ! xray run -test -c "$new" >"$test_log" 2>&1 9>&-; then
+      warn "Xray отклонил новый конфиг, изменения не применены."
+      tail -n 5 "$test_log" >&2
+      rm -f "$test_log" "$new"; return 1
     fi
+    rm -f "$test_log"
   fi
   if [[ $had_old == 1 ]] && ! cp -p "$XRAY_CFG" "$XRAY_CFG.bak"; then
     rm -f "$new"; warn "Не удалось сохранить прежний конфиг Xray."; return 1
@@ -580,11 +631,17 @@ apply_xray() {
   fi
   grp=$([[ $DRY == 1 ]] && echo "" || xray_group)
   if [[ -n $grp ]]; then chown "root:$grp" "$XRAY_CFG" && chmod 640 "$XRAY_CFG" || rc=1; else chmod 600 "$XRAY_CFG" || rc=1; [[ $DRY == 1 ]] || rc=1; fi
-  [[ $rc != 0 ]] || svc restart xray || rc=1
+  if [[ $rc == 0 ]]; then
+    svc restart xray || rc=1
+    if [[ $rc == 0 && $source != "$STATE" ]]; then xray_rules_ready || rc=1; fi
+  fi
   if [[ $rc != 0 ]]; then
     warn "Не удалось применить конфигурацию; восстанавливаю предыдущую."
     if [[ $had_old == 1 ]]; then
-      cp -p "$XRAY_CFG.bak" "$XRAY_CFG" && svc restart xray || warn "Не удалось восстановить Xray; проверьте журнал службы."
+      if ! { cp -p "$XRAY_CFG.bak" "$XRAY_CFG" && svc restart xray &&
+             { [[ $source == "$STATE" ]] || xray_rules_ready; }; }; then
+        warn "Не удалось восстановить Xray; проверьте журнал службы."
+      fi
     else
       rm -f "$XRAY_CFG"
     fi
@@ -3510,6 +3567,29 @@ cmd_restore() {
 
 xray_version() { xray version 2>/dev/null | awk 'NR == 1 {print "v" $2}'; }
 
+check_rules_core() { # config [version]
+  local protected version=${2-}
+  protected=$(jq -r 'any(.outbounds[]?; .tag == "ax-policy-direct")' "$1") || return 1
+  [[ $protected == true ]] || return 0
+  if [[ $# == 1 ]]; then version=$(xray_version 9>&-) || version=; fi
+  [[ $version =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && ! ver_gt "$XRAY_RULES_MIN" "$version" && return 0
+  warn "Разрешённые домены требуют Xray $XRAY_RULES_MIN или новее. Обновите ядро: autoxray core update"
+  return 1
+}
+
+xray_rules_ready() {
+  [[ $DRY == 1 ]] && return 0
+  local attempt
+  for attempt in {1..5}; do
+    if svc is-active --quiet xray && xray api statsquery -s "$API_ADDR" -t 1 >/dev/null 2>&1 9>&-; then
+      return 0
+    fi
+    [[ $attempt == 5 ]] || sleep 1
+  done
+  warn "Xray не ответил после перезапуска."
+  return 1
+}
+
 # Официальный установщик Xray (XTLS/Xray-install). Скачивается в файл: если загрузка не удалась, это ошибка
 # (раньше `bash -c "$(curl ...)"` с пустым скриптом считался успехом). TERM задаётся явно: установщик вызывает tput
 # и без TERM (cron) или с TERM=dumb завершается с ошибкой.
@@ -3558,6 +3638,35 @@ core_mptcp_note() {
   echo -e " ${BOLD}${YEL}Безопасность:${NC} $cur слушает MPTCP. В ядре Linux через IPv4 MPTCP можно было удалённо получить root. С v26.10.31 Xray его выключает: ${CYAN}autoxray core update${NC}"
 }
 
+core_apply_version() { # version; called with maintenance and state locks
+  local v=$1 prev install_rc=0 saved_core runtime_user
+  if [[ -f $XRAY_CFG ]]; then check_rules_core "$XRAY_CFG" "$v" || return 1; fi
+  prev=$(xray_version)
+  saved_core=$(mktemp -d) || die "Не удалось сохранить прежнее ядро."
+  cp -p /usr/local/bin/xray "$saved_core/xray" || { rm -rf "$saved_core"; die "Не удалось сохранить прежнее ядро."; }
+  core_restore() {
+    warn "Восстанавливаю прежнее ядро $prev."
+    svc stop xray || return 1
+    cp -p "$saved_core/xray" /usr/local/bin/xray && ensure_xray_runtime_access && ensure_xray_logs && svc restart xray
+  }
+  xray_installer install --version "$v" 9>&- || install_rc=$?
+  if ! ensure_xray_runtime_access || ! ensure_xray_logs || [[ $(xray_version) != "$v" ]] ||
+     ! runtime_user=$(xray_runtime_user) ||
+     ! runuser -u "$runtime_user" -- /usr/local/bin/xray run -test -c "$XRAY_CFG" >/dev/null 2>&1 9>&- ||
+     ! svc restart xray; then
+    if core_restore; then
+      rm -rf "$saved_core"
+      die "Обновление не удалось; прежнее ядро восстановлено."
+    fi
+    warn "Не удалось восстановить службу. Копия прежнего ядра: $saved_core/xray"
+    die "Проверьте journalctl -u xray -n 30 --no-pager"
+  fi
+  rm -rf "$saved_core"
+  st_edit --arg v "$v" '.xray_version = $v'
+  [[ $install_rc == 0 ]] || warn "Установщик сообщил об ошибке запуска до исправления прав; ядро $v проверено и служба запущена успешно."
+  ok "✅ Ядро обновлено: $prev → $v"
+}
+
 cmd_core() {
   need_state
   local sub=${1:-list}; shift || true
@@ -3582,36 +3691,13 @@ cmd_core() {
       while (($#)); do case $1 in --yes|-y) yes=1 ;; *) v=$1 ;; esac; shift; done
       [[ -n $v ]] || v=$XRAY_TESTED
       [[ $v == v* ]] || v="v$v"
+      if [[ -f $XRAY_CFG ]]; then check_rules_core "$XRAY_CFG" "$v" || return 1; fi
       prev=$(xray_version)
       core_warning
       core_is_pre "$v" && echo -e "\n ${BOLD}${RED}🧪 $v это пререлиз.${NC} ${DIM}Он может содержать ошибки и менять поведение. Для постоянной работы выбирайте стабильные версии.${NC}"
       echo -e "\n Сейчас: ${BOLD}${prev:-?}${NC}  →  будет установлена: ${BOLD}$v${NC}"
       if [[ $yes != 1 ]]; then read -rp "$(echo -e " ${BOLD}Продолжить? Введите yes:${NC} ")" a; [[ $a == yes ]] || die "Отменено."; fi
-      local install_rc=0 saved_core
-      saved_core=$(mktemp -d) || die "Не удалось сохранить прежнее ядро."
-      cp -p /usr/local/bin/xray "$saved_core/xray" || { rm -rf "$saved_core"; die "Не удалось сохранить прежнее ядро."; }
-      core_restore() {
-        warn "Восстанавливаю прежнее ядро $prev."
-        svc stop xray || return 1
-        cp -p "$saved_core/xray" /usr/local/bin/xray && ensure_xray_runtime_access && ensure_xray_logs && svc restart xray
-      }
-      xray_installer install --version "$v" || install_rc=$?
-      local runtime_user
-      if ! ensure_xray_runtime_access || ! ensure_xray_logs || [[ $(xray_version) != "$v" ]] ||
-         ! runtime_user=$(xray_runtime_user) ||
-         ! runuser -u "$runtime_user" -- /usr/local/bin/xray run -test -c "$XRAY_CFG" >/dev/null 2>&1 ||
-         ! svc restart xray; then
-        if core_restore; then
-          rm -rf "$saved_core"
-          die "Обновление не удалось; прежнее ядро восстановлено."
-        fi
-        warn "Не удалось восстановить службу. Копия прежнего ядра: $saved_core/xray"
-        die "Проверьте journalctl -u xray -n 30 --no-pager"
-      fi
-      rm -rf "$saved_core"
-      st_edit --arg v "$v" '.xray_version = $v'
-      [[ $install_rc == 0 ]] || warn "Установщик сообщил об ошибке запуска до исправления прав; ядро $v проверено и служба запущена успешно."
-      ok "✅ Ядро обновлено: $prev → $v" ;;
+      with_update_lock locked core_apply_version "$v" ;;
     *) die "core: list | update [версия] [--yes]" ;;
   esac
 }
@@ -3655,7 +3741,7 @@ cmd_migrate() {
 SNAP_DIR="${AX_SNAP_DIR:-/var/lib/autoxray/snapshots}"
 AX_BIN="${AX_BIN:-/usr/local/bin/autoxray}"
 UPDATE_CONFIRM_DIR="$AX_ETC/.update-confirm"
-RELEASE_FILES=(autoxray templates/sub.html templates/nginx.conf templates/report.html templates/gen_page.sh
+RELEASE_FILES=(autoxray templates/sub.html templates/nginx.conf templates/report.html templates/gen_page.sh templates/server_rules.py
                components/telegram/install.sh components/telegram/update.sh components/telegram/uninstall.sh components/telegram/artifacts.sh)
 
 # One maintenance lock shared by CLI/TUI/Telegram update and manual rollback.
@@ -3729,6 +3815,13 @@ snapshot_unpack() { # файл [auto]
     for path in "$AX_ETC" "$XRAY_CFG" "$NGX_CONF" "$NGX_MAP" "$NGX_ANN" "$NGX_DEV"; do
       exclude+=(--exclude="${path#/}")
     done
+  else
+    local saved_config
+    # Manual rollback restores the saved config directly. Check the core
+    # before unpacking a snapshot that contains the protected outbound.
+    if saved_config=$(tar -xOzf "$1" -- "${XRAY_CFG#/}" 2>/dev/null); then
+      check_rules_core /dev/stdin <<<"$saved_config" || return 1
+    fi
   fi
   snapshot_tar "${exclude[@]}" -xzf "$1"
 }
@@ -4261,7 +4354,7 @@ bot_notify() {
   return 0
 }
 
-BOT_MAIN_KB='{"inline_keyboard":[[{"text":"📊 Статус","callback_data":"status"},{"text":"👥 Пользователи","callback_data":"list"}],[{"text":"🩺 Диагностика","callback_data":"doctor"},{"text":"🌍 WARP","callback_data":"warp"}],[{"text":"🛡 Fail2ban SSH","callback_data":"f2b:p:0"}]]}'
+BOT_MAIN_KB='{"inline_keyboard":[[{"text":"📊 Статус","callback_data":"status"},{"text":"👥 Пользователи","callback_data":"list"}],[{"text":"🩺 Диагностика","callback_data":"doctor"},{"text":"🌍 WARP","callback_data":"warp"}],[{"text":"🛡 Fail2ban SSH","callback_data":"f2b:p:0"}],[{"text":"📜 Правила Xray","callback_data":"rules"}]]}'
 
 # Встроенные в Fail2ban команды работают только с jail sshd.
 bot_f2b_admin() { [[ $1 =~ ^[1-9][0-9]{0,19}$ ]] && bot_enabled && bot_is_admin "$1"; }
@@ -4532,6 +4625,47 @@ bot_update_worker() { # admin chat confirmed-from-version target-version
 }
 
 
+# Edit a copy under the state lock. Publish it only after Xray accepts it.
+cmd_rules_change() { (
+  local candidate result
+  candidate=$(mktemp -d "$AX_ETC/.state.rules.XXXXXX") || return 1
+  trap 'rm -rf -- "$candidate"' EXIT
+  cp -p -- "$STATE" "$candidate/state.json" || return 1
+  result=$(rules_python "$candidate/state.json" edit "$@") || return 1
+  case $result in
+    UNCHANGED) ok "Правило уже в требуемом состоянии. Изменений нет."; return 0 ;;
+    CHANGED) ;;
+    *) warn "Непредусмотренный ответ менеджера правил"; return 1 ;;
+  esac
+  apply_xray "$candidate/state.json" || return 1
+  if ! mv -fT -- "$candidate/state.json" "$STATE"; then
+    warn "Не удалось сохранить серверные правила. Восстанавливаю прежний конфиг Xray."
+    apply_xray || warn "Не удалось восстановить Xray; проверьте журнал службы."
+    return 1
+  fi
+  ok "✅ Серверные правила применены"
+); }
+
+cmd_rules() {
+  local sub=${1:-status}; shift || true
+  need_state
+  case $sub in
+    status|keyboard)
+      (( $# == 0 )) || { warn "Лишние параметры"; return 1; }
+      if [[ $(mode) != direct ]]; then
+        if [[ $sub == status ]]; then echo "📜 Правила Xray доступны в режиме direct."
+        else echo '{"inline_keyboard":[[{"text":"⬅️ Назад","callback_data":"status"}]]}'; fi
+        return 0
+      fi
+      rules_python "$STATE" "$sub" ;;
+    set|allow|block|del)
+      need_root
+      [[ $(mode) == direct ]] || { warn "Управление правилами поддерживает только direct"; return 1; }
+      with_update_lock locked cmd_rules_change "$sub" "$@" ;;
+    *) warn "Использование: autoxray rules status|set KEY on|off|allow DOMAIN|block DOMAIN|del DOMAIN"; return 1 ;;
+  esac
+}
+
 bot_help() {
   echo "<b>autoXRAY $AX_VERSION: управление сервером</b>"
   cat <<'EOF'
@@ -4560,6 +4694,8 @@ bot_help() {
 /stats — трафик
 /doctor — диагностика
 /warp — состояние WARP
+/rules — серверные правила Xray (direct)
+/rule <code>allow|block|del домен</code> — исключения
 /fail2ban — статистика SSH-защиты и список банов
 /unban <code>IP</code> — разблокировать адрес в Fail2ban SSH с подтверждением
 /id — ваш Telegram ID
@@ -4684,6 +4820,66 @@ bot_report_text() { # результат bot_do
   if [[ $BOT_RC -eq 0 ]]; then echo "✅ Готово"; else printf '❌ <pre>%s</pre>' "$(html_esc <<<"${BOT_OUT:0:900}")"; fi
 }
 
+# One-shot, five-minute confirmations. Old callback buttons cannot change policy.
+AX_RULE_CONFIRM_DIR="${AX_RULE_CONFIRM_DIR:-/run/autoxray-rule-confirm}"
+bot_rule_pending_file() {
+  [[ $1 =~ ^[0-9]{1,20}$ ]] || return 1
+  printf '%s/%s' "$AX_RULE_CONFIRM_DIR" "$1"
+}
+bot_rule_pending_save() { # chat filter desired
+  local file tmp nonce
+  [[ $2 =~ ^(ipcheck|ads|spyware|bittorrent)$ && $3 =~ ^(on|off)$ ]] || return 1
+  file=$(bot_rule_pending_file "$1") || return 1
+  mkdir -p "$AX_RULE_CONFIRM_DIR" || return 1
+  chmod 700 "$AX_RULE_CONFIRM_DIR" || return 1
+  nonce=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n') || return 1
+  [[ $nonce =~ ^[0-9a-f]{16}$ ]] || return 1
+  tmp=$(mktemp "$AX_RULE_CONFIRM_DIR/.request.XXXXXXXX") || return 1
+  chmod 600 "$tmp"
+  if ! printf '%s %s %s %s\n' "$nonce" "$2" "$3" "$(date +%s)" >"$tmp"; then
+    rm -f "$tmp"; return 1
+  fi
+  mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+  printf '%s' "$nonce"
+}
+bot_rule_pending_consume() { # chat filter nonce; prints desired on success
+  local file nonce key desired timestamp now
+  file=$(bot_rule_pending_file "$1") || return 1
+  [[ $2 =~ ^(ipcheck|ads|spyware|bittorrent)$ && $3 =~ ^[0-9a-f]{16}$ ]] || return 1
+  [[ -f $file && ! -L $file ]] || return 1
+  read -r nonce key desired timestamp <"$file" || return 1
+  # Invalid or mismatching confirmation does not consume the valid pending request.
+  [[ $nonce == "$3" && $key == "$2" && $desired =~ ^(on|off)$ && $timestamp =~ ^[0-9]{1,12}$ ]] || return 1
+  now=$(date +%s)
+  (( now >= timestamp && now - timestamp <= 300 )) || { rm -f "$file"; return 1; }
+  rm -- "$file" || return 1
+  printf '%s' "$desired"
+}
+
+bot_rules_show() { # chat
+  local chat=$1 msg kb
+  msg=$(cmd_rules status 2>&1) || {
+    tg_send "$chat" "⚠️ Правила недоступны. Проверьте autoxray rules status."
+    return 0
+  }
+  kb=$(cmd_rules keyboard 2>/dev/null) || kb=''
+  tg_send "$chat" "$msg" "$kb"
+}
+
+bot_rules_apply() { # chat args...
+  local chat=$1; shift
+  bot_do with_update_lock locked bot_rules_change "$chat" "$@"
+  bot_enabled && bot_is_admin "$chat" || return 0
+  tg_send "$chat" "$(bot_report_text)"
+  bot_rules_show "$chat"
+}
+
+bot_rules_change() {
+  local chat=$1; shift
+  bot_enabled && bot_is_admin "$chat" || return 1
+  cmd_rules_change "$@"
+}
+
 bot_callback() { # chat message_id callback_id data
   local chat=$1 mid=$2 cbid=$3 data=$4 a b c d name
   IFS=: read -r a b c d <<<"$data"
@@ -4695,6 +4891,41 @@ bot_callback() { # chat message_id callback_id data
         p) [[ -z $d ]] && bot_f2b_report "$chat" "$c" "$mid" ;;
         ask) bot_f2b_confirm "$chat" "${data#f2b:ask:}" ;;
         do|cancel) [[ -z $d ]] && bot_f2b_finish "$chat" "$c" "$b" ;;
+      esac ;;
+    rules) bot_rules_show "$chat" ;;
+    r)
+      case $b in
+        show) bot_rules_show "$chat" ;;
+        help)
+          case $c in
+            allow) tg_send "$chat" '➕ Разрешить домен: <code>/rule allow example.com</code>' ;;
+            block) tg_send "$chat" '🚫 Заблокировать домен: <code>/rule block example.com</code>' ;;
+          esac ;;
+        ask)
+          [[ $c =~ ^(ipcheck|ads|spyware|bittorrent)$ && $d =~ ^(on|off)$ ]] || return 0
+          # Reject stale buttons instead of silently reversing an updated policy.
+          local current
+          current=$(jq -r --arg k "$c" 'if .server_policy.filters[$k] == null then true else .server_policy.filters[$k] end' "$STATE")
+          if [[ ( $d == on && $current == true ) || ( $d == off && $current == false ) ]]; then
+            bot_rules_show "$chat"; return 0
+          fi
+          local nonce
+          nonce=$(locked bot_rule_pending_save "$chat" "$c" "$d") || { tg_send "$chat" '⚠️ Не удалось создать подтверждение.'; return 0; }
+          tg_send "$chat" "Изменить фильтр <b>$c</b> на <b>$d</b>? Подтверждение действует 5 минут." "$(bot_confirm_kb "r:do:$c:$nonce" "r:cancel:$c:$nonce")" ;;
+        do|cancel)
+          [[ $c =~ ^(ipcheck|ads|spyware|bittorrent)$ && $d =~ ^[0-9a-f]{16}$ ]] || return 0
+          local desired current
+          desired=$(locked bot_rule_pending_consume "$chat" "$c" "$d") || {
+            tg_send "$chat" '⚠️ Подтверждение устарело или уже использовано. Открой /rules заново.'
+            return 0
+          }
+          if [[ $b == cancel ]]; then bot_rules_show "$chat"; return 0; fi
+          current=$(jq -r --arg k "$c" 'if .server_policy.filters[$k] == null then true else .server_policy.filters[$k] end' "$STATE")
+          if [[ ( $desired == on && $current == true ) || ( $desired == off && $current == false ) ]]; then
+            tg_send "$chat" '⚠️ Состояние уже изменено, повторное действие отменено.'
+            bot_rules_show "$chat"; return 0
+          fi
+          bot_rules_apply "$chat" set "$c" "$desired" ;;
       esac ;;
     list) bot_show_list "$chat" "$mid" ;;
     new) tg_send "$chat" "Создайте пользователя: <code>/add имя [ГБ] [дней]</code>" ;;
@@ -4804,6 +5035,13 @@ bot_command() { # chat текст
     /del) need_name || return 0; tg_send "$chat" "🗑 Удалить <b>$name</b> без возможности восстановления?" "$(bot_confirm_kb "u:$name:delok" "u:$name")" ;;
     /stats) bot_do cmd_stats; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" ;;
     /doctor) bot_do cmd_doctor; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" ;;
+    /rules) bot_rules_show "$chat" ;;
+    /rule)
+      if [[ ${#a[@]} != 2 || ! ${a[0]} =~ ^(allow|block|del)$ ]]; then
+        tg_send "$chat" 'Использование: <code>/rule allow|block|del example.com</code>'
+      else
+        bot_rules_apply "$chat" "${a[0]}" "${a[1]}"
+      fi ;;
     /warp) bot_do cmd_warp status; tg_send "$chat" "$(printf '%s' "$BOT_OUT" | tg_pre)" ;;
     *) tg_send "$chat" "Не знаю такой команды. /help" ;;
   esac
@@ -5440,6 +5678,7 @@ usage() {
   echo -e "  ${C}autoxray fingerprint${N} <браузер> ${C}telegram${N} set <ссылка>|off|update|remove"
   echo -e "  ${C}autoxray bot${N} setup|status|on|off|add-admin|del-admin|proxy|test|remove   ${D}Telegram-бот администратора и уведомления${N}"
   echo -e "  ${C}autoxray site${N} status|regenerate|set <папка>   ${D}сайт-маскировка: новый дизайн или свой сайт${N}"
+  echo -e "  ${C}autoxray rules${N} status|set KEY on|off|allow DOMAIN|block DOMAIN|del DOMAIN  ${D}серверные правила direct${N}"
   echo -e "  ${C}autoxray firewall${N} [--dry-run]  ${D}🔥 настроить ufw (SSH, 80, 443)${N}"
   echo -e "  ${C}autoxray setup-fail2ban${N}        ${D}включить Fail2ban для SSH или сверить его порты${N}"
   echo -e "  ${C}autoxray hop${N} on [20000-30000]|off|status   ${D}Hysteria2 меняет UDP-порты (port hopping)${N}"
@@ -5468,6 +5707,7 @@ main() {
     update-core)  cmd_core update "$@" ;;
     core)         cmd_core "$@" ;;
     render)       cmd_render ;;
+    rules)        cmd_rules "$@" ;;
     init)         cmd_init "$@" ;;
     migrate)      cmd_migrate "$@" ;;
     node|nodes)   cmd_node "$@" ;;
