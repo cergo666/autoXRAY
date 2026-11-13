@@ -40,12 +40,13 @@ FAKE_LATEST=$NEXT_VERSION
 [[ $(bot_available_update) == "$NEXT_VERSION" ]]
 kb=$(bot_status_kb)
 [[ $(jq -r '.inline_keyboard[-1][0].callback_data' <<<"$kb") == "upd:ask:$NEXT_VERSION" ]]
-[[ $(jq -r '.inline_keyboard | length' <<<"$kb") -eq 3 ]]
+base_rows=$(jq -r '.inline_keyboard | length' <<<"$BOT_MAIN_KB")
+[[ $(jq -r '.inline_keyboard | length' <<<"$kb") -eq $((base_rows + 1)) ]]
 
 for FAKE_LATEST in "$AX_VERSION" 0.0.0 "$NEXT_VERSION;invalid"; do
   [[ -z $(bot_available_update) ]]
   kb=$(bot_status_kb)
-  [[ $(jq -r '.inline_keyboard | length' <<<"$kb") -eq 2 ]]
+  [[ $kb == "$BOT_MAIN_KB" ]]
 done
 
 FAKE_LATEST=$NEXT_VERSION

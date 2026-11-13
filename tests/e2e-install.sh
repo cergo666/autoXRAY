@@ -36,8 +36,14 @@ setup_tls "$DOMAIN"
 cp /opt/autoxray/tests/stubs/acme.sh /root/.acme.sh/acme.sh
 start_target
 
+mkdir -p /etc/fail2ban
+printf '[sshd]\nenabled = true\nbantime = 5h\n' >/etc/fail2ban/jail.local
+fail2ban_before=$(sha256sum </etc/fail2ban/jail.local)
+export AX_TEST_F2B_STATUS_LOG=/tmp/install-fail2ban-status.log
+: >"$AX_TEST_F2B_STATUS_LOG"
+
 run_install() {
-    AX_TG=n AX_FP=${1:-2} AX_USER=anna AX_WARP=n AX_MIGRATE=${2:-y} AUTOXRAY_SRC=/opt/autoxray \
+    AX_TG=n AX_FP=${1:-2} AX_USER=anna AX_WARP=n AX_MIGRATE=${2:-y} AX_FAIL2BAN=${3:-} AUTOXRAY_SRC=/opt/autoxray \
         bash /opt/autoxray/install.sh "$DOMAIN" </dev/null >/tmp/install.log 2>&1
 }
 
@@ -62,6 +68,7 @@ check "xray -test" xray run -test -c /usr/local/etc/xray/config.json
 check "nginx -t" nginx -t
 check "xray и nginx запущены" bash -c 'pgrep -x xray && pgrep -x nginx'
 check "cron: учёт трафика, лимит IP, гео-данные" bash -c 'grep -q collect /etc/cron.d/autoxray && grep -q ipwatch /etc/cron.d/autoxray && grep -q geo-update /etc/cron.d/autoxray'
+[ ! -s "$AX_TEST_F2B_STATUS_LOG" ] && pass "установщик пропустил Fail2ban по умолчанию" || fail "установщик обратился к Fail2ban без явного выбора"
 [ "$(stat -c %a /var/lib/xray/cert/privkey.pem)" = 640 ] && pass "ключ TLS: права 640" || fail "права ключа: $(stat -c %a /var/lib/xray/cert/privkey.pem)"
 TOKEN=$(jq -r '.users[0].token' /etc/autoxray/state.json)
 check "подписка отдаётся (три протокола и «Авто»)" bash -c "curl -fsS --max-time 8 https://$DOMAIN/$TOKEN.json | jq -e 'length == 4'"
@@ -83,7 +90,10 @@ client_stop
 
 step "Повторный запуск install.sh сохраняет пользователей"
 uuid_before=$(jq -r '.users[0].uuid' /etc/autoxray/state.json)
-run_install 1 y && pass "повторный install.sh успешен" || { fail "повторный install.sh упал"; tail -n 15 /tmp/install.log; }
+fail2ban_status_before=$(sha256sum <"$AX_TEST_F2B_STATUS_LOG")
+run_install 1 y y && pass "повторный install.sh успешен" || { fail "повторный install.sh упал"; tail -n 15 /tmp/install.log; }
 [ "$uuid_before" = "$(jq -r '.users[0].uuid' /etc/autoxray/state.json)" ] && pass "UUID не изменился при повторном запуске" || fail "UUID изменился"
+[ "$(sha256sum </etc/fail2ban/jail.local)" = "$fail2ban_before" ] && pass "существующие настройки Fail2ban сохранены" || fail "конфигурация Fail2ban изменилась"
+[ "$(sha256sum <"$AX_TEST_F2B_STATUS_LOG")" = "$fail2ban_status_before" ] && pass "повторная установка пропустила Fail2ban" || fail "Fail2ban проверен повторно"
 
 finish

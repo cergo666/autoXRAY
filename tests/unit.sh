@@ -87,9 +87,11 @@ check_ver_fail "1.0 не больше 1.0.1" "1.0" "1.0.1"
 # -------------------------------------------------------- days_left
 echo "== days_left =="
 
-now_ts=$(date +%s)
+now_ts=1700000000
+date() { printf '%s\n' "$now_ts"; }
 dl=$(days_left $((now_ts + 86400))); [[ "$dl" == "1" ]] && ok_test "завтра → $dl" || fail_test "завтра → $dl ($dl)"
 dl=$(days_left "$now_ts"); [[ "$dl" == "0" ]] && ok_test "сейчас → $dl" || fail_test "сейчас → $dl ($dl)"
+unset -f date
 
 # -------------------------------------------------------- parse_vless
 echo "== parse_vless: vless:// ссылки =="
